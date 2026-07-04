@@ -1,0 +1,61 @@
+# VST TestBench — ビルド & 使い方
+
+Cubaseの重さに耐えられない、VSTを1個だけ通して素早く音を確認するための**軽量VST3ホスト（テストベンチ）**。
+JUCE 8.0.13 スタンダードアロンアプリ。
+
+## 目的（何をするソフトか）
+DAWの重い機能を捨て、「MIDIスイッチング」＋「VST再生」だけをやる。
+
+```
+鍵盤 ─MIDI─▶ TestBench ─(thru)─▶ Reface CP ─音─▶ UR-RT2 in3/4 ─▶ VST ─▶ 出力
+                                      └ VSTi検査時は MIDI が VST にも入る
+```
+
+- プラグイン未ロード時は **in3/4 をそのまま出力にモニター**（配線チェック用）
+- **フォルダスキャンしない**。VSTはファイル指定で1個ずつ読み、`KnownPluginList` をXMLキャッシュ
+  （プラグイン800個環境でも起動時スキャンゼロ）
+
+## 依存
+- **JUCE**: `C:/JUCE`（8.0.13）
+- **ASIO SDK**: `C:/SDKs/ASIOSDK`（`common/iasiodrv.h` の存在で自動有効化）
+  - なければ WASAPI/DirectSound にフォールバック（CMakeが警告を出す）
+
+## ビルド
+```powershell
+cmake -S C:\dev\vst-testbench -B C:\dev\vst-testbench\build -G "Visual Studio 17 2022" -A x64
+cmake --build C:\dev\vst-testbench\build --config Release
+```
+出力: `C:\dev\vst-testbench\build\VstTestBench_artefacts\Release\VST TestBench.exe`
+
+> 実行中は exe がロックされるため、再ビルド前にアプリを閉じること
+> （`Get-Process -Name "VST TestBench" | Stop-Process -Force`）。
+
+## 使い方
+1. **Audio / MIDI Settings** → Type=**ASIO** / Device=**Yamaha Steinberg USB ASIO (UR-RT2)**
+   → Active input channels で **3 / 4** をチェック / MIDI Inputs で鍵盤を有効化
+2. **VST input pair** = **3 / 4**（デフォルト）
+3. **Reface MIDI out** で Reface CP を選択（名前に "reface" があれば自動選択）→ **MIDI thru → Reface** ON
+4. **Load VST3 file...** で `.vst3` を1個選択（初期フォルダ `Common Files\VST3`）
+   → 以後は **Recent plugins** からワンクリック（再スキャンなし）
+5. **Open Plugin UI** / **Bypass** で素通し比較 / **Remove Plugin** で外す
+
+## 設定の保存先
+`%APPDATA%\VstTestBench\`
+- `known_plugins.xml` — 読み込み済みプラグインのキャッシュ
+- `audio_settings.xml` — オーディオ/MIDIデバイス設定
+
+## 構成
+```
+CMakeLists.txt          juce_add_gui_app + ASIO条件付き有効化 + VST3ホスト
+assets/icon.png         タスクバー用「VT」アイコン（白タイル/黒枠/黒字）
+Source/Main.cpp         JUCEApplication + DocumentWindow
+Source/MainComponent.*  AudioProcessorGraph ホスト本体
+```
+
+## 実装メモ
+- 中核は `juce::AudioProcessorGraph`（audioIn / audioOut / midiIn / plugin ノードを配線）
+- MIDI thru（→Reface）は `AudioDeviceManager` の MidiInputCallback で直接 `MidiOutput` に転送
+- 同じMIDIを `AudioProcessorPlayer` 経由でグラフにも供給（VSTi検査対応）
+- **JUCE 8.0.13 API変更**: `AudioPluginFormatManager::addDefaultFormats()` は削除
+  → 自由関数 `juce::addDefaultFormatsToManager(mgr)` を使う
+- プラグインエディタは `createEditorAndMakeActive()`、無ければ `GenericAudioProcessorEditor`

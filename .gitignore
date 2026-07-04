@@ -1,0 +1,23 @@
+# Build output
+/build/
+build/
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.cmake~
+
+# IDE / editor
+.vs/
+.vscode/
+*.user
+*.suo
+
+# OS junk
+Thumbs.db
+Desktop.ini
+.DS_Store
+
+# JUCE generated
+JuceLibraryCode/
