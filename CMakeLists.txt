@@ -2,7 +2,15 @@ cmake_minimum_required(VERSION 3.22)
 project(VstTestBench VERSION 0.1.0)
 set(CMAKE_CXX_STANDARD 17)
 
-add_subdirectory("C:/JUCE" "${CMAKE_CURRENT_BINARY_DIR}/JUCE" EXCLUDE_FROM_ALL)
+# JUCE location: override with -DJUCE_DIR=..., else per-platform default
+if(NOT DEFINED JUCE_DIR)
+    if(APPLE)
+        set(JUCE_DIR "$ENV{HOME}/JUCE")
+    else()
+        set(JUCE_DIR "C:/JUCE")
+    endif()
+endif()
+add_subdirectory("${JUCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/JUCE" EXCLUDE_FROM_ALL)
 
 juce_add_gui_app(VstTestBench
     PRODUCT_NAME "VST TestBench"
@@ -36,6 +44,7 @@ target_compile_definitions(VstTestBench PRIVATE
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
     JUCE_PLUGINHOST_VST3=1
+    JUCE_PLUGINHOST_AU=1
     JUCE_WASAPI=1
     JUCE_DIRECTSOUND=1
     JUCE_APPLICATION_NAME_STRING="$<TARGET_PROPERTY:VstTestBench,JUCE_PRODUCT_NAME>"
