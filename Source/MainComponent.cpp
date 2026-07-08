@@ -98,6 +98,7 @@ MainComponent::MainComponent()
     {
         if (currentSourceMode() != srcFile && preRenderButton.getToggleState())
             setPreRenderEnabled (false);   // pre-render only exists in file mode
+        applyBackendForMode (currentSourceMode());
         rebuildConnections();
         switch (currentSourceMode())
         {
@@ -107,6 +108,21 @@ MainComponent::MainComponent()
                                                                  : "Source: file player (open a file)"); break;
             default:            setStatus ("Source: live input -> FX"); break;
         }
+    };
+
+    // --- auto backend: keep the crash-prone ASIO driver out of the hot path
+    //     whenever latency does not matter (file playback / pre-render). ---
+    addAndMakeVisible (autoBackendButton);
+    autoBackendButton.setTooltip ("Switch the audio backend with the source: WASAPI for file playback "
+                                  "(latency is irrelevant there), ASIO only for live/VSTi.");
+    autoBackendButton.setToggleState (autoBackendFile().existsAsFile()
+                                          ? autoBackendFile().loadFileAsString().trim() == "1"
+                                          : true,   // default ON
+                                      juce::dontSendNotification);
+    autoBackendButton.onClick = [this]
+    {
+        autoBackendFile().replaceWithText (autoBackendButton.getToggleState() ? "1" : "0");
+        applyBackendForMode (currentSourceMode());
     };
 
     // --- file player transport ---
@@ -219,6 +235,10 @@ MainComponent::MainComponent()
     setStatus ("Ready. Open Audio/MIDI Settings and pick UR-RT2 (ASIO).");
     pluginLabel.setText ("No FX loaded (source -> output monitor)", juce::dontSendNotification);
 
+    // If the last session ended on the other backend (e.g. closed in file/WASAPI
+    // mode), realign the device with the initial source mode.
+    applyBackendForMode (currentSourceMode());
+
     startTimerHz (10);
     setSize (680, 600);
 }
@@ -237,6 +257,7 @@ MainComponent::~MainComponent()
     deviceManager.removeChangeListener (this);
     player.setProcessor (nullptr);
 
+    saveBackendSnapshot();
     if (auto xml = deviceManager.createStateXml())
         xml->writeTo (audioStateFile());
 
@@ -255,6 +276,71 @@ juce::File MainComponent::appDir() const
 juce::File MainComponent::cacheFile()      const { return appDir().getChildFile ("known_plugins.xml"); }
 juce::File MainComponent::audioStateFile() const { return appDir().getChildFile ("audio_settings.xml"); }
 juce::File MainComponent::lastDirFile()    const { return appDir().getChildFile ("last_audio_dir.txt"); }
+juce::File MainComponent::autoBackendFile() const { return appDir().getChildFile ("auto_backend.txt"); }
+
+juce::File MainComponent::backendStateFile (const juce::String& typeName) const
+{
+    const auto slug = typeName.replaceCharacter (' ', '_')
+                              .retainCharacters ("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_");
+    return appDir().getChildFile ("audio_settings_" + slug + ".xml");
+}
+
+void MainComponent::saveBackendSnapshot()
+{
+    if (auto xml = deviceManager.createStateXml())
+        xml->writeTo (backendStateFile (deviceManager.getCurrentAudioDeviceType()));
+}
+
+//==============================================================================
+// Latency only matters when the source is live; file playback streams a file
+// (or the pre-render cache), so it can run on WASAPI and keep the ASIO driver
+// untouched. Each backend's exact device setup is snapshotted so switching
+// back restores it (ASIO input pair 3/4, buffer size, ...).
+void MainComponent::applyBackendForMode (int mode)
+{
+    if (! autoBackendButton.getToggleState())
+        return;
+
+    const juce::String want = (mode == srcFile) ? "Windows Audio" : "ASIO";
+    if (deviceManager.getCurrentAudioDeviceType() == want)
+        return;
+
+    bool available = false;
+    for (auto* type : deviceManager.getAvailableDeviceTypes())
+        if (type->getTypeName() == want)
+            { available = true; break; }
+
+    if (! available)
+    {
+        setStatus ("Backend " + want + " not available - staying on "
+                   + deviceManager.getCurrentAudioDeviceType());
+        return;
+    }
+
+    saveBackendSnapshot();   // remember the outgoing backend's setup
+
+    const bool wasPlaying = filePlayer->transport.isPlaying();
+    filePlayer->transport.stop();
+
+    std::unique_ptr<juce::XmlElement> snap (juce::XmlDocument::parse (backendStateFile (want)));
+    if (snap != nullptr)
+        deviceManager.initialise (8, 2, snap.get(), true);
+    else
+        deviceManager.setCurrentAudioDeviceType (want, true);   // first time: default device
+
+    rebuildConnections();
+
+    // The device (and possibly its sample rate) changed under the cache.
+    if (preRenderActive())
+        beginPreRender();
+
+    if (wasPlaying)
+        filePlayer->transport.start();
+
+    auto* dev = deviceManager.getCurrentAudioDevice();
+    setStatus ("Audio backend -> " + want
+               + (dev != nullptr ? " (" + dev->getName() + ")" : juce::String (" - no device opened!")));
+}
 
 juce::AudioPluginFormat* MainComponent::vst3Format() const
 {
@@ -456,6 +542,7 @@ void MainComponent::setInstrumentNode (std::unique_ptr<juce::AudioPluginInstance
 
     // Loading an instrument implies wanting to hear it: switch the source stage.
     sourceCombo.setSelectedId (srcInstrument, juce::dontSendNotification);
+    applyBackendForMode (srcInstrument);
 
     rebuildConnections();
     instLabel.setText ("Inst: " + desc.name + "  ("
@@ -657,6 +744,7 @@ void MainComponent::finishAudioFileLoad (std::unique_ptr<juce::AudioFormatReader
 
     // Opening a file implies wanting to hear it: switch the source stage.
     sourceCombo.setSelectedId (srcFile, juce::dontSendNotification);
+    applyBackendForMode (srcFile);
     rebuildConnections();
     setStatus ("Loaded " + original.getFileName() + " (source switched to file player)");
 
@@ -938,6 +1026,8 @@ void MainComponent::resized()
         sourceLabel.setBounds (r.removeFromLeft (110));
         r.removeFromLeft (6);
         sourceCombo.setBounds (r.removeFromLeft (220));
+        r.removeFromLeft (8);
+        autoBackendButton.setBounds (r);
     }
     {
         auto r = row (28);

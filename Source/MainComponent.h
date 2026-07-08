@@ -74,11 +74,17 @@ private:
     void audioProcessorParameterChanged (juce::AudioProcessor*, int, float) override;
     void audioProcessorChanged (juce::AudioProcessor*, const ChangeDetails&) override;
 
+    //== audio backend per source mode (WASAPI for file playback, ASIO for live) ==
+    void applyBackendForMode (int mode);
+    void saveBackendSnapshot();
+    juce::File backendStateFile (const juce::String& typeName) const;
+
     //== helpers ==
     juce::File appDir() const;
     juce::File cacheFile() const;
     juce::File audioStateFile() const;
     juce::File lastDirFile() const;
+    juce::File autoBackendFile() const;
     juce::AudioPluginFormat* vst3Format() const;
     int currentSourceMode() const;
 
@@ -122,6 +128,7 @@ private:
     juce::TextButton   resetAudioButton    { "Reset ASIO" };
     juce::ComboBox     sourceCombo;
     juce::Label        sourceLabel { {}, "Source:" };
+    juce::ToggleButton autoBackendButton { "Auto backend (file=WASAPI / live=ASIO)" };
 
     // FX stage
     juce::TextButton   loadButton   { "Load FX VST3..." };

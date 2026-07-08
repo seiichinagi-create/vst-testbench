@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.22)
-project(VstTestBench VERSION 0.6.0)
+project(VstTestBench VERSION 0.7.0)
 set(CMAKE_CXX_STANDARD 17)
 
 add_subdirectory("C:/JUCE" "${CMAKE_CURRENT_BINARY_DIR}/JUCE" EXCLUDE_FROM_ALL)
