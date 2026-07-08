@@ -25,6 +25,7 @@ namespace
 MainComponent::MainComponent()
 {
     juce::addDefaultFormatsToManager (formatManager);
+    audioFormats.registerBasicFormats();
     loadKnownPlugins();
 
     // --- audio + MIDI device ---
@@ -32,10 +33,16 @@ MainComponent::MainComponent()
     deviceManager.initialise (8, 2, savedAudio.get(), true);   // request up to 8 inputs / 2 outputs
     deviceManager.addChangeListener (this);
 
-    // --- processor graph: build the fixed IO nodes ---
+    // --- processor graph: build the fixed IO nodes + resident file player ---
     audioInNode  = graph.addNode (std::make_unique<Graph::AudioGraphIOProcessor> (Graph::AudioGraphIOProcessor::audioInputNode));
     audioOutNode = graph.addNode (std::make_unique<Graph::AudioGraphIOProcessor> (Graph::AudioGraphIOProcessor::audioOutputNode));
     midiInNode   = graph.addNode (std::make_unique<Graph::AudioGraphIOProcessor> (Graph::AudioGraphIOProcessor::midiInputNode));
+
+    {
+        auto fp = std::make_unique<FilePlayerProcessor>();
+        filePlayer = fp.get();
+        filePlayerNode = graph.addNode (std::move (fp));
+    }
 
     player.setProcessor (&graph);
     deviceManager.addAudioCallback (&player);
@@ -45,21 +52,124 @@ MainComponent::MainComponent()
 
     // === UI ===
     auto addBtn = [this] (juce::Button& b) { addAndMakeVisible (b); };
-    addBtn (audioSettingsButton); addBtn (loadButton); addBtn (editorButton);
+    addBtn (audioSettingsButton); addBtn (resetAudioButton);
+    addBtn (loadButton); addBtn (editorButton);
     addBtn (clearButton);         addBtn (bypassButton); addBtn (midiThruButton);
+    addBtn (loadInstButton);      addBtn (instEditorButton); addBtn (clearInstButton);
+    addBtn (openFileButton);      addBtn (playButton); addBtn (stopButton); addBtn (loopButton);
 
     audioSettingsButton.onClick = [this] { showAudioSettings(); };
-    loadButton.onClick          = [this] { loadPluginDialog(); };
-    editorButton.onClick        = [this] { toggleEditor(); };
-    clearButton.onClick         = [this] { removePlugin(); };
+    resetAudioButton.onClick    = [this]
+    {
+        // One-click recovery when the ASIO driver goes irregular (post-xrun).
+        const bool wasPlaying = filePlayer->transport.isPlaying();
+        filePlayer->transport.stop();
+        deviceManager.closeAudioDevice();
+        deviceManager.restartLastAudioDevice();
+        rebuildConnections();
+        if (wasPlaying) filePlayer->transport.start();
+        setStatus ("Audio device restarted.");
+    };
+    loadButton.onClick          = [this] { loadPluginDialog (false); };
+    loadInstButton.onClick      = [this] { loadPluginDialog (true); };
+    editorButton.onClick        = [this] { toggleEditorFor (effectNode, currentEffectName, editorWindow); };
+    instEditorButton.onClick    = [this] { toggleEditorFor (instrumentNode, currentInstrumentName, instEditorWindow); };
+    clearButton.onClick         = [this] { removeEffect(); };
+    clearInstButton.onClick     = [this] { removeInstrument(); };
 
     midiThruButton.setToggleState (true, juce::dontSendNotification);
     midiThruButton.onClick = [this] { midiThru = midiThruButton.getToggleState(); };
     bypassButton.onClick   = [this]
     {
-        if (pluginNode != nullptr)
-            pluginNode->setBypassed (bypassButton.getToggleState());
+        // In pre-render mode the live FX node stays bypassed (render thread owns the sound).
+        if (effectNode != nullptr && ! preRenderActive())
+            effectNode->setBypassed (bypassButton.getToggleState());
     };
+
+    // --- source selector ---
+    sourceLabel.setJustificationType (juce::Justification::centredRight);
+    addAndMakeVisible (sourceLabel);
+    addAndMakeVisible (sourceCombo);
+    sourceCombo.addItem ("Live input (audio in)", srcLive);
+    sourceCombo.addItem ("VST instrument (MIDI)", srcInstrument);
+    sourceCombo.addItem ("Audio file player",     srcFile);
+    sourceCombo.setSelectedId (srcLive, juce::dontSendNotification);
+    sourceCombo.onChange = [this]
+    {
+        if (currentSourceMode() != srcFile && preRenderButton.getToggleState())
+            setPreRenderEnabled (false);   // pre-render only exists in file mode
+        rebuildConnections();
+        switch (currentSourceMode())
+        {
+            case srcInstrument: setStatus (instrumentNode != nullptr ? "Source: VSTi -> FX"
+                                                                     : "Source: VSTi (load one first)"); break;
+            case srcFile:       setStatus (filePlayer->hasFile() ? "Source: file player -> FX"
+                                                                 : "Source: file player (open a file)"); break;
+            default:            setStatus ("Source: live input -> FX"); break;
+        }
+    };
+
+    // --- file player transport ---
+    playButton.onClick = [this]
+    {
+        auto& t = filePlayer->transport;
+        if (! filePlayer->hasFile()) { setStatus ("No audio file loaded."); return; }
+        if (t.isPlaying())
+            t.stop();
+        else
+        {
+            if (t.hasStreamFinished() || t.getCurrentPosition() >= t.getLengthInSeconds() - 0.05)
+                t.setPosition (0.0);
+            t.start();
+        }
+    };
+    stopButton.onClick = [this]
+    {
+        filePlayer->transport.stop();
+        filePlayer->transport.setPosition (0.0);
+    };
+    loopButton.onClick = [this]
+    {
+        filePlayer->setLooping (loopButton.getToggleState());
+        if (cacheSource != nullptr)
+            cacheSource->setLooping (loopButton.getToggleState());
+    };
+    openFileButton.onClick = [this] { openAudioFileDialog(); };
+
+    addAndMakeVisible (preRenderButton);
+    preRenderButton.setTooltip ("Render the file through the FX chain ahead of playback; the audio thread only streams RAM.");
+    preRenderButton.onClick = [this] { setPreRenderEnabled (preRenderButton.getToggleState()); };
+
+    renderLabel.setJustificationType (juce::Justification::centredLeft);
+    renderLabel.setColour (juce::Label::textColourId, juce::Colours::orange);
+    renderLabel.setText ("PRE-RENDER off", juce::dontSendNotification);
+    addAndMakeVisible (renderLabel);
+
+    posSlider.setSliderStyle (juce::Slider::LinearHorizontal);
+    posSlider.setTextBoxStyle (juce::Slider::NoTextBox, true, 0, 0);
+    posSlider.setRange (0.0, 1.0);
+    posSlider.onValueChange = [this]
+    {
+        // Only fires for user gestures: the timer updates with dontSendNotification.
+        if (filePlayer->hasFile())
+            filePlayer->transport.setPosition (posSlider.getValue());
+    };
+    addAndMakeVisible (posSlider);
+
+    timeLabel.setJustificationType (juce::Justification::centredRight);
+    timeLabel.setColour (juce::Label::textColourId, juce::Colours::lightgrey);
+    timeLabel.setText ("--:-- / --:--", juce::dontSendNotification);
+    addAndMakeVisible (timeLabel);
+
+    fileLabel.setJustificationType (juce::Justification::centredLeft);
+    fileLabel.setColour (juce::Label::textColourId, juce::Colours::khaki);
+    fileLabel.setText ("No audio file loaded", juce::dontSendNotification);
+    addAndMakeVisible (fileLabel);
+
+    instLabel.setJustificationType (juce::Justification::centredLeft);
+    instLabel.setColour (juce::Label::textColourId, juce::Colours::lightgreen);
+    instLabel.setText ("No instrument loaded", juce::dontSendNotification);
+    addAndMakeVisible (instLabel);
 
     for (auto* l : { &midiOutLabel, &inputPairLabel, &recentLabel })
     {
@@ -93,7 +203,7 @@ MainComponent::MainComponent()
         const int idx = recentCombo.getSelectedId() - 1;
         auto types = knownPlugins.getTypes();
         if (idx >= 0 && idx < types.size())
-            loadPluginFromDescription (types[idx]);
+            loadPluginFromDescription (types[idx], types[idx].isInstrument);
     };
 
     pluginLabel.setJustificationType (juce::Justification::centredLeft);
@@ -107,14 +217,20 @@ MainComponent::MainComponent()
     refreshMidiOutList();
     refreshRecentList();
     setStatus ("Ready. Open Audio/MIDI Settings and pick UR-RT2 (ASIO).");
-    pluginLabel.setText ("No plugin loaded (input -> output monitor)", juce::dontSendNotification);
+    pluginLabel.setText ("No FX loaded (source -> output monitor)", juce::dontSendNotification);
 
-    setSize (640, 380);
+    startTimerHz (10);
+    setSize (680, 600);
 }
 
 MainComponent::~MainComponent()
 {
+    stopTimer();
+    renderEngine.stopRender();
+    if (effectNode != nullptr)
+        effectNode->getProcessor()->removeListener (this);
     editorWindow = nullptr;
+    instEditorWindow = nullptr;
     deviceManager.removeMidiInputDeviceCallback ({}, this);
     deviceManager.removeMidiInputDeviceCallback ({}, &player);
     deviceManager.removeAudioCallback (&player);
@@ -138,6 +254,7 @@ juce::File MainComponent::appDir() const
 }
 juce::File MainComponent::cacheFile()      const { return appDir().getChildFile ("known_plugins.xml"); }
 juce::File MainComponent::audioStateFile() const { return appDir().getChildFile ("audio_settings.xml"); }
+juce::File MainComponent::lastDirFile()    const { return appDir().getChildFile ("last_audio_dir.txt"); }
 
 juce::AudioPluginFormat* MainComponent::vst3Format() const
 {
@@ -145,6 +262,12 @@ juce::AudioPluginFormat* MainComponent::vst3Format() const
         if (f->getName().containsIgnoreCase ("VST3"))
             return f;
     return nullptr;
+}
+
+int MainComponent::currentSourceMode() const
+{
+    const int id = sourceCombo.getSelectedId();
+    return id > 0 ? id : (int) srcLive;
 }
 
 void MainComponent::setStatus (const juce::String& s)
@@ -170,7 +293,7 @@ void MainComponent::refreshRecentList()
     recentCombo.clear (juce::dontSendNotification);
     auto types = knownPlugins.getTypes();
     for (int i = 0; i < types.size(); ++i)
-        recentCombo.addItem (types[i].name, i + 1);
+        recentCombo.addItem ((types[i].isInstrument ? "[inst] " : "[fx] ") + types[i].name, i + 1);
     recentCombo.setTextWhenNothingSelected (types.isEmpty() ? "(none cached yet)"
                                                             : "select cached plugin...");
 }
@@ -224,17 +347,17 @@ void MainComponent::showAudioSettings()
 }
 
 //==============================================================================
-void MainComponent::loadPluginDialog()
+void MainComponent::loadPluginDialog (bool asInstrument)
 {
     auto chooser = std::make_shared<juce::FileChooser> (
-        "Select a VST3 plugin",
+        asInstrument ? "Select a VST3 instrument" : "Select a VST3 effect",
         juce::File ("C:/Program Files/Common Files/VST3"),
         "*.vst3");
 
     chooser->launchAsync (juce::FileBrowserComponent::openMode
                           | juce::FileBrowserComponent::canSelectFiles
                           | juce::FileBrowserComponent::canSelectDirectories,
-        [this, chooser] (const juce::FileChooser& fc)
+        [this, chooser, asInstrument] (const juce::FileChooser& fc)
         {
             auto file = fc.getResult();
             if (file == juce::File{}) return;
@@ -251,11 +374,11 @@ void MainComponent::loadPluginDialog()
             if (found.isEmpty())
                 setStatus ("No plugin found in " + file.getFileName());
             else
-                loadPluginFromDescription (*found.getFirst());
+                loadPluginFromDescription (*found.getFirst(), asInstrument);
         });
 }
 
-void MainComponent::loadPluginFromDescription (const juce::PluginDescription& desc)
+void MainComponent::loadPluginFromDescription (const juce::PluginDescription& desc, bool asInstrument)
 {
     auto setup = deviceManager.getAudioDeviceSetup();
     const double rate  = setup.sampleRate > 0 ? setup.sampleRate : 48000.0;
@@ -264,56 +387,115 @@ void MainComponent::loadPluginFromDescription (const juce::PluginDescription& de
     setStatus ("Loading " + desc.name + " ...");
     formatManager.createPluginInstanceAsync (
         desc, rate, block,
-        [this, desc] (std::unique_ptr<juce::AudioPluginInstance> instance, const juce::String& error)
+        [this, desc, asInstrument] (std::unique_ptr<juce::AudioPluginInstance> instance, const juce::String& error)
         {
             if (instance == nullptr)
             {
                 setStatus ("Load failed: " + error);
                 return;
             }
-            setPluginNode (std::move (instance), desc);
+            if (asInstrument)
+                setInstrumentNode (std::move (instance), desc);
+            else
+                setEffectNode (std::move (instance), desc);
         });
 }
 
-void MainComponent::setPluginNode (std::unique_ptr<juce::AudioPluginInstance> instance,
+static void configureInstance (juce::AudioPluginInstance& instance,
+                               const juce::AudioDeviceManager& dm)
+{
+    instance.enableAllBuses();
+    auto setup = dm.getAudioDeviceSetup();
+    instance.setPlayConfigDetails (instance.getTotalNumInputChannels(),
+                                   instance.getTotalNumOutputChannels(),
+                                   setup.sampleRate > 0 ? setup.sampleRate : 48000.0,
+                                   setup.bufferSize  > 0 ? setup.bufferSize  : 512);
+}
+
+void MainComponent::setEffectNode (std::unique_ptr<juce::AudioPluginInstance> instance,
                                    const juce::PluginDescription& desc)
 {
     editorWindow = nullptr;
-    if (pluginNode != nullptr)
-        graph.removeNode (pluginNode->nodeID);
+    if (effectNode != nullptr)
+    {
+        effectNode->getProcessor()->removeListener (this);
+        graph.removeNode (effectNode->nodeID);
+    }
 
-    instance->enableAllBuses();
+    renderEngine.stopRender();
+    offlineFx.reset();          // clone of the previous FX, now stale
+    currentFxDesc = desc;
 
-    auto setup = deviceManager.getAudioDeviceSetup();
-    instance->setPlayConfigDetails (instance->getTotalNumInputChannels(),
-                                    instance->getTotalNumOutputChannels(),
-                                    setup.sampleRate > 0 ? setup.sampleRate : 48000.0,
-                                    setup.bufferSize  > 0 ? setup.bufferSize  : 512);
-
-    pluginNode = graph.addNode (std::move (instance));
-    pluginNode->setBypassed (bypassButton.getToggleState());
-    currentPluginName = desc.name;
+    configureInstance (*instance, deviceManager);
+    effectNode = graph.addNode (std::move (instance));
+    effectNode->setBypassed (preRenderActive() || bypassButton.getToggleState());
+    effectNode->getProcessor()->addListener (this);
+    currentEffectName = desc.name;
 
     rebuildConnections();
-    pluginLabel.setText ("VST: " + desc.name + "  ("
-                         + juce::String (pluginNode->getProcessor()->getTotalNumInputChannels()) + " in / "
-                         + juce::String (pluginNode->getProcessor()->getTotalNumOutputChannels()) + " out)",
+
+    if (preRenderActive())
+        createOfflineFx();      // re-render kicks off once the clone is ready
+    pluginLabel.setText ("FX: " + desc.name + "  ("
+                         + juce::String (effectNode->getProcessor()->getTotalNumInputChannels()) + " in / "
+                         + juce::String (effectNode->getProcessor()->getTotalNumOutputChannels()) + " out)",
                          juce::dontSendNotification);
-    setStatus ("Loaded " + desc.name);
+    setStatus ("Loaded FX " + desc.name);
 }
 
-void MainComponent::removePlugin()
+void MainComponent::setInstrumentNode (std::unique_ptr<juce::AudioPluginInstance> instance,
+                                       const juce::PluginDescription& desc)
+{
+    instEditorWindow = nullptr;
+    if (instrumentNode != nullptr)
+        graph.removeNode (instrumentNode->nodeID);
+
+    configureInstance (*instance, deviceManager);
+    instrumentNode = graph.addNode (std::move (instance));
+    currentInstrumentName = desc.name;
+
+    // Loading an instrument implies wanting to hear it: switch the source stage.
+    sourceCombo.setSelectedId (srcInstrument, juce::dontSendNotification);
+
+    rebuildConnections();
+    instLabel.setText ("Inst: " + desc.name + "  ("
+                       + juce::String (instrumentNode->getProcessor()->getTotalNumOutputChannels()) + " out)",
+                       juce::dontSendNotification);
+    setStatus ("Loaded instrument " + desc.name + " (source switched to VSTi)");
+}
+
+void MainComponent::removeEffect()
 {
     editorWindow = nullptr;
-    if (pluginNode != nullptr)
+    renderEngine.stopRender();
+    offlineFx.reset();
+    if (effectNode != nullptr)
     {
-        graph.removeNode (pluginNode->nodeID);
-        pluginNode = nullptr;
+        effectNode->getProcessor()->removeListener (this);
+        graph.removeNode (effectNode->nodeID);
+        effectNode = nullptr;
     }
-    currentPluginName = {};
+    currentEffectName = {};
     rebuildConnections();
-    pluginLabel.setText ("No plugin loaded (input -> output monitor)", juce::dontSendNotification);
-    setStatus ("Plugin removed.");
+    pluginLabel.setText ("No FX loaded (source -> output monitor)", juce::dontSendNotification);
+    setStatus ("FX removed.");
+
+    if (preRenderActive())
+        syncOfflineStateAndRender();   // re-render dry
+}
+
+void MainComponent::removeInstrument()
+{
+    instEditorWindow = nullptr;
+    if (instrumentNode != nullptr)
+    {
+        graph.removeNode (instrumentNode->nodeID);
+        instrumentNode = nullptr;
+    }
+    currentInstrumentName = {};
+    rebuildConnections();
+    instLabel.setText ("No instrument loaded", juce::dontSendNotification);
+    setStatus ("Instrument removed.");
 }
 
 //==============================================================================
@@ -323,47 +505,333 @@ void MainComponent::rebuildConnections()
         graph.removeConnection (c);
 
     const int outChans = 2;
+    const int mode = currentSourceMode();
 
-    if (pluginNode != nullptr)
+    // --- pick the source node feeding the FX stage ---
+    Graph::Node::Ptr src;
+    int srcChanBase = 0;
+    int srcChans    = 2;
+
+    if (mode == srcInstrument && instrumentNode != nullptr)
     {
-        auto* proc = pluginNode->getProcessor();
+        src = instrumentNode;
+        srcChans = instrumentNode->getProcessor()->getTotalNumOutputChannels();
+    }
+    else if (mode == srcFile)
+    {
+        src = filePlayerNode;
+    }
+    else   // live input (also the fallback when no instrument is loaded)
+    {
+        src = audioInNode;
+        srcChanBase = inputPairStart;
+    }
+
+    // MIDI in -> instrument (whenever one is loaded, regardless of mode)
+    if (instrumentNode != nullptr)
+        graph.addConnection ({ { midiInNode->nodeID,     Graph::midiChannelIndex },
+                               { instrumentNode->nodeID, Graph::midiChannelIndex } });
+
+    if (effectNode != nullptr && ! preRenderActive())
+    {
+        auto* proc = effectNode->getProcessor();
         const int pin  = juce::jmax (0, proc->getTotalNumInputChannels());
         const int pout = juce::jmax (0, proc->getTotalNumOutputChannels());
 
-        // audio in (chosen pair) -> plugin inputs
-        for (int ch = 0; ch < juce::jmin (2, pin); ++ch)
-            graph.addConnection ({ { audioInNode->nodeID,  inputPairStart + ch },
-                                   { pluginNode->nodeID,   ch } });
+        // source -> FX inputs
+        for (int ch = 0; ch < juce::jmin (2, srcChans, pin); ++ch)
+            graph.addConnection ({ { src->nodeID,        srcChanBase + ch },
+                                   { effectNode->nodeID, ch } });
 
-        // plugin outputs -> device out
+        // FX outputs -> device out
         for (int ch = 0; ch < juce::jmin (outChans, pout); ++ch)
-            graph.addConnection ({ { pluginNode->nodeID,  ch },
+            graph.addConnection ({ { effectNode->nodeID,  ch },
                                    { audioOutNode->nodeID, ch } });
 
-        // MIDI in -> plugin (for VSTi testing)
-        graph.addConnection ({ { midiInNode->nodeID,  Graph::midiChannelIndex },
-                               { pluginNode->nodeID,  Graph::midiChannelIndex } });
+        // MIDI in -> FX (for MIDI-controlled effects)
+        graph.addConnection ({ { midiInNode->nodeID, Graph::midiChannelIndex },
+                               { effectNode->nodeID, Graph::midiChannelIndex } });
     }
     else
     {
-        // No plugin: monitor the chosen input pair straight to the outputs.
-        for (int ch = 0; ch < outChans; ++ch)
-            graph.addConnection ({ { audioInNode->nodeID,  inputPairStart + ch },
+        // No FX (or pre-render mode: FX already baked into the cache) ->
+        // stream the source straight to the outputs.
+        for (int ch = 0; ch < juce::jmin (outChans, srcChans); ++ch)
+            graph.addConnection ({ { src->nodeID,         srcChanBase + ch },
                                    { audioOutNode->nodeID, ch } });
     }
 }
 
 //==============================================================================
-void MainComponent::toggleEditor()
+void MainComponent::openAudioFileDialog()
 {
-    if (editorWindow != nullptr) { editorWindow = nullptr; return; }
-    if (pluginNode == nullptr)   { setStatus ("No plugin to show."); return; }
+    juce::File startDir (lastDirFile().loadFileAsString().trim());
+    if (! startDir.isDirectory())
+        startDir = juce::File::getSpecialLocation (juce::File::userMusicDirectory);
 
-    auto* proc = pluginNode->getProcessor();
+    auto chooser = std::make_shared<juce::FileChooser> (
+        "Select an audio file",
+        startDir,
+        "*.wav;*.aif;*.aiff;*.flac;*.mp3;*.ogg;*.opus;*.m4a;*.aac;*.alac;*.wma;*.caf");
+
+    chooser->launchAsync (juce::FileBrowserComponent::openMode
+                          | juce::FileBrowserComponent::canSelectFiles,
+        [this, chooser] (const juce::FileChooser& fc)
+        {
+            auto file = fc.getResult();
+            if (file == juce::File{}) return;
+            lastDirFile().replaceWithText (file.getParentDirectory().getFullPathName());
+            loadAudioFile (file);
+        });
+}
+
+void MainComponent::loadAudioFile (const juce::File& file)
+{
+    std::unique_ptr<juce::AudioFormatReader> reader (audioFormats.createReaderFor (file));
+    if (reader != nullptr)
+    {
+        finishAudioFileLoad (std::move (reader), file, file);
+        return;
+    }
+    // Not natively decodable (opus / m4a / alac ...) -> ffmpeg fallback.
+    setStatus ("No native decoder for " + file.getFileExtension() + " -> converting via ffmpeg ...");
+    convertWithFfmpegAsync (file);
+}
+
+void MainComponent::convertWithFfmpegAsync (const juce::File& source)
+{
+    const auto dest = appDir().getChildFile ("decode_cache.wav");
+    juce::Component::SafePointer<MainComponent> safeThis (this);
+
+    juce::Thread::launch ([safeThis, source, dest]
+    {
+        dest.deleteFile();
+        juce::ChildProcess proc;
+        juce::StringArray args { "ffmpeg", "-y", "-i", source.getFullPathName(),
+                                 "-acodec", "pcm_f32le", dest.getFullPathName() };
+        juce::String error;
+        if (! proc.start (args, 0))
+            error = "ffmpeg not found on PATH. Install ffmpeg or use wav/flac/mp3/ogg.";
+        else if (! proc.waitForProcessToFinish (120000) || ! dest.existsAsFile())
+            error = "ffmpeg conversion failed for " + source.getFileName();
+
+        juce::MessageManager::callAsync ([safeThis, source, dest, error]
+        {
+            if (safeThis == nullptr) return;
+            if (error.isNotEmpty()) { safeThis->setStatus (error); return; }
+
+            std::unique_ptr<juce::AudioFormatReader> reader (
+                safeThis->audioFormats.createReaderFor (dest));
+            if (reader == nullptr) { safeThis->setStatus ("Could not read converted wav."); return; }
+            safeThis->finishAudioFileLoad (std::move (reader), source, dest);
+        });
+    });
+}
+
+void MainComponent::finishAudioFileLoad (std::unique_ptr<juce::AudioFormatReader> reader,
+                                         const juce::File& original, const juce::File& readable)
+{
+    renderEngine.stopRender();   // a running render targets the previous file
+
+    const double srcRate  = reader->sampleRate;
+    const int    channels = (int) reader->numChannels;
+    fileLengthSamples   = reader->lengthInSamples;
+    fileSampleRate      = srcRate;
+    currentOriginalFile = original;
+    currentPlayableFile = readable;
+
+    if (! filePlayer->loadReader (std::move (reader), loopButton.getToggleState()))
+    {
+        setStatus ("Failed to load " + original.getFileName());
+        return;
+    }
+
+    const double len = filePlayer->transport.getLengthInSeconds();
+    posSlider.setRange (0.0, juce::jmax (0.01, len));
+    posSlider.setValue (0.0, juce::dontSendNotification);
+
+    fileLabel.setText (original.getFileName()
+                       + "  (" + juce::String (srcRate / 1000.0, 1) + " kHz, "
+                       + juce::String (channels) + " ch, " + formatTime (len) + ")",
+                       juce::dontSendNotification);
+
+    // Opening a file implies wanting to hear it: switch the source stage.
+    sourceCombo.setSelectedId (srcFile, juce::dontSendNotification);
+    rebuildConnections();
+    setStatus ("Loaded " + original.getFileName() + " (source switched to file player)");
+
+    if (preRenderButton.getToggleState())
+        beginPreRender();   // new file -> new cache
+}
+
+juce::String MainComponent::formatTime (double seconds) const
+{
+    const int total = (int) std::floor (juce::jmax (0.0, seconds));
+    return juce::String::formatted ("%d:%02d", total / 60, total % 60);
+}
+
+//==============================================================================
+bool MainComponent::preRenderActive() const
+{
+    return preRenderButton.getToggleState() && currentSourceMode() == srcFile;
+}
+
+void MainComponent::setPreRenderEnabled (bool shouldEnable)
+{
+    if (shouldEnable)
+    {
+        if (currentSourceMode() != srcFile || ! filePlayer->hasFile())
+        {
+            setStatus ("PRE-RENDER needs the file player as source with a file loaded.");
+            preRenderButton.setToggleState (false, juce::dontSendNotification);
+            return;
+        }
+        preRenderButton.setToggleState (true, juce::dontSendNotification);
+        beginPreRender();
+    }
+    else
+    {
+        preRenderButton.setToggleState (false, juce::dontSendNotification);
+        renderEngine.stopRender();
+        filePlayer->reattachReader();
+        if (effectNode != nullptr)
+            effectNode->setBypassed (bypassButton.getToggleState());
+        rebuildConnections();
+        renderLabel.setText ("PRE-RENDER off", juce::dontSendNotification);
+        setStatus ("PRE-RENDER off: FX back in the live path.");
+    }
+}
+
+void MainComponent::beginPreRender()
+{
+    renderEngine.stopRender();
+
+    // 150M samples @48k stereo float ~= 52 min / 1.2 GB RAM - a sane ceiling.
+    if (fileLengthSamples <= 0 || fileLengthSamples > 150'000'000)
+    {
+        setStatus ("File too long for PRE-RENDER cache (or no file).");
+        preRenderButton.setToggleState (false, juce::dontSendNotification);
+        return;
+    }
+
+    // Safe to (re)allocate here: the transport is currently on the reader
+    // source (fresh load or toggle-on), so nothing reads the cache buffer.
+    renderCache.primed.store (false);   // toggle-on always starts with a deterministic full render
+    renderCache.valid.store (0);
+    renderCache.length     = fileLengthSamples;
+    renderCache.sampleRate = fileSampleRate;
+    renderCache.data.setSize (2, (int) fileLengthSamples, false, true, true);
+
+    if (cacheSource == nullptr)
+        cacheSource = std::make_unique<CacheAudioSource> (renderCache);
+    cacheSource->setLooping (loopButton.getToggleState());
+
+    filePlayer->attachExternalSource (cacheSource.get(), fileSampleRate);
+    if (effectNode != nullptr)
+        effectNode->setBypassed (true);   // live node parked; render thread owns the sound
+    rebuildConnections();
+
+    if (effectNode != nullptr && offlineFx == nullptr)
+    {
+        if (! offlineFxLoading)
+            createOfflineFx();            // render starts when the clone arrives
+    }
+    else
+        syncOfflineStateAndRender();
+}
+
+void MainComponent::createOfflineFx()
+{
+    offlineFxLoading = true;
+    setStatus ("Creating offline FX instance ...");
+    formatManager.createPluginInstanceAsync (
+        currentFxDesc,
+        fileSampleRate > 0 ? fileSampleRate : 48000.0, 4096,
+        [this] (std::unique_ptr<juce::AudioPluginInstance> instance, const juce::String& error)
+        {
+            offlineFxLoading = false;
+            if (instance == nullptr)
+            {
+                setStatus ("Offline FX load failed: " + error);
+                setPreRenderEnabled (false);
+                return;
+            }
+            offlineFx = std::move (instance);
+            if (preRenderActive())
+                syncOfflineStateAndRender();
+        });
+}
+
+void MainComponent::syncOfflineStateAndRender (bool quickOnly)
+{
+    if (effectNode != nullptr && offlineFx != nullptr)
+    {
+        juce::MemoryBlock state;
+        effectNode->getProcessor()->getStateInformation (state);
+        if (state.getSize() > 0)
+            offlineFx->setStateInformation (state.getData(), (int) state.getSize());
+    }
+
+    fxStale = false;
+
+    // After the first full render, re-renders target a SWITCH POINT slightly
+    // ahead of the playhead (HLS-style segment switch): by the time playback
+    // arrives there, the new sound is already laid down - a deterministic,
+    // sample-aligned transition instead of a writer-overtakes-reader race.
+    // Quick renders only refresh a short window past the switch point; the
+    // deferred full render (janitor) sweeps the file once the knobs go quiet.
+    juce::int64 startSample = 0, quickWindow = 0;
+    if (renderCache.primed.load())
+    {
+        const double curSec = filePlayer->transport.getCurrentPosition();
+        double leadSec = 0.0;
+        if (filePlayer->transport.isPlaying())
+        {
+            // Enough lead to burn the 2s warm-up before the playhead arrives,
+            // scaled by the measured render speed (0.5s fast .. 3s heavy).
+            leadSec = juce::jlimit (0.5, 3.0, 1.5 * 2.0 / juce::jmax (1.0f, lastRenderSpeed));
+        }
+        startSample = (juce::int64) ((curSec + leadSec) * fileSampleRate);
+        if (startSample >= fileLengthSamples)
+            startSample = loopButton.getToggleState() ? startSample - fileLengthSamples
+                                                      : fileLengthSamples;
+        if (quickOnly)
+            quickWindow = (juce::int64) (25.0 * fileSampleRate);
+    }
+
+    renderEngine.startRender (currentPlayableFile, audioFormats,
+                              effectNode != nullptr ? offlineFx.get() : nullptr,
+                              renderCache, startSample, quickWindow);
+}
+
+void MainComponent::audioProcessorParameterChanged (juce::AudioProcessor*, int, float)
+{
+    // May arrive on any thread: only touch atomics.
+    fxStale = true;
+    lastParamChangeMs = juce::Time::getMillisecondCounter();
+}
+
+void MainComponent::audioProcessorChanged (juce::AudioProcessor*, const ChangeDetails& details)
+{
+    if (details.parameterInfoChanged || details.programChanged)
+    {
+        fxStale = true;
+        lastParamChangeMs = juce::Time::getMillisecondCounter();
+    }
+}
+
+//==============================================================================
+void MainComponent::toggleEditorFor (Graph::Node::Ptr node, const juce::String& name,
+                                     std::unique_ptr<juce::DocumentWindow>& window)
+{
+    if (window != nullptr) { window = nullptr; return; }
+    if (node == nullptr)   { setStatus ("No plugin to show."); return; }
+
+    auto* proc = node->getProcessor();
     juce::AudioProcessorEditor* editor = proc->hasEditor() ? proc->createEditorAndMakeActive()
                                                            : new juce::GenericAudioProcessorEditor (*proc);
     if (editor == nullptr) editor = new juce::GenericAudioProcessorEditor (*proc);
-    editorWindow.reset (new PluginEditorWindow (currentPluginName, editor));
+    window.reset (new PluginEditorWindow (name, editor));
 }
 
 //==============================================================================
@@ -379,6 +847,67 @@ void MainComponent::changeListenerCallback (juce::ChangeBroadcaster*)
 {
     // Device layout may have changed; keep monitor/plugin wiring valid.
     rebuildConnections();
+}
+
+void MainComponent::timerCallback()
+{
+    // --- PRE-RENDER housekeeping ---
+    if (preRenderActive())
+    {
+        if (renderEngine.isRendering())
+        {
+            lastRenderSpeed = renderEngine.speedX.load();
+            const char* fmt = renderEngine.quickMode.load()  ? "Quick update... %d%%  (%.1fx realtime)"
+                            : renderEngine.fromCursor.load() ? "Updating from cursor... %d%%  (%.1fx realtime)"
+                                                             : "Rendering... %d%%  (%.1fx realtime)";
+            renderLabel.setText (juce::String::formatted (fmt,
+                                     (int) (renderEngine.progress.load() * 100.0f),
+                                     lastRenderSpeed),
+                                 juce::dontSendNotification);
+        }
+        else if (renderEngine.failed.load())
+            renderLabel.setText ("Render FAILED", juce::dontSendNotification);
+        else if (fxStale.load())
+            renderLabel.setText ("FX changed - re-render pending...", juce::dontSendNotification);
+        else if (needsFullRefresh)
+            renderLabel.setText ("Window fresh - full sweep when knobs settle...", juce::dontSendNotification);
+        else if (renderEngine.finished.load())
+            renderLabel.setText (juce::String::formatted ("Cache ready  (%.1fx realtime)",
+                                                          lastRenderSpeed),
+                                 juce::dontSendNotification);
+
+        const auto now = juce::Time::getMillisecondCounter();
+        const bool renderIdle = ! renderEngine.isRendering() && ! offlineFxLoading;
+
+        // Debounced quick render after knob movement: only refresh the
+        // listening window, so knob-twiddling stays cheap.
+        if (fxStale.load() && renderIdle && now - lastParamChangeMs.load() > 600)
+        {
+            syncOfflineStateAndRender (true);
+            needsFullRefresh = true;
+        }
+        // Janitor: once the knobs have been quiet for a while, do the full
+        // cursor-first sweep so the whole cache converges to fresh.
+        else if (needsFullRefresh && renderIdle && ! fxStale.load()
+                 && now - lastParamChangeMs.load() > 3000)
+        {
+            needsFullRefresh = false;
+            syncOfflineStateAndRender (false);
+        }
+    }
+
+    if (! filePlayer->hasFile())
+        return;
+
+    auto& t = filePlayer->transport;
+    const double pos = t.getCurrentPosition();
+    const double len = t.getLengthInSeconds();
+
+    if (! posSlider.isMouseButtonDown())
+        posSlider.setValue (pos, juce::dontSendNotification);
+
+    timeLabel.setText (formatTime (pos) + " / " + formatTime (len), juce::dontSendNotification);
+    playButton.setButtonText (t.isPlaying() ? "Pause" : "Play");
 }
 
 //==============================================================================
@@ -397,13 +926,24 @@ void MainComponent::resized()
 
     auto row = [&area] (int h) { auto r = area.removeFromTop (h); area.removeFromTop (8); return r; };
 
-    audioSettingsButton.setBounds (row (30));
+    {
+        auto r = row (30);
+        resetAudioButton.setBounds (r.removeFromRight (110));
+        r.removeFromRight (6);
+        audioSettingsButton.setBounds (r);
+    }
 
+    {
+        auto r = row (28);
+        sourceLabel.setBounds (r.removeFromLeft (110));
+        r.removeFromLeft (6);
+        sourceCombo.setBounds (r.removeFromLeft (220));
+    }
     {
         auto r = row (28);
         recentLabel.setBounds (r.removeFromLeft (110));
         r.removeFromLeft (6);
-        recentCombo.setBounds (r.removeFromLeft (r.getWidth() - 130));
+        recentCombo.setBounds (r.removeFromLeft (r.getWidth() - 140));
         r.removeFromLeft (6);
         loadButton.setBounds (r);
     }
@@ -421,13 +961,51 @@ void MainComponent::resized()
         r.removeFromLeft (6);
         midiThruButton.setBounds (r);
     }
+
+    // --- instrument stage ---
     {
         auto r = row (30);
-        editorButton.setBounds (r.removeFromLeft (140));
+        loadInstButton.setBounds (r.removeFromLeft (130));
+        r.removeFromLeft (8);
+        instEditorButton.setBounds (r.removeFromLeft (90));
+        r.removeFromLeft (8);
+        clearInstButton.setBounds (r.removeFromLeft (110));
+    }
+    instLabel.setBounds (row (22));
+
+    // --- file player ---
+    {
+        auto r = row (30);
+        openFileButton.setBounds (r.removeFromLeft (150));
+        r.removeFromLeft (8);
+        playButton.setBounds (r.removeFromLeft (80));
+        r.removeFromLeft (8);
+        stopButton.setBounds (r.removeFromLeft (70));
+        r.removeFromLeft (8);
+        loopButton.setBounds (r.removeFromLeft (70));
+    }
+    {
+        auto r = row (26);
+        timeLabel.setBounds (r.removeFromRight (110));
+        r.removeFromRight (6);
+        posSlider.setBounds (r);
+    }
+    {
+        auto r = row (26);
+        preRenderButton.setBounds (r.removeFromLeft (130));
+        r.removeFromLeft (8);
+        renderLabel.setBounds (r);
+    }
+    fileLabel.setBounds (row (22));
+
+    // --- FX stage ---
+    {
+        auto r = row (30);
+        editorButton.setBounds (r.removeFromLeft (90));
         r.removeFromLeft (8);
         bypassButton.setBounds (r.removeFromLeft (110));
         r.removeFromLeft (8);
-        clearButton.setBounds (r.removeFromLeft (130));
+        clearButton.setBounds (r.removeFromLeft (110));
     }
 
     pluginLabel.setBounds (row (24));

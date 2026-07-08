@@ -1,16 +1,26 @@
 #pragma once
 
 #include <juce_audio_utils/juce_audio_utils.h>
+#include "FilePlayerProcessor.h"
+#include "RenderAheadEngine.h"
 
 //==============================================================================
 // Lightweight VST3 test-bench host.
-//   MIDI in  -> (thru)   -> Reface CP (hardware MIDI out)
-//   Audio in (UR-RT2 3/4) -> VST      -> Audio out (monitor)
+//
+//   Source stage (switchable)            FX stage
+//   ------------------------------       --------
+//   Live input (UR-RT2 pair)      \
+//   VST instrument <- MIDI in      >---> VST effect ---> Audio out
+//   Audio file player             /
+//
+//   MIDI in also goes thru to hardware (Reface CP) when enabled.
 // No folder scanning: plugins are loaded one file at a time and cached.
 //==============================================================================
 class MainComponent : public juce::Component,
                       private juce::MidiInputCallback,
-                      private juce::ChangeListener
+                      private juce::ChangeListener,
+                      private juce::Timer,
+                      private juce::AudioProcessorListener
 {
 public:
     MainComponent();
@@ -22,30 +32,55 @@ public:
 private:
     using Graph = juce::AudioProcessorGraph;
 
+    enum SourceMode { srcLive = 1, srcInstrument = 2, srcFile = 3 };
+
     //== actions ==
     void showAudioSettings();
-    void loadPluginDialog();
-    void loadPluginFromDescription (const juce::PluginDescription&);
-    void setPluginNode (std::unique_ptr<juce::AudioPluginInstance>, const juce::PluginDescription&);
-    void removePlugin();
+    void loadPluginDialog (bool asInstrument);
+    void loadPluginFromDescription (const juce::PluginDescription&, bool asInstrument);
+    void setEffectNode (std::unique_ptr<juce::AudioPluginInstance>, const juce::PluginDescription&);
+    void setInstrumentNode (std::unique_ptr<juce::AudioPluginInstance>, const juce::PluginDescription&);
+    void removeEffect();
+    void removeInstrument();
     void rebuildConnections();
     void refreshMidiOutList();
     void refreshRecentList();
     void openMidiOut (const juce::String& identifier);
-    void toggleEditor();
+    void toggleEditorFor (Graph::Node::Ptr, const juce::String& name,
+                          std::unique_ptr<juce::DocumentWindow>& window);
     void saveKnownPlugins();
     void loadKnownPlugins();
     void setStatus (const juce::String&);
 
+    //== file player ==
+    void openAudioFileDialog();
+    void loadAudioFile (const juce::File&);
+    void finishAudioFileLoad (std::unique_ptr<juce::AudioFormatReader>,
+                              const juce::File& original, const juce::File& readable);
+    void convertWithFfmpegAsync (const juce::File& source);
+    juce::String formatTime (double seconds) const;
+
+    //== PRE-RENDER (render-ahead cache) ==
+    bool preRenderActive() const;
+    void setPreRenderEnabled (bool);
+    void beginPreRender();
+    void createOfflineFx();
+    void syncOfflineStateAndRender (bool quickOnly = false);
+
     //== callbacks ==
     void handleIncomingMidiMessage (juce::MidiInput*, const juce::MidiMessage&) override;
     void changeListenerCallback (juce::ChangeBroadcaster*) override;
+    void timerCallback() override;
+    void audioProcessorParameterChanged (juce::AudioProcessor*, int, float) override;
+    void audioProcessorChanged (juce::AudioProcessor*, const ChangeDetails&) override;
 
     //== helpers ==
     juce::File appDir() const;
     juce::File cacheFile() const;
     juce::File audioStateFile() const;
+    juce::File lastDirFile() const;
     juce::AudioPluginFormat* vst3Format() const;
+    int currentSourceMode() const;
 
     //== audio graph ==
     juce::AudioDeviceManager deviceManager;
@@ -53,9 +88,27 @@ private:
     juce::AudioProcessorPlayer player;
     juce::AudioPluginFormatManager formatManager;
     juce::KnownPluginList knownPlugins;
+    juce::AudioFormatManager audioFormats;
 
-    Graph::Node::Ptr audioInNode, audioOutNode, midiInNode, pluginNode;
-    juce::String currentPluginName;
+    Graph::Node::Ptr audioInNode, audioOutNode, midiInNode;
+    Graph::Node::Ptr effectNode, instrumentNode, filePlayerNode;
+    FilePlayerProcessor* filePlayer = nullptr;   // owned by the graph node
+    juce::String currentEffectName, currentInstrumentName;
+
+    //== PRE-RENDER state ==
+    RenderCache renderCache;
+    std::unique_ptr<CacheAudioSource> cacheSource;
+    RenderAheadEngine renderEngine;
+    std::unique_ptr<juce::AudioPluginInstance> offlineFx;   // clone of the live FX, render thread only
+    bool offlineFxLoading = false;
+    juce::PluginDescription currentFxDesc;
+    juce::File currentPlayableFile, currentOriginalFile;    // playable = decoded (ffmpeg) file
+    juce::int64 fileLengthSamples = 0;
+    double fileSampleRate = 0.0;
+    std::atomic<bool> fxStale { false };
+    std::atomic<juce::uint32> lastParamChangeMs { 0 };
+    float lastRenderSpeed = 0.0f;
+    bool  needsFullRefresh = false;   // quick renders leave the rest of the file stale
 
     //== MIDI thru to Reface ==
     std::unique_ptr<juce::MidiOutput> midiOut;
@@ -66,19 +119,42 @@ private:
 
     //== UI ==
     juce::TextButton   audioSettingsButton { "Audio / MIDI Settings" };
-    juce::TextButton   loadButton          { "Load VST3 file..." };
-    juce::TextButton   editorButton        { "Open Plugin UI" };
-    juce::TextButton   clearButton         { "Remove Plugin" };
-    juce::ToggleButton bypassButton        { "Bypass VST" };
-    juce::ToggleButton midiThruButton      { "MIDI thru -> Reface" };
+    juce::TextButton   resetAudioButton    { "Reset ASIO" };
+    juce::ComboBox     sourceCombo;
+    juce::Label        sourceLabel { {}, "Source:" };
+
+    // FX stage
+    juce::TextButton   loadButton   { "Load FX VST3..." };
+    juce::TextButton   editorButton { "FX UI" };
+    juce::TextButton   clearButton  { "Remove FX" };
+    juce::ToggleButton bypassButton { "Bypass FX" };
+
+    // Instrument stage
+    juce::TextButton   loadInstButton  { "Load VSTi..." };
+    juce::TextButton   instEditorButton{ "Inst UI" };
+    juce::TextButton   clearInstButton { "Remove Inst" };
+    juce::Label        instLabel;
+
+    // File player
+    juce::TextButton   openFileButton { "Open audio file..." };
+    juce::TextButton   playButton     { "Play" };
+    juce::TextButton   stopButton     { "Stop" };
+    juce::ToggleButton loopButton     { "Loop" };
+    juce::Slider       posSlider;
+    juce::Label        timeLabel;
+    juce::Label        fileLabel;
+    juce::ToggleButton preRenderButton { "PRE-RENDER" };
+    juce::Label        renderLabel;
+
+    juce::ToggleButton midiThruButton { "MIDI thru -> Reface" };
     juce::ComboBox     midiOutCombo, inputPairCombo, recentCombo;
     juce::Label        midiOutLabel  { {}, "Reface MIDI out:" };
-    juce::Label        inputPairLabel{ {}, "VST input pair:" };
-    juce::Label        recentLabel   { {}, "Recent plugins:" };
+    juce::Label        inputPairLabel{ {}, "Live input pair:" };
+    juce::Label        recentLabel   { {}, "Cached plugins:" };
     juce::Label        pluginLabel;
     juce::Label        statusLabel;
 
-    std::unique_ptr<juce::DocumentWindow> editorWindow;
+    std::unique_ptr<juce::DocumentWindow> editorWindow, instEditorWindow;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MainComponent)
 };

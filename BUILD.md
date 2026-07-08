@@ -6,6 +6,14 @@ JUCE 8.0.13 スタンダードアロンアプリ。
 ## 目的（何をするソフトか）
 DAWの重い機能を捨て、「MIDIスイッチング」＋「VST再生」だけをやる。
 
+## v0.2.0〜: ソース段3系統 + PRE-RENDERモード
+- **ソース段をコンボで3切替**: ①Live入力(下図の実機経路) ②VSTiプレイバック(MIDI in→VSTi→FX)
+  ③音楽ファイルプレイヤー(Play/Pause/Stop/Loop/シーク。WAV/FLAC/MP3/OGGネイティブ、
+  m4a/AAC/OPUS等はffmpegフォールバックで`decode_cache.wav`に変換)
+- **PRE-RENDERモード**(ファイル→FX経路限定): FXのオフライン複製でファイル全体をRAMに
+  先行レンダリングし、再生はキャッシュを流すだけにする。リアルタイム制約を捨てて
+  重い処理を大メモリブロック単位で回す設計。**思想と進化の記録は [docs/PRERENDER.md](docs/PRERENDER.md)**
+
 ```
 鍵盤 ─MIDI─▶ TestBench ─(thru)─▶ Reface CP ─音─▶ UR-RT2 in3/4 ─▶ VST ─▶ 出力
                                       └ VSTi検査時は MIDI が VST にも入る
