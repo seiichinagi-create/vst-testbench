@@ -890,6 +890,15 @@ void MainComponent::syncOfflineStateAndRender (bool quickOnly)
         effectNode->getProcessor()->getStateInformation (state);
         if (state.getSize() > 0)
             offlineFx->setStateInformation (state.getData(), (int) state.getSize());
+
+        // Node::setBypassed(true) on the parked live node maps to a real
+        // bypass PARAMETER for JUCE-built VST3s (the wrapper auto-adds one),
+        // and that just travelled into the clone via the state copy - so the
+        // clone would render a bit-perfect dry pass. Clear it explicitly.
+        // (Most commercial plugins expose no bypass parameter, which is why
+        // they were unaffected.)
+        if (auto* bypass = offlineFx->getBypassParameter())
+            bypass->setValueNotifyingHost (0.0f);
     }
 
     fxStale = false;
