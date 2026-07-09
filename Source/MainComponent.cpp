@@ -56,6 +56,7 @@ MainComponent::MainComponent()
     addBtn (loadButton); addBtn (editorButton);
     addBtn (clearButton);         addBtn (bypassButton); addBtn (midiThruButton);
     addBtn (loadInstButton);      addBtn (instEditorButton); addBtn (clearInstButton);
+    addBtn (openMidiButton);
     addBtn (openFileButton);      addBtn (playButton); addBtn (stopButton); addBtn (loopButton);
 
     audioSettingsButton.onClick = [this] { showAudioSettings(); };
@@ -212,6 +213,25 @@ MainComponent::MainComponent()
     instLabel.setText ("No instrument loaded", juce::dontSendNotification);
     addAndMakeVisible (instLabel);
 
+    // --- MIDI bounce (Phase C: MIDI file -> VSTi offline bounce -> file player) ---
+    openMidiButton.setTooltip ("Bounce a MIDI file through the loaded VSTi (faster than realtime) "
+                               "and play the result on the file player - GPU FX / FX / PRE-RENDER "
+                               "all apply. VSTi knob changes re-bounce and hot-swap.");
+    openMidiButton.onClick = [this] { openMidiFileDialog(); };
+
+    midiStatusLabel.setJustificationType (juce::Justification::centredLeft);
+    midiStatusLabel.setColour (juce::Label::textColourId, juce::Colours::skyblue);
+    midiStatusLabel.setText ("MIDI: none (bounces thru the VSTi to the file player)",
+                             juce::dontSendNotification);
+    addAndMakeVisible (midiStatusLabel);
+
+    bounceEngine.onDone = [safeThis = juce::Component::SafePointer<MainComponent> (this)]
+                          (bool ok, juce::File out, juce::String info)
+    {
+        if (safeThis != nullptr)
+            safeThis->handleBounceDone (ok, out, info);
+    };
+
     for (auto* l : { &midiOutLabel, &inputPairLabel, &recentLabel })
     {
         l->setJustificationType (juce::Justification::centredRight);
@@ -265,7 +285,7 @@ MainComponent::MainComponent()
     applyBackendForMode (currentSourceMode());
 
     startTimerHz (10);
-    setSize (680, 810);   // room for the GPU FX panel (11 params, 2 columns)
+    setSize (680, 846);   // room for the GPU FX panel (11 params) + MIDI bounce row
 }
 
 MainComponent::~MainComponent()
@@ -273,8 +293,11 @@ MainComponent::~MainComponent()
     stopTimer();
     gpuWorker.shutdown();
     renderEngine.stopRender();
+    bounceEngine.stopBounce();
     if (effectNode != nullptr)
         effectNode->getProcessor()->removeListener (this);
+    if (instrumentNode != nullptr)
+        instrumentNode->getProcessor()->removeListener (this);
     editorWindow = nullptr;
     instEditorWindow = nullptr;
     deviceManager.removeMidiInputDeviceCallback ({}, this);
@@ -302,6 +325,7 @@ juce::File MainComponent::appDir() const
 juce::File MainComponent::cacheFile()      const { return appDir().getChildFile ("known_plugins.xml"); }
 juce::File MainComponent::audioStateFile() const { return appDir().getChildFile ("audio_settings.xml"); }
 juce::File MainComponent::lastDirFile()    const { return appDir().getChildFile ("last_audio_dir.txt"); }
+juce::File MainComponent::lastMidiDirFile() const { return appDir().getChildFile ("last_midi_dir.txt"); }
 juce::File MainComponent::autoBackendFile() const { return appDir().getChildFile ("auto_backend.txt"); }
 
 juce::File MainComponent::backendStateFile (const juce::String& typeName) const
@@ -559,11 +583,19 @@ void MainComponent::setInstrumentNode (std::unique_ptr<juce::AudioPluginInstance
                                        const juce::PluginDescription& desc)
 {
     instEditorWindow = nullptr;
+    bounceEngine.stopBounce();
+    offlineInst.reset();          // clone of the previous instrument, now stale
     if (instrumentNode != nullptr)
+    {
+        instrumentNode->getProcessor()->removeListener (this);
         graph.removeNode (instrumentNode->nodeID);
+    }
 
+    currentInstDesc = desc;
     configureInstance (*instance, deviceManager);
     instrumentNode = graph.addNode (std::move (instance));
+    instrumentNode->getProcessor()->addListener (this);   // knob changes re-bounce the MIDI chain
+    instrumentProc = instrumentNode->getProcessor();
     currentInstrumentName = desc.name;
 
     // Loading an instrument implies wanting to hear it: switch the source stage.
@@ -575,6 +607,13 @@ void MainComponent::setInstrumentNode (std::unique_ptr<juce::AudioPluginInstance
                        + juce::String (instrumentNode->getProcessor()->getTotalNumOutputChannels()) + " out)",
                        juce::dontSendNotification);
     setStatus ("Loaded instrument " + desc.name + " (source switched to VSTi)");
+
+    // A different instrument means the bounced wav no longer matches the chain.
+    if (midiChainActive())
+    {
+        instStale = true;
+        lastInstChangeMs = juce::Time::getMillisecondCounter();
+    }
 }
 
 void MainComponent::removeEffect()
@@ -600,8 +639,12 @@ void MainComponent::removeEffect()
 void MainComponent::removeInstrument()
 {
     instEditorWindow = nullptr;
+    bounceEngine.stopBounce();
+    offlineInst.reset();
+    instrumentProc = nullptr;
     if (instrumentNode != nullptr)
     {
+        instrumentNode->getProcessor()->removeListener (this);
         graph.removeNode (instrumentNode->nodeID);
         instrumentNode = nullptr;
     }
@@ -700,6 +743,7 @@ void MainComponent::openAudioFileDialog()
 
 void MainComponent::loadAudioFile (const juce::File& file)
 {
+    abandonMidiChain();   // opening a plain audio file replaces the MIDI chain
     std::unique_ptr<juce::AudioFormatReader> reader (audioFormats.createReaderFor (file));
     if (reader != nullptr)
     {
@@ -788,6 +832,218 @@ juce::String MainComponent::formatTime (double seconds) const
 {
     const int total = (int) std::floor (juce::jmax (0.0, seconds));
     return juce::String::formatted ("%d:%02d", total / 60, total % 60);
+}
+
+//==============================================================================
+// MIDI file -> VSTi offline bounce (Phase C). The bounce result enters the
+// normal file-player path, so GPU FX / VST FX / PRE-RENDER apply unchanged.
+bool MainComponent::midiChainActive() const
+{
+    return currentMidiFile != juce::File() && currentOriginalFile == currentMidiFile;
+}
+
+void MainComponent::abandonMidiChain()
+{
+    if (currentMidiFile == juce::File() && ! bounceEngine.isBouncing())
+        return;
+    bounceEngine.stopBounce();
+    currentMidiFile = juce::File();
+    firstBouncePending = false;
+    instStale = false;
+    midiReadyText = "MIDI: none";
+    midiStatusLabel.setText ("MIDI: none (bounces thru the VSTi to the file player)",
+                             juce::dontSendNotification);
+}
+
+void MainComponent::openMidiFileDialog()
+{
+    if (instrumentNode == nullptr)
+    {
+        setStatus ("Load a VSTi first - the MIDI file is bounced through it.");
+        return;
+    }
+
+    juce::File startDir (lastMidiDirFile().loadFileAsString().trim());
+    if (! startDir.isDirectory())
+        startDir = juce::File::getSpecialLocation (juce::File::userMusicDirectory);
+
+    auto chooser = std::make_shared<juce::FileChooser> ("Select a MIDI file", startDir,
+                                                        "*.mid;*.midi;*.smf");
+    chooser->launchAsync (juce::FileBrowserComponent::openMode
+                          | juce::FileBrowserComponent::canSelectFiles,
+        [this, chooser] (const juce::FileChooser& fc)
+        {
+            auto file = fc.getResult();
+            if (file == juce::File{}) return;
+            lastMidiDirFile().replaceWithText (file.getParentDirectory().getFullPathName());
+            loadMidiFile (file);
+        });
+}
+
+void MainComponent::loadMidiFile (const juce::File& file)
+{
+    juce::FileInputStream in (file);
+    juce::MidiFile mf;
+    if (! in.openedOk() || ! mf.readFrom (in))
+    {
+        setStatus ("Could not read MIDI file " + file.getFileName());
+        return;
+    }
+    mf.convertTimestampTicksToSeconds();   // applies the tempo map
+
+    juce::MidiMessageSequence merged;
+    for (int t = 0; t < mf.getNumTracks(); ++t)
+        merged.addSequence (*mf.getTrack (t), 0.0);
+    merged.sort();
+
+    if (merged.getNumEvents() == 0)
+    {
+        setStatus ("No events in " + file.getFileName());
+        return;
+    }
+
+    bounceEngine.stopBounce();
+    midiSequence       = std::move (merged);
+    currentMidiFile    = file;
+    firstBouncePending = true;
+    instStale          = false;
+    midiReadyText = "MIDI: " + file.getFileName();
+    midiStatusLabel.setText ("MIDI: bouncing " + file.getFileName() + " thru "
+                             + currentInstrumentName + " ...", juce::dontSendNotification);
+    syncInstStateAndBounce();
+}
+
+void MainComponent::createOfflineInstAndBounce()
+{
+    offlineInstLoading = true;
+    setStatus ("Creating offline VSTi instance ...");
+    auto setup = deviceManager.getAudioDeviceSetup();
+    formatManager.createPluginInstanceAsync (
+        currentInstDesc,
+        setup.sampleRate > 0 ? setup.sampleRate : 48000.0, 4096,
+        [this] (std::unique_ptr<juce::AudioPluginInstance> instance, const juce::String& error)
+        {
+            offlineInstLoading = false;
+            if (instance == nullptr)
+            {
+                firstBouncePending = false;
+                midiStatusLabel.setText ("MIDI: offline VSTi load failed", juce::dontSendNotification);
+                setStatus ("Offline VSTi load failed: " + error);
+                return;
+            }
+            instance->enableAllBuses();
+            offlineInst = std::move (instance);
+            if (currentMidiFile != juce::File())
+                syncInstStateAndBounce();
+        });
+}
+
+void MainComponent::syncInstStateAndBounce()
+{
+    if (instrumentNode == nullptr || currentMidiFile == juce::File() || bounceEngine.isBouncing())
+        return;
+    if (offlineInst == nullptr)
+    {
+        if (! offlineInstLoading)
+            createOfflineInstAndBounce();   // bounce starts when the clone arrives
+        return;
+    }
+
+    juce::MemoryBlock state;
+    instrumentNode->getProcessor()->getStateInformation (state);
+    if (state.getSize() > 0)
+        offlineInst->setStateInformation (state.getData(), (int) state.getSize());
+
+    // Same JUCE-VST3 wrapper trap as the offline FX clone: a bypass PARAMETER
+    // may have travelled inside the state copy. Clear it explicitly.
+    if (auto* bypass = offlineInst->getBypassParameter())
+        bypass->setValueNotifyingHost (0.0f);
+
+    auto setup = deviceManager.getAudioDeviceSetup();
+    ++bounceGeneration;
+    const auto out = appDir().getChildFile (juce::String::formatted ("midi_bounce_%04d.wav",
+                                                                     bounceGeneration));
+    bounceEngine.startBounce (midiSequence, offlineInst.get(),
+                              setup.sampleRate > 0 ? setup.sampleRate : 48000.0, out);
+}
+
+void MainComponent::handleBounceDone (bool ok, juce::File out, juce::String info)
+{
+    if (currentMidiFile == juce::File())   // chain abandoned while the bounce ran
+    {
+        out.deleteFile();
+        return;
+    }
+    if (! ok)
+    {
+        out.deleteFile();
+        firstBouncePending = false;
+        midiReadyText = "MIDI bounce failed: " + info;
+        midiStatusLabel.setText (midiReadyText, juce::dontSendNotification);
+        setStatus ("MIDI bounce failed: " + info);
+        return;
+    }
+
+    midiReadyText = "MIDI: " + currentMidiFile.getFileName() + " - bounce ready (" + info + ")";
+    auto isBounceFile = [] (const juce::File& f) { return f.getFileName().startsWith ("midi_bounce_"); };
+
+    if (firstBouncePending)
+    {
+        firstBouncePending = false;
+        std::unique_ptr<juce::AudioFormatReader> reader (audioFormats.createReaderFor (out));
+        if (reader == nullptr)
+        {
+            midiStatusLabel.setText ("MIDI: could not read bounced wav", juce::dontSendNotification);
+            return;
+        }
+        const juce::File oldWav = currentPlayableFile;
+        // original = the .mid file: the file label names it and midiChainActive() keys on it.
+        finishAudioFileLoad (std::move (reader), currentMidiFile, out);
+        if (oldWav != out && isBounceFile (oldWav))
+            oldWav.deleteFile();
+        midiStatusLabel.setText (midiReadyText, juce::dontSendNotification);
+        return;
+    }
+
+    // Knob re-bounce: hot-swap at the playback position (GPU FX flow's sibling).
+    std::unique_ptr<juce::AudioFormatReader> probe (audioFormats.createReaderFor (out));
+    if (probe == nullptr)
+    {
+        midiStatusLabel.setText ("MIDI: could not read bounced wav", juce::dontSendNotification);
+        return;
+    }
+    const juce::int64 newLen  = probe->lengthInSamples;
+    const double      newRate = probe->sampleRate;
+    probe.reset();
+
+    const juce::File oldWav     = currentPlayableFile;
+    const bool       lenChanged = newLen != fileLengthSamples;
+    currentPlayableFile = out;
+    fileLengthSamples   = newLen;
+    fileSampleRate      = newRate;
+
+    if (gpuFxButton.getToggleState())
+    {
+        // The audible file is the GPU generation: keep playing it and re-render
+        // from the new bounce; handleGpuRenderDone hot-swaps when it lands.
+        requestGpuRender();
+    }
+    else
+    {
+        swapPlayableFilePreservingPosition (out);
+        posSlider.setRange (0.0, juce::jmax (0.01, filePlayer->transport.getLengthInSeconds()));
+        if (preRenderActive())
+        {
+            if (lenChanged)
+                beginPreRender();              // cache must be re-sized
+            else
+                syncOfflineStateAndRender();   // re-lay cursor-first from the new bounce
+        }
+    }
+
+    if (oldWav != out && isBounceFile (oldWav))
+        oldWav.deleteFile();   // may fail while a stale GPU render still reads it - harmless
+    midiStatusLabel.setText (midiReadyText, juce::dontSendNotification);
 }
 
 //==============================================================================
@@ -1120,19 +1376,35 @@ juce::var MainComponent::collectGpuParams() const
 }
 
 //==============================================================================
-void MainComponent::audioProcessorParameterChanged (juce::AudioProcessor*, int, float)
+void MainComponent::audioProcessorParameterChanged (juce::AudioProcessor* proc, int, float)
 {
     // May arrive on any thread: only touch atomics.
-    fxStale = true;
-    lastParamChangeMs = juce::Time::getMillisecondCounter();
-}
-
-void MainComponent::audioProcessorChanged (juce::AudioProcessor*, const ChangeDetails& details)
-{
-    if (details.parameterInfoChanged || details.programChanged)
+    if (proc != nullptr && proc == instrumentProc.load())
+    {
+        instStale = true;
+        lastInstChangeMs = juce::Time::getMillisecondCounter();
+    }
+    else
     {
         fxStale = true;
         lastParamChangeMs = juce::Time::getMillisecondCounter();
+    }
+}
+
+void MainComponent::audioProcessorChanged (juce::AudioProcessor* proc, const ChangeDetails& details)
+{
+    if (details.parameterInfoChanged || details.programChanged)
+    {
+        if (proc != nullptr && proc == instrumentProc.load())
+        {
+            instStale = true;
+            lastInstChangeMs = juce::Time::getMillisecondCounter();
+        }
+        else
+        {
+            fxStale = true;
+            lastParamChangeMs = juce::Time::getMillisecondCounter();
+        }
     }
 }
 
@@ -1234,6 +1506,31 @@ void MainComponent::timerCallback()
         }
     }
 
+    // --- MIDI bounce housekeeping ---
+    if (bounceEngine.isBouncing())
+    {
+        midiStatusLabel.setText (juce::String::formatted ("MIDI: bouncing... %d%%  (%.1fx realtime)",
+                                     (int) (bounceEngine.progress.load() * 100.0f),
+                                     bounceEngine.speedX.load()),
+                                 juce::dontSendNotification);
+    }
+    else if (midiChainActive())
+    {
+        if (instStale.load())
+            midiStatusLabel.setText ("MIDI: VSTi changed - re-bounce pending...",
+                                     juce::dontSendNotification);
+
+        // Same debounce as the FX/GPU knobs: re-bounce once the VSTi has been
+        // quiet for 600 ms, then hot-swap at the playback position.
+        const auto now = juce::Time::getMillisecondCounter();
+        if (instStale.load() && ! offlineInstLoading && instrumentNode != nullptr
+            && now - lastInstChangeMs.load() > 600)
+        {
+            instStale = false;
+            syncInstStateAndBounce();
+        }
+    }
+
     if (! filePlayer->hasFile())
         return;
 
@@ -1312,6 +1609,14 @@ void MainComponent::resized()
         clearInstButton.setBounds (r.removeFromLeft (110));
     }
     instLabel.setBounds (row (22));
+
+    // --- MIDI bounce ---
+    {
+        auto r = row (28);
+        openMidiButton.setBounds (r.removeFromLeft (150));
+        r.removeFromLeft (8);
+        midiStatusLabel.setBounds (r);
+    }
 
     // --- file player ---
     {

@@ -4,6 +4,7 @@
 #include "FilePlayerProcessor.h"
 #include "RenderAheadEngine.h"
 #include "GpuFxWorker.h"
+#include "MidiBounceEngine.h"
 
 //==============================================================================
 // Lightweight VST3 test-bench host.
@@ -68,6 +69,15 @@ private:
     void createOfflineFx();
     void syncOfflineStateAndRender (bool quickOnly = false);
 
+    //== MIDI file -> VSTi offline bounce (Phase C) ==
+    void openMidiFileDialog();
+    void loadMidiFile (const juce::File&);
+    void createOfflineInstAndBounce();
+    void syncInstStateAndBounce();
+    void handleBounceDone (bool ok, juce::File out, juce::String info);
+    void abandonMidiChain();
+    bool midiChainActive() const;
+
     //== GPU FX (gpufx worker renders the playable file) ==
     void setGpuFxEnabled (bool);
     void requestGpuRender();
@@ -94,6 +104,7 @@ private:
     juce::File cacheFile() const;
     juce::File audioStateFile() const;
     juce::File lastDirFile() const;
+    juce::File lastMidiDirFile() const;
     juce::File autoBackendFile() const;
     juce::AudioPluginFormat* vst3Format() const;
     int currentSourceMode() const;
@@ -110,6 +121,7 @@ private:
     Graph::Node::Ptr effectNode, instrumentNode, filePlayerNode;
     FilePlayerProcessor* filePlayer = nullptr;   // owned by the graph node
     juce::String currentEffectName, currentInstrumentName;
+    juce::PluginDescription currentInstDesc;
 
     //== PRE-RENDER state ==
     RenderCache renderCache;
@@ -125,6 +137,19 @@ private:
     std::atomic<juce::uint32> lastParamChangeMs { 0 };
     float lastRenderSpeed = 0.0f;
     bool  needsFullRefresh = false;   // quick renders leave the rest of the file stale
+
+    //== MIDI bounce state (Phase C) ==
+    MidiBounceEngine bounceEngine;
+    std::unique_ptr<juce::AudioPluginInstance> offlineInst;  // clone of the live VSTi, bounce thread only
+    bool offlineInstLoading = false;
+    juce::MidiMessageSequence midiSequence;   // merged tracks, timestamps in seconds
+    juce::File currentMidiFile;
+    int  bounceGeneration = 0;
+    bool firstBouncePending = false;          // bounce result should (re)load the file player
+    std::atomic<bool> instStale { false };
+    std::atomic<juce::uint32> lastInstChangeMs { 0 };
+    std::atomic<juce::AudioProcessor*> instrumentProc { nullptr };  // listener-thread-safe identity
+    juce::String midiReadyText { "MIDI: none" };
 
     //== GPU FX state ==
     GpuFxWorker gpuWorker;
@@ -169,6 +194,10 @@ private:
     juce::TextButton   instEditorButton{ "Inst UI" };
     juce::TextButton   clearInstButton { "Remove Inst" };
     juce::Label        instLabel;
+
+    // MIDI bounce (Phase C)
+    juce::TextButton   openMidiButton { "Open MIDI file..." };
+    juce::Label        midiStatusLabel;
 
     // File player
     juce::TextButton   openFileButton { "Open audio file..." };
