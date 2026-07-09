@@ -7,7 +7,7 @@ public:
     VstTestBenchApplication() = default;
 
     const juce::String getApplicationName() override    { return "VST TestBench"; }
-    const juce::String getApplicationVersion() override { return "0.6.0"; }
+    const juce::String getApplicationVersion() override { return "0.8.0"; }
     bool moreThanOneInstanceAllowed() override          { return true; }
 
     void initialise (const juce::String&) override

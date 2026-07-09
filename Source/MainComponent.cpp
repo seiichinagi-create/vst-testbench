@@ -98,6 +98,8 @@ MainComponent::MainComponent()
     {
         if (currentSourceMode() != srcFile && preRenderButton.getToggleState())
             setPreRenderEnabled (false);   // pre-render only exists in file mode
+        if (currentSourceMode() != srcFile && gpuFxButton.getToggleState())
+            setGpuFxEnabled (false);       // GPU FX transforms the playable file
         applyBackendForMode (currentSourceMode());
         rebuildConnections();
         switch (currentSourceMode())
@@ -160,6 +162,29 @@ MainComponent::MainComponent()
     renderLabel.setColour (juce::Label::textColourId, juce::Colours::orange);
     renderLabel.setText ("PRE-RENDER off", juce::dontSendNotification);
     addAndMakeVisible (renderLabel);
+
+    // --- GPU FX (gpufx worker transforms the playable file) ---
+    addAndMakeVisible (gpuFxButton);
+    gpuFxButton.setTooltip ("Render the file through the gpufx worker (spectral rebuild on the GPU); "
+                            "knob changes re-render and hot-swap at the playback position.");
+    gpuFxButton.onClick = [this] { setGpuFxEnabled (gpuFxButton.getToggleState()); };
+
+    gpuStatusLabel.setJustificationType (juce::Justification::centredLeft);
+    gpuStatusLabel.setColour (juce::Label::textColourId, juce::Colours::mediumpurple);
+    gpuStatusLabel.setText ("GPU FX off", juce::dontSendNotification);
+    addAndMakeVisible (gpuStatusLabel);
+
+    juce::Component::SafePointer<MainComponent> weakThis (this);
+    gpuWorker.onSchemaReady = [weakThis] (juce::var schema)
+    {
+        if (weakThis != nullptr)
+            weakThis->buildGpuPanel (schema);
+    };
+    gpuWorker.onRenderDone = [weakThis] (bool ok, juce::String info, juce::File in, juce::File out)
+    {
+        if (weakThis != nullptr)
+            weakThis->handleGpuRenderDone (ok, info, in, out);
+    };
 
     posSlider.setSliderStyle (juce::Slider::LinearHorizontal);
     posSlider.setTextBoxStyle (juce::Slider::NoTextBox, true, 0, 0);
@@ -240,12 +265,13 @@ MainComponent::MainComponent()
     applyBackendForMode (currentSourceMode());
 
     startTimerHz (10);
-    setSize (680, 600);
+    setSize (680, 810);   // room for the GPU FX panel (11 params, 2 columns)
 }
 
 MainComponent::~MainComponent()
 {
     stopTimer();
+    gpuWorker.shutdown();
     renderEngine.stopRender();
     if (effectNode != nullptr)
         effectNode->getProcessor()->removeListener (this);
@@ -748,6 +774,12 @@ void MainComponent::finishAudioFileLoad (std::unique_ptr<juce::AudioFormatReader
     rebuildConnections();
     setStatus ("Loaded " + original.getFileName() + " (source switched to file player)");
 
+    // The old GPU render belongs to the previous file: play dry until the
+    // worker has baked the new one, then hot-swap.
+    currentGpuFile = juce::File();
+    if (gpuFxButton.getToggleState())
+        requestGpuRender();
+
     if (preRenderButton.getToggleState())
         beginPreRender();   // new file -> new cache
 }
@@ -887,11 +919,198 @@ void MainComponent::syncOfflineStateAndRender (bool quickOnly)
             quickWindow = (juce::int64) (25.0 * fileSampleRate);
     }
 
-    renderEngine.startRender (currentPlayableFile, audioFormats,
+    renderEngine.startRender (effectivePlayableFile(), audioFormats,
                               effectNode != nullptr ? offlineFx.get() : nullptr,
                               renderCache, startSample, quickWindow);
 }
 
+//==============================================================================
+juce::File MainComponent::effectivePlayableFile() const
+{
+    // What the pre-render engine (and, via swap, the file player) should read:
+    // the GPU-baked generation file when GPU FX is active, else the plain file.
+    if (gpuFxButton.getToggleState() && currentGpuFile.existsAsFile())
+        return currentGpuFile;
+    return currentPlayableFile;
+}
+
+bool MainComponent::swapPlayableFilePreservingPosition (const juce::File& f)
+{
+    std::unique_ptr<juce::AudioFormatReader> reader (audioFormats.createReaderFor (f));
+    if (reader == nullptr)
+    {
+        setStatus ("Could not read " + f.getFileName());
+        return false;
+    }
+
+    auto& t = filePlayer->transport;
+    const bool   usingExternal = filePlayer->isUsingExternalSource();
+    const double pos           = t.getCurrentPosition();
+    const bool   playing       = t.isPlaying();
+
+    if (! filePlayer->loadReader (std::move (reader), loopButton.getToggleState()))
+        return false;
+
+    // In PRE-RENDER mode the audible sound comes from the cache: put the
+    // transport back on it, the fresh reader waits for pre-render-off.
+    if (usingExternal && cacheSource != nullptr)
+        filePlayer->attachExternalSource (cacheSource.get(), fileSampleRate);
+
+    t.setPosition (pos);
+    if (playing)
+        t.start();
+    return true;
+}
+
+void MainComponent::setGpuFxEnabled (bool shouldEnable)
+{
+    if (shouldEnable)
+    {
+        if (currentSourceMode() != srcFile || ! filePlayer->hasFile())
+        {
+            setStatus ("GPU FX needs the file player as source with a file loaded.");
+            gpuFxButton.setToggleState (false, juce::dontSendNotification);
+            return;
+        }
+        gpuFxButton.setToggleState (true, juce::dontSendNotification);
+        gpuWorker.start();
+        requestGpuRender();
+    }
+    else
+    {
+        gpuFxButton.setToggleState (false, juce::dontSendNotification);
+        const juce::File old = currentGpuFile;
+        currentGpuFile = juce::File();
+        gpuDirty = false;
+
+        if (filePlayer->hasFile() && old != juce::File())
+            swapPlayableFilePreservingPosition (currentPlayableFile);
+        old.deleteFile();
+
+        if (preRenderActive())
+            syncOfflineStateAndRender();   // cache back to the dry source
+        gpuStatusLabel.setText ("GPU FX off", juce::dontSendNotification);
+        setStatus ("GPU FX off: playing the plain file.");
+    }
+}
+
+void MainComponent::requestGpuRender()
+{
+    if (! filePlayer->hasFile() || currentPlayableFile == juce::File())
+        return;
+    gpuWorker.start();
+    ++gpuGeneration;
+    const auto out = appDir().getChildFile (juce::String::formatted ("gpu_cache_%04d.wav", gpuGeneration));
+    gpuWorker.requestRender (currentPlayableFile, out, collectGpuParams());
+    gpuStatusLabel.setText ("GPU: rendering...", juce::dontSendNotification);
+}
+
+void MainComponent::handleGpuRenderDone (bool ok, juce::String info, juce::File in, juce::File out)
+{
+    if (! gpuFxButton.getToggleState())      // disabled while the render ran
+    {
+        out.deleteFile();
+        return;
+    }
+    if (! ok)
+    {
+        gpuReadyText = "GPU render failed: " + info;
+        gpuStatusLabel.setText (gpuReadyText, juce::dontSendNotification);
+        return;
+    }
+    if (in != currentPlayableFile)           // a different file was loaded meanwhile
+    {
+        out.deleteFile();
+        requestGpuRender();
+        return;
+    }
+
+    const juce::File old = currentGpuFile;
+    if (swapPlayableFilePreservingPosition (out))
+    {
+        currentGpuFile = out;
+        if (old != juce::File() && old != out)
+            old.deleteFile();                // reader released it in the swap
+
+        gpuReadyText = "GPU ready (" + info + ")";
+        gpuStatusLabel.setText (gpuReadyText, juce::dontSendNotification);
+
+        // The cache holds the previous sound; re-lay it cursor-first so the
+        // new render fades in at the switch point (existing mechanism).
+        if (preRenderActive())
+            syncOfflineStateAndRender();
+    }
+    else
+    {
+        out.deleteFile();
+        gpuReadyText = "GPU: could not open rendered file";
+        gpuStatusLabel.setText (gpuReadyText, juce::dontSendNotification);
+    }
+}
+
+void MainComponent::buildGpuPanel (const juce::var& describeResponse)
+{
+    gpuControls.clear();
+
+    const auto modules = describeResponse["modules"];
+    if (! modules.isArray() || modules.size() == 0)
+        return;
+    const auto params = modules[0]["params"];
+    if (! params.isArray())
+        return;
+
+    auto markDirty = [this]
+    {
+        gpuDirty = true;
+        lastGpuChangeMs = juce::Time::getMillisecondCounter();
+    };
+
+    for (const auto& p : *params.getArray())
+    {
+        GpuControl c;
+        c.name = p["name"].toString();
+        const auto label = p["label"].toString();
+
+        if (p["type"].toString() == "bool")
+        {
+            c.isBool = true;
+            c.toggle = std::make_unique<juce::ToggleButton> (label);
+            c.toggle->setToggleState ((bool) p["default"], juce::dontSendNotification);
+            c.toggle->onClick = markDirty;
+            addAndMakeVisible (*c.toggle);
+        }
+        else
+        {
+            c.label = std::make_unique<juce::Label> (juce::String(), label);
+            c.label->setFont (juce::FontOptions (12.0f));
+            c.label->setColour (juce::Label::textColourId, juce::Colours::lightgrey);
+            addAndMakeVisible (*c.label);
+
+            c.slider = std::make_unique<juce::Slider> (juce::Slider::LinearHorizontal,
+                                                       juce::Slider::TextBoxRight);
+            c.slider->setTextBoxStyle (juce::Slider::TextBoxRight, false, 52, 18);
+            c.slider->setRange ((double) p.getProperty ("min", 0.0),
+                                (double) p.getProperty ("max", 1.0),
+                                (double) p.getProperty ("step", 0.0));
+            c.slider->setValue ((double) p["default"], juce::dontSendNotification);
+            c.slider->onValueChange = markDirty;
+            addAndMakeVisible (*c.slider);
+        }
+        gpuControls.push_back (std::move (c));
+    }
+    resized();
+}
+
+juce::var MainComponent::collectGpuParams() const
+{
+    auto* obj = new juce::DynamicObject();
+    for (const auto& c : gpuControls)
+        obj->setProperty (c.name, c.isBool ? juce::var (c.toggle->getToggleState())
+                                           : juce::var (c.slider->getValue()));
+    return juce::var (obj);
+}
+
+//==============================================================================
 void MainComponent::audioProcessorParameterChanged (juce::AudioProcessor*, int, float)
 {
     // May arrive on any thread: only touch atomics.
@@ -981,6 +1200,28 @@ void MainComponent::timerCallback()
         {
             needsFullRefresh = false;
             syncOfflineStateAndRender (false);
+        }
+    }
+
+    // --- GPU FX housekeeping ---
+    if (gpuFxButton.getToggleState())
+    {
+        const auto workerText = gpuWorker.getStatusText();   // empty when ready
+        if (workerText.isNotEmpty())
+            gpuStatusLabel.setText (workerText, juce::dontSendNotification);
+        else if (! gpuDirty.load())
+            gpuStatusLabel.setText (gpuReadyText, juce::dontSendNotification);
+        else
+            gpuStatusLabel.setText ("GPU: knobs changed - re-render pending...", juce::dontSendNotification);
+
+        // Same debounce idea as the FX-knob path: re-render once the GPU
+        // knobs have been quiet for 600 ms and the worker is idle.
+        const auto now = juce::Time::getMillisecondCounter();
+        if (gpuDirty.load() && gpuWorker.isIdleReady()
+            && now - lastGpuChangeMs.load() > 600)
+        {
+            gpuDirty = false;
+            requestGpuRender();
         }
     }
 
@@ -1085,6 +1326,33 @@ void MainComponent::resized()
         preRenderButton.setBounds (r.removeFromLeft (130));
         r.removeFromLeft (8);
         renderLabel.setBounds (r);
+    }
+    {
+        auto r = row (26);
+        gpuFxButton.setBounds (r.removeFromLeft (130));
+        r.removeFromLeft (8);
+        gpuStatusLabel.setBounds (r);
+    }
+    if (! gpuControls.empty())
+    {
+        const int n    = (int) gpuControls.size();
+        const int rows = (n + 1) / 2;
+        auto panel = row (rows * 26);
+        const int colW = panel.getWidth() / 2;
+        for (int i = 0; i < n; ++i)
+        {
+            auto cell = juce::Rectangle<int> (panel.getX() + (i % 2) * colW,
+                                              panel.getY() + (i / 2) * 26,
+                                              colW - 10, 22);
+            auto& c = gpuControls[(size_t) i];
+            if (c.isBool)
+                c.toggle->setBounds (cell);
+            else
+            {
+                c.label->setBounds (cell.removeFromLeft (118));
+                c.slider->setBounds (cell);
+            }
+        }
     }
     fileLabel.setBounds (row (22));
 

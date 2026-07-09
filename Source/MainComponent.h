@@ -3,6 +3,7 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 #include "FilePlayerProcessor.h"
 #include "RenderAheadEngine.h"
+#include "GpuFxWorker.h"
 
 //==============================================================================
 // Lightweight VST3 test-bench host.
@@ -67,6 +68,15 @@ private:
     void createOfflineFx();
     void syncOfflineStateAndRender (bool quickOnly = false);
 
+    //== GPU FX (gpufx worker renders the playable file) ==
+    void setGpuFxEnabled (bool);
+    void requestGpuRender();
+    void handleGpuRenderDone (bool ok, juce::String info, juce::File in, juce::File out);
+    void buildGpuPanel (const juce::var& describeResponse);
+    juce::var collectGpuParams() const;
+    juce::File effectivePlayableFile() const;
+    bool swapPlayableFilePreservingPosition (const juce::File&);
+
     //== callbacks ==
     void handleIncomingMidiMessage (juce::MidiInput*, const juce::MidiMessage&) override;
     void changeListenerCallback (juce::ChangeBroadcaster*) override;
@@ -116,6 +126,24 @@ private:
     float lastRenderSpeed = 0.0f;
     bool  needsFullRefresh = false;   // quick renders leave the rest of the file stale
 
+    //== GPU FX state ==
+    GpuFxWorker gpuWorker;
+    juce::File  currentGpuFile;       // last completed gpufx output (generation file)
+    int         gpuGeneration = 0;
+    std::atomic<bool> gpuDirty { false };
+    std::atomic<juce::uint32> lastGpuChangeMs { 0 };
+    juce::String gpuReadyText { "GPU: worker ready" };
+
+    struct GpuControl
+    {
+        juce::String name;
+        bool isBool = false;
+        std::unique_ptr<juce::Label>        label;
+        std::unique_ptr<juce::Slider>       slider;
+        std::unique_ptr<juce::ToggleButton> toggle;
+    };
+    std::vector<GpuControl> gpuControls;   // built from the worker's describe schema
+
     //== MIDI thru to Reface ==
     std::unique_ptr<juce::MidiOutput> midiOut;
     juce::CriticalSection            midiOutLock;
@@ -152,6 +180,8 @@ private:
     juce::Label        fileLabel;
     juce::ToggleButton preRenderButton { "PRE-RENDER" };
     juce::Label        renderLabel;
+    juce::ToggleButton gpuFxButton { "GPU FX" };
+    juce::Label        gpuStatusLabel;
 
     juce::ToggleButton midiThruButton { "MIDI thru -> Reface" };
     juce::ComboBox     midiOutCombo, inputPairCombo, recentCombo;
