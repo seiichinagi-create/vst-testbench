@@ -1349,13 +1349,10 @@ void MainComponent::handleGpuRenderDone (bool ok, juce::String info, juce::File 
 
 void MainComponent::buildGpuPanel (const juce::var& describeResponse)
 {
-    gpuControls.clear();
+    gpuModules.clear();
 
     const auto modules = describeResponse["modules"];
     if (! modules.isArray() || modules.size() == 0)
-        return;
-    const auto params = modules[0]["params"];
-    if (! params.isArray())
         return;
 
     auto markDirty = [this]
@@ -1364,49 +1361,107 @@ void MainComponent::buildGpuPanel (const juce::var& describeResponse)
         lastGpuChangeMs = juce::Time::getMillisecondCounter();
     };
 
-    for (const auto& p : *params.getArray())
+    for (const auto& m : *modules.getArray())
     {
-        GpuControl c;
-        c.name = p["name"].toString();
-        const auto label = p["label"].toString();
+        GpuModule gm;
+        gm.name = m["name"].toString();
 
-        if (p["type"].toString() == "bool")
-        {
-            c.isBool = true;
-            c.toggle = std::make_unique<juce::ToggleButton> (label);
-            c.toggle->setToggleState ((bool) p["default"], juce::dontSendNotification);
-            c.toggle->onClick = markDirty;
-            addAndMakeVisible (*c.toggle);
-        }
-        else
-        {
-            c.label = std::make_unique<juce::Label> (juce::String(), label);
-            c.label->setFont (juce::FontOptions (12.0f));
-            c.label->setColour (juce::Label::textColourId, juce::Colours::lightgrey);
-            addAndMakeVisible (*c.label);
+        gm.enable = std::make_unique<juce::ToggleButton> ("[" + m["label"].toString() + "]");
+        gm.enable->setToggleState ((bool) m.getProperty ("default_enabled", true),
+                                   juce::dontSendNotification);
+        gm.enable->setColour (juce::ToggleButton::textColourId, juce::Colours::mediumpurple);
+        gm.enable->onClick = markDirty;
+        addAndMakeVisible (*gm.enable);
 
-            c.slider = std::make_unique<juce::Slider> (juce::Slider::LinearHorizontal,
-                                                       juce::Slider::TextBoxRight);
-            c.slider->setTextBoxStyle (juce::Slider::TextBoxRight, false, 52, 18);
-            c.slider->setRange ((double) p.getProperty ("min", 0.0),
-                                (double) p.getProperty ("max", 1.0),
-                                (double) p.getProperty ("step", 0.0));
-            c.slider->setValue ((double) p["default"], juce::dontSendNotification);
-            c.slider->onValueChange = markDirty;
-            addAndMakeVisible (*c.slider);
+        const auto params = m["params"];
+        if (params.isArray())
+        {
+            for (const auto& p : *params.getArray())
+            {
+                GpuControl c;
+                c.name = p["name"].toString();
+                c.type = p["type"].toString();
+                const auto label = p["label"].toString();
+
+                if (c.type == "bool")
+                {
+                    c.toggle = std::make_unique<juce::ToggleButton> (label);
+                    c.toggle->setToggleState ((bool) p["default"], juce::dontSendNotification);
+                    c.toggle->onClick = markDirty;
+                    addAndMakeVisible (*c.toggle);
+                }
+                else if (c.type == "choice")
+                {
+                    c.label = std::make_unique<juce::Label> (juce::String(), label);
+                    c.label->setFont (juce::FontOptions (12.0f));
+                    c.label->setColour (juce::Label::textColourId, juce::Colours::lightgrey);
+                    addAndMakeVisible (*c.label);
+
+                    c.combo = std::make_unique<juce::ComboBox>();
+                    const auto options = p["options"];
+                    if (options.isArray())
+                        for (int i = 0; i < options.size(); ++i)
+                            c.combo->addItem (options[i].toString(), i + 1);
+                    const auto def = p["default"].toString();
+                    for (int i = 1; i <= c.combo->getNumItems(); ++i)
+                        if (c.combo->getItemText (i - 1) == def)
+                            { c.combo->setSelectedId (i, juce::dontSendNotification); break; }
+                    if (c.combo->getSelectedId() == 0 && c.combo->getNumItems() > 0)
+                        c.combo->setSelectedId (1, juce::dontSendNotification);
+                    c.combo->onChange = markDirty;
+                    addAndMakeVisible (*c.combo);
+                }
+                else   // float / int
+                {
+                    c.label = std::make_unique<juce::Label> (juce::String(), label);
+                    c.label->setFont (juce::FontOptions (12.0f));
+                    c.label->setColour (juce::Label::textColourId, juce::Colours::lightgrey);
+                    addAndMakeVisible (*c.label);
+
+                    c.slider = std::make_unique<juce::Slider> (juce::Slider::LinearHorizontal,
+                                                               juce::Slider::TextBoxRight);
+                    c.slider->setTextBoxStyle (juce::Slider::TextBoxRight, false, 52, 18);
+                    c.slider->setRange ((double) p.getProperty ("min", 0.0),
+                                        (double) p.getProperty ("max", 1.0),
+                                        (double) p.getProperty ("step", 0.0));
+                    c.slider->setValue ((double) p["default"], juce::dontSendNotification);
+                    c.slider->onValueChange = markDirty;
+                    addAndMakeVisible (*c.slider);
+                }
+                gm.controls.push_back (std::move (c));
+            }
         }
-        gpuControls.push_back (std::move (c));
+        gpuModules.push_back (std::move (gm));
     }
-    resized();
+
+    // Grow the window to fit the panel: per module an enable row (24+8) plus
+    // two-column param rows (26 each + 8). Base height without panel = 682.
+    int extra = 0;
+    for (const auto& gm : gpuModules)
+        extra += 32 + ((int) gm.controls.size() + 1) / 2 * 26 + 8;
+    setSize (680, juce::jmax (846, 682 + extra));
 }
 
 juce::var MainComponent::collectGpuParams() const
 {
-    auto* obj = new juce::DynamicObject();
-    for (const auto& c : gpuControls)
-        obj->setProperty (c.name, c.isBool ? juce::var (c.toggle->getToggleState())
-                                           : juce::var (c.slider->getValue()));
-    return juce::var (obj);
+    // Module chain for the worker: enabled modules in describe order.
+    juce::Array<juce::var> chain;
+    for (const auto& gm : gpuModules)
+    {
+        if (gm.enable == nullptr || ! gm.enable->getToggleState())
+            continue;
+        auto* params = new juce::DynamicObject();
+        for (const auto& c : gm.controls)
+            params->setProperty (c.name,
+                c.type == "bool"   ? juce::var (c.toggle->getToggleState())
+              : c.type == "choice" ? juce::var (c.combo->getText())
+                                   : juce::var (c.slider->getValue()));
+        auto* entry = new juce::DynamicObject();
+        entry->setProperty ("module", gm.name);
+        entry->setProperty ("params", juce::var (params));
+        chain.add (juce::var (entry));
+    }
+    return juce::var (chain);
 }
 
 //==============================================================================
@@ -1698,9 +1753,12 @@ void MainComponent::resized()
         r.removeFromLeft (8);
         gpuStatusLabel.setBounds (r);
     }
-    if (! gpuControls.empty())
+    for (auto& gm : gpuModules)
     {
-        const int n    = (int) gpuControls.size();
+        gm.enable->setBounds (row (24));
+        const int n = (int) gm.controls.size();
+        if (n == 0)
+            continue;
         const int rows = (n + 1) / 2;
         auto panel = row (rows * 26);
         const int colW = panel.getWidth() / 2;
@@ -1709,9 +1767,14 @@ void MainComponent::resized()
             auto cell = juce::Rectangle<int> (panel.getX() + (i % 2) * colW,
                                               panel.getY() + (i / 2) * 26,
                                               colW - 10, 22);
-            auto& c = gpuControls[(size_t) i];
-            if (c.isBool)
+            auto& c = gm.controls[(size_t) i];
+            if (c.type == "bool")
                 c.toggle->setBounds (cell);
+            else if (c.type == "choice")
+            {
+                c.label->setBounds (cell.removeFromLeft (60));
+                c.combo->setBounds (cell);
+            }
             else
             {
                 c.label->setBounds (cell.removeFromLeft (118));

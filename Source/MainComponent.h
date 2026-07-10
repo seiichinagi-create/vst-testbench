@@ -165,12 +165,19 @@ private:
     struct GpuControl
     {
         juce::String name;
-        bool isBool = false;
+        juce::String type;   // "float" / "int" / "bool" / "choice"
         std::unique_ptr<juce::Label>        label;
         std::unique_ptr<juce::Slider>       slider;
         std::unique_ptr<juce::ToggleButton> toggle;
+        std::unique_ptr<juce::ComboBox>     combo;
     };
-    std::vector<GpuControl> gpuControls;   // built from the worker's describe schema
+    struct GpuModule
+    {
+        juce::String name;
+        std::unique_ptr<juce::ToggleButton> enable;   // module on/off in the chain
+        std::vector<GpuControl> controls;
+    };
+    std::vector<GpuModule> gpuModules;   // built from the worker's describe schema
 
     //== MIDI thru to Reface ==
     std::unique_ptr<juce::MidiOutput> midiOut;
