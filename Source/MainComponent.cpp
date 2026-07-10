@@ -175,6 +175,11 @@ MainComponent::MainComponent()
     gpuStatusLabel.setText ("GPU FX off", juce::dontSendNotification);
     addAndMakeVisible (gpuStatusLabel);
 
+    addAndMakeVisible (gpuViewport);
+    gpuViewport.setViewedComponent (&gpuPanelHolder, false);
+    gpuViewport.setScrollBarsShown (true, false);
+    gpuViewport.setScrollBarThickness (12);
+
     juce::Component::SafePointer<MainComponent> weakThis (this);
     gpuWorker.onSchemaReady = [weakThis] (juce::var schema)
     {
@@ -1371,7 +1376,7 @@ void MainComponent::buildGpuPanel (const juce::var& describeResponse)
                                    juce::dontSendNotification);
         gm.enable->setColour (juce::ToggleButton::textColourId, juce::Colours::mediumpurple);
         gm.enable->onClick = markDirty;
-        addAndMakeVisible (*gm.enable);
+        gpuPanelHolder.addAndMakeVisible (*gm.enable);
 
         const auto params = m["params"];
         if (params.isArray())
@@ -1388,14 +1393,14 @@ void MainComponent::buildGpuPanel (const juce::var& describeResponse)
                     c.toggle = std::make_unique<juce::ToggleButton> (label);
                     c.toggle->setToggleState ((bool) p["default"], juce::dontSendNotification);
                     c.toggle->onClick = markDirty;
-                    addAndMakeVisible (*c.toggle);
+                    gpuPanelHolder.addAndMakeVisible (*c.toggle);
                 }
                 else if (c.type == "choice")
                 {
                     c.label = std::make_unique<juce::Label> (juce::String(), label);
                     c.label->setFont (juce::FontOptions (12.0f));
                     c.label->setColour (juce::Label::textColourId, juce::Colours::lightgrey);
-                    addAndMakeVisible (*c.label);
+                    gpuPanelHolder.addAndMakeVisible (*c.label);
 
                     c.combo = std::make_unique<juce::ComboBox>();
                     const auto options = p["options"];
@@ -1409,14 +1414,14 @@ void MainComponent::buildGpuPanel (const juce::var& describeResponse)
                     if (c.combo->getSelectedId() == 0 && c.combo->getNumItems() > 0)
                         c.combo->setSelectedId (1, juce::dontSendNotification);
                     c.combo->onChange = markDirty;
-                    addAndMakeVisible (*c.combo);
+                    gpuPanelHolder.addAndMakeVisible (*c.combo);
                 }
                 else   // float / int
                 {
                     c.label = std::make_unique<juce::Label> (juce::String(), label);
                     c.label->setFont (juce::FontOptions (12.0f));
                     c.label->setColour (juce::Label::textColourId, juce::Colours::lightgrey);
-                    addAndMakeVisible (*c.label);
+                    gpuPanelHolder.addAndMakeVisible (*c.label);
 
                     c.slider = std::make_unique<juce::Slider> (juce::Slider::LinearHorizontal,
                                                                juce::Slider::TextBoxRight);
@@ -1426,7 +1431,7 @@ void MainComponent::buildGpuPanel (const juce::var& describeResponse)
                                         (double) p.getProperty ("step", 0.0));
                     c.slider->setValue ((double) p["default"], juce::dontSendNotification);
                     c.slider->onValueChange = markDirty;
-                    addAndMakeVisible (*c.slider);
+                    gpuPanelHolder.addAndMakeVisible (*c.slider);
                 }
                 gm.controls.push_back (std::move (c));
             }
@@ -1434,12 +1439,17 @@ void MainComponent::buildGpuPanel (const juce::var& describeResponse)
         gpuModules.push_back (std::move (gm));
     }
 
-    // Grow the window to fit the panel: per module an enable row (24+8) plus
-    // two-column param rows (26 each + 8). Base height without panel = 682.
-    int extra = 0;
+    // The panel lives in a viewport capped at 340 px: five modules of chain
+    // outgrow any window, so the chain scrolls instead of the app growing.
+    setSize (680, juce::jmax (846, 690 + juce::jmin (340, gpuPanelContentHeight())));
+}
+
+int MainComponent::gpuPanelContentHeight() const
+{
+    int h = 0;
     for (const auto& gm : gpuModules)
-        extra += 32 + ((int) gm.controls.size() + 1) / 2 * 26 + 8;
-    setSize (680, juce::jmax (846, 682 + extra));
+        h += 28 + ((int) gm.controls.size() + 1) / 2 * 26 + 6;
+    return h;
 }
 
 juce::var MainComponent::collectGpuParams() const
@@ -1753,35 +1763,45 @@ void MainComponent::resized()
         r.removeFromLeft (8);
         gpuStatusLabel.setBounds (r);
     }
-    for (auto& gm : gpuModules)
+    if (! gpuModules.empty())
     {
-        gm.enable->setBounds (row (24));
-        const int n = (int) gm.controls.size();
-        if (n == 0)
-            continue;
-        const int rows = (n + 1) / 2;
-        auto panel = row (rows * 26);
-        const int colW = panel.getWidth() / 2;
-        for (int i = 0; i < n; ++i)
+        const int contentH = gpuPanelContentHeight();
+        auto vp = row (juce::jmin (340, contentH));
+        gpuViewport.setBounds (vp);
+        const int holderW = vp.getWidth() - (contentH > vp.getHeight() ? 14 : 0);
+        gpuPanelHolder.setSize (holderW, contentH);
+
+        int y = 0;
+        for (auto& gm : gpuModules)
         {
-            auto cell = juce::Rectangle<int> (panel.getX() + (i % 2) * colW,
-                                              panel.getY() + (i / 2) * 26,
-                                              colW - 10, 22);
-            auto& c = gm.controls[(size_t) i];
-            if (c.type == "bool")
-                c.toggle->setBounds (cell);
-            else if (c.type == "choice")
+            gm.enable->setBounds (0, y, holderW - 4, 24);
+            y += 28;
+            const int n = (int) gm.controls.size();
+            const int rows = (n + 1) / 2;
+            const int colW = holderW / 2;
+            for (int i = 0; i < n; ++i)
             {
-                c.label->setBounds (cell.removeFromLeft (60));
-                c.combo->setBounds (cell);
+                auto cell = juce::Rectangle<int> ((i % 2) * colW, y + (i / 2) * 26,
+                                                  colW - 10, 22);
+                auto& c = gm.controls[(size_t) i];
+                if (c.type == "bool")
+                    c.toggle->setBounds (cell);
+                else if (c.type == "choice")
+                {
+                    c.label->setBounds (cell.removeFromLeft (60));
+                    c.combo->setBounds (cell);
+                }
+                else
+                {
+                    c.label->setBounds (cell.removeFromLeft (118));
+                    c.slider->setBounds (cell);
+                }
             }
-            else
-            {
-                c.label->setBounds (cell.removeFromLeft (118));
-                c.slider->setBounds (cell);
-            }
+            y += rows * 26 + 6;
         }
     }
+    else
+        gpuViewport.setBounds ({});
     fileLabel.setBounds (row (22));
 
     // --- FX stage ---

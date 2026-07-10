@@ -178,6 +178,9 @@ private:
         std::vector<GpuControl> controls;
     };
     std::vector<GpuModule> gpuModules;   // built from the worker's describe schema
+    juce::Viewport  gpuViewport;         // the chain outgrew the window: scroll it
+    juce::Component gpuPanelHolder;      // controls live here, inside the viewport
+    int gpuPanelContentHeight() const;
 
     //== MIDI thru to Reface ==
     std::unique_ptr<juce::MidiOutput> midiOut;
