@@ -214,10 +214,47 @@ MainComponent::MainComponent()
     addAndMakeVisible (instLabel);
 
     // --- MIDI bounce (Phase C: MIDI file -> VSTi offline bounce -> file player) ---
+    // One MIDI home next to the exe: recorded takes land there and the open
+    // dialog starts there, so play -> auto-save -> bounce is one folder.
+    midiFolder = juce::File::getSpecialLocation (juce::File::currentExecutableFile)
+                     .getParentDirectory().getChildFile ("MIDI");
+    midiFolder.createDirectory();
+    if (! midiFolder.isDirectory())
+    {
+        midiFolder = appDir().getChildFile ("MIDI");   // exe dir not writable - unlikely here
+        midiFolder.createDirectory();
+    }
+    midiRecorder.setDirectory (midiFolder);
+
     openMidiButton.setTooltip ("Bounce a MIDI file through the loaded VSTi (faster than realtime) "
                                "and play the result on the file player - GPU FX / FX / PRE-RENDER "
-                               "all apply. VSTi knob changes re-bounce and hot-swap.");
+                               "all apply. VSTi knob changes re-bounce and hot-swap. "
+                               "Opens in " + midiFolder.getFullPathName());
     openMidiButton.onClick = [this] { openMidiFileDialog(); };
+
+    addAndMakeVisible (midiRecButton);
+    midiRecButton.setTooltip ("Dashcam MIDI capture: a take opens on the first note-on and auto-saves "
+                              "to " + midiFolder.getFullPathName() + " after "
+                              + juce::String ((int) MidiTakeRecorder::idleCloseSeconds)
+                              + " s of silence. Takes with fewer than "
+                              + juce::String (MidiTakeRecorder::minNoteOns) + " notes are discarded.");
+    midiRecButton.setToggleState (midiRecFile().existsAsFile()
+                                      ? midiRecFile().loadFileAsString().trim() == "1"
+                                      : true,   // default ON - noodling is never lost
+                                  juce::dontSendNotification);
+    midiRecorder.setEnabled (midiRecButton.getToggleState());
+    midiRecButton.onClick = [this]
+    {
+        const bool on = midiRecButton.getToggleState();
+        midiRecFile().replaceWithText (on ? "1" : "0");
+        midiRecorder.setEnabled (on);
+        if (! on)
+        {
+            const auto saved = midiRecorder.closeAndSave();   // keep what was played
+            if (saved != juce::File())
+                setStatus ("MIDI take saved: " + saved.getFileName());
+        }
+    };
 
     midiStatusLabel.setJustificationType (juce::Justification::centredLeft);
     midiStatusLabel.setColour (juce::Label::textColourId, juce::Colours::skyblue);
@@ -302,6 +339,7 @@ MainComponent::~MainComponent()
     instEditorWindow = nullptr;
     deviceManager.removeMidiInputDeviceCallback ({}, this);
     deviceManager.removeMidiInputDeviceCallback ({}, &player);
+    midiRecorder.closeAndSave();   // an open take survives app close
     deviceManager.removeAudioCallback (&player);
     deviceManager.removeChangeListener (this);
     player.setProcessor (nullptr);
@@ -325,7 +363,7 @@ juce::File MainComponent::appDir() const
 juce::File MainComponent::cacheFile()      const { return appDir().getChildFile ("known_plugins.xml"); }
 juce::File MainComponent::audioStateFile() const { return appDir().getChildFile ("audio_settings.xml"); }
 juce::File MainComponent::lastDirFile()    const { return appDir().getChildFile ("last_audio_dir.txt"); }
-juce::File MainComponent::lastMidiDirFile() const { return appDir().getChildFile ("last_midi_dir.txt"); }
+juce::File MainComponent::midiRecFile()    const { return appDir().getChildFile ("midi_rec.txt"); }
 juce::File MainComponent::autoBackendFile() const { return appDir().getChildFile ("auto_backend.txt"); }
 
 juce::File MainComponent::backendStateFile (const juce::String& typeName) const
@@ -863,11 +901,8 @@ void MainComponent::openMidiFileDialog()
         return;
     }
 
-    juce::File startDir (lastMidiDirFile().loadFileAsString().trim());
-    if (! startDir.isDirectory())
-        startDir = juce::File::getSpecialLocation (juce::File::userMusicDirectory);
-
-    auto chooser = std::make_shared<juce::FileChooser> ("Select a MIDI file", startDir,
+    // Same folder the take recorder saves into: play -> auto-save -> bounce.
+    auto chooser = std::make_shared<juce::FileChooser> ("Select a MIDI file", midiFolder,
                                                         "*.mid;*.midi;*.smf");
     chooser->launchAsync (juce::FileBrowserComponent::openMode
                           | juce::FileBrowserComponent::canSelectFiles,
@@ -875,7 +910,6 @@ void MainComponent::openMidiFileDialog()
         {
             auto file = fc.getResult();
             if (file == juce::File{}) return;
-            lastMidiDirFile().replaceWithText (file.getParentDirectory().getFullPathName());
             loadMidiFile (file);
         });
 }
@@ -1425,6 +1459,8 @@ void MainComponent::toggleEditorFor (Graph::Node::Ptr node, const juce::String& 
 //==============================================================================
 void MainComponent::handleIncomingMidiMessage (juce::MidiInput*, const juce::MidiMessage& m)
 {
+    midiRecorder.handleMessage (m);   // dashcam capture, independent of the thru switch
+
     if (! midiThru.load()) return;
     const juce::ScopedLock sl (midiOutLock);
     if (midiOut != nullptr)
@@ -1504,6 +1540,19 @@ void MainComponent::timerCallback()
             gpuDirty = false;
             requestGpuRender();
         }
+    }
+
+    // --- MIDI take recorder housekeeping ---
+    {
+        const auto saved = midiRecorder.poll();
+        if (saved != juce::File())
+            setStatus ("MIDI take saved: " + saved.getFileName());
+
+        const auto recText = midiRecorder.isTakeOpen()
+            ? juce::String::formatted ("REC * %d", midiRecorder.getNoteCount())
+            : juce::String ("MIDI REC");
+        if (midiRecButton.getButtonText() != recText)
+            midiRecButton.setButtonText (recText);
     }
 
     // --- MIDI bounce housekeeping ---
@@ -1610,10 +1659,12 @@ void MainComponent::resized()
     }
     instLabel.setBounds (row (22));
 
-    // --- MIDI bounce ---
+    // --- MIDI bounce + take recorder ---
     {
         auto r = row (28);
         openMidiButton.setBounds (r.removeFromLeft (150));
+        r.removeFromLeft (8);
+        midiRecButton.setBounds (r.removeFromLeft (110));
         r.removeFromLeft (8);
         midiStatusLabel.setBounds (r);
     }

@@ -5,6 +5,7 @@
 #include "RenderAheadEngine.h"
 #include "GpuFxWorker.h"
 #include "MidiBounceEngine.h"
+#include "MidiTakeRecorder.h"
 
 //==============================================================================
 // Lightweight VST3 test-bench host.
@@ -104,7 +105,7 @@ private:
     juce::File cacheFile() const;
     juce::File audioStateFile() const;
     juce::File lastDirFile() const;
-    juce::File lastMidiDirFile() const;
+    juce::File midiRecFile() const;
     juce::File autoBackendFile() const;
     juce::AudioPluginFormat* vst3Format() const;
     int currentSourceMode() const;
@@ -139,6 +140,8 @@ private:
     bool  needsFullRefresh = false;   // quick renders leave the rest of the file stale
 
     //== MIDI bounce state (Phase C) ==
+    juce::File midiFolder;   // <exe dir>\MIDI - shared home of recorded takes and the open dialog
+    MidiTakeRecorder midiRecorder;
     MidiBounceEngine bounceEngine;
     std::unique_ptr<juce::AudioPluginInstance> offlineInst;  // clone of the live VSTi, bounce thread only
     bool offlineInstLoading = false;
@@ -195,8 +198,9 @@ private:
     juce::TextButton   clearInstButton { "Remove Inst" };
     juce::Label        instLabel;
 
-    // MIDI bounce (Phase C)
+    // MIDI bounce (Phase C) + take recorder
     juce::TextButton   openMidiButton { "Open MIDI file..." };
+    juce::ToggleButton midiRecButton  { "MIDI REC" };
     juce::Label        midiStatusLabel;
 
     // File player
