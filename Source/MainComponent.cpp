@@ -327,7 +327,7 @@ MainComponent::MainComponent()
     applyBackendForMode (currentSourceMode());
 
     startTimerHz (10);
-    setSize (680, 846);   // room for the GPU FX panel (11 params) + MIDI bounce row
+    setSize (760, 880);   // flow-diagram layout: SOURCE / PROCESS / FX+OUT boxes
 }
 
 MainComponent::~MainComponent()
@@ -1660,160 +1660,220 @@ void MainComponent::timerCallback()
 }
 
 //==============================================================================
+void MainComponent::drawStageBox (juce::Graphics& g, juce::Rectangle<int> b,
+                                  const juce::String& title, juce::Colour accent) const
+{
+    if (b.isEmpty()) return;
+    g.setColour (juce::Colour (0xff262b34));
+    g.fillRoundedRectangle (b.toFloat(), 8.0f);
+    g.setColour (accent.withAlpha (0.55f));
+    g.drawRoundedRectangle (b.toFloat().reduced (0.5f), 8.0f, 1.4f);
+    // title chip
+    g.setColour (accent);
+    g.setFont (juce::FontOptions (12.0f, juce::Font::bold));
+    g.drawText (title, b.getX() + 12, b.getY() + 5, b.getWidth() - 24, 14,
+                juce::Justification::left);
+}
+
+void MainComponent::drawFlowArrow (juce::Graphics& g, juce::Point<int> from,
+                                   juce::Point<int> to, juce::Colour c) const
+{
+    g.setColour (c);
+    juce::Line<float> line (from.toFloat(), to.toFloat());
+    g.drawArrow (line, 2.4f, 9.0f, 9.0f);
+}
+
 void MainComponent::paint (juce::Graphics& g)
 {
     g.fillAll (juce::Colour (0xff20242b));
     g.setColour (juce::Colours::white);
     g.setFont (juce::FontOptions (18.0f, juce::Font::bold));
-    g.drawText ("VST TestBench", 16, 10, getWidth() - 32, 26, juce::Justification::left);
+    g.drawText ("VST TestBench", 16, 10, getWidth() - 300, 26, juce::Justification::left);
+
+    const juce::Colour cSrc (0xff5fb0e0), cProc (0xffe0a35f), cFx (0xff9a5fe0),
+                       cOut (0xff5fe08a);
+    drawStageBox (g, boxSource,  "SOURCE  (switchable)",         cSrc);
+    drawStageBox (g, boxProcess, "PROCESS  (offline render chain)", cProc);
+    drawStageBox (g, boxFx,      "FX  VST3",                     cFx);
+
+    // OUT terminal
+    if (! boxOut.isEmpty())
+    {
+        g.setColour (juce::Colour (0xff262b34));
+        g.fillRoundedRectangle (boxOut.toFloat(), 8.0f);
+        g.setColour (cOut.withAlpha (0.6f));
+        g.drawRoundedRectangle (boxOut.toFloat().reduced (0.5f), 8.0f, 1.4f);
+        g.setColour (cOut);
+        g.setFont (juce::FontOptions (12.0f, juce::Font::bold));
+        g.drawText ("OUT", boxOut.getX(), boxOut.getY() + 10, boxOut.getWidth(), 14,
+                    juce::Justification::centred);
+        g.setFont (juce::FontOptions (20.0f, juce::Font::bold));
+        g.drawText (juce::CharPointer_UTF8 ("\xe2\x96\xba\xe2\x96\xba"),
+                    boxOut.getX(), boxOut.getY() + 26, boxOut.getWidth(), 22,
+                    juce::Justification::centred);
+    }
+
+    // connectors between stages
+    auto midX = [] (juce::Rectangle<int> r) { return juce::Point<int> (r.getCentreX(), 0); };
+    if (! boxSource.isEmpty() && ! boxProcess.isEmpty())
+        drawFlowArrow (g, { boxSource.getCentreX(), boxSource.getBottom() },
+                          { boxProcess.getCentreX(), boxProcess.getY() }, cSrc.withAlpha (0.8f));
+    if (! boxProcess.isEmpty() && ! boxFx.isEmpty())
+        drawFlowArrow (g, { boxProcess.getCentreX(), boxProcess.getBottom() },
+                          { boxProcess.getCentreX(), boxFx.getY() }, cProc.withAlpha (0.8f));
+    if (! boxFx.isEmpty() && ! boxOut.isEmpty())
+        drawFlowArrow (g, { boxFx.getRight(), boxFx.getCentreY() },
+                          { boxOut.getX(), boxOut.getCentreY() }, cFx.withAlpha (0.8f));
+    juce::ignoreUnused (midX);
 }
 
 void MainComponent::resized()
 {
-    auto area = getLocalBounds().reduced (16);
-    area.removeFromTop (34);   // title
+    auto full = getLocalBounds().reduced (14);
 
-    auto row = [&area] (int h) { auto r = area.removeFromTop (h); area.removeFromTop (8); return r; };
+    // --- top utility bar: title (painted) + settings on the right ---
+    {
+        auto top = full.removeFromTop (30);
+        resetAudioButton.setBounds (top.removeFromRight (100));
+        top.removeFromRight (6);
+        audioSettingsButton.setBounds (top.removeFromRight (150));
+    }
+    full.removeFromTop (10);
 
-    {
-        auto r = row (30);
-        resetAudioButton.setBounds (r.removeFromRight (110));
-        r.removeFromRight (6);
-        audioSettingsButton.setBounds (r);
-    }
+    statusLabel.setBounds (full.removeFromBottom (22));
+    full.removeFromBottom (6);
 
-    {
-        auto r = row (28);
-        sourceLabel.setBounds (r.removeFromLeft (110));
-        r.removeFromLeft (6);
-        sourceCombo.setBounds (r.removeFromLeft (220));
-        r.removeFromLeft (8);
-        autoBackendButton.setBounds (r);
-    }
-    {
-        auto r = row (28);
-        recentLabel.setBounds (r.removeFromLeft (110));
-        r.removeFromLeft (6);
-        recentCombo.setBounds (r.removeFromLeft (r.getWidth() - 140));
-        r.removeFromLeft (6);
-        loadButton.setBounds (r);
-    }
-    {
-        auto r = row (28);
-        inputPairLabel.setBounds (r.removeFromLeft (110));
-        r.removeFromLeft (6);
-        inputPairCombo.setBounds (r.removeFromLeft (120));
-    }
-    {
-        auto r = row (28);
-        midiOutLabel.setBounds (r.removeFromLeft (110));
-        r.removeFromLeft (6);
-        midiOutCombo.setBounds (r.removeFromLeft (r.getWidth() - 190));
-        r.removeFromLeft (6);
-        midiThruButton.setBounds (r);
-    }
+    const int arrow = 20;    // vertical gap between stages for the connector arrow
+    const int pad   = 26;    // inside padding below a box title
+    auto rowIn = [] (juce::Rectangle<int>& a, int h)
+                 { auto r = a.removeFromTop (h); a.removeFromTop (6); return r; };
 
-    // --- instrument stage ---
+    // ===== SOURCE box (top, fixed height) =====================================
+    const int srcH = 6 + 20 + 30 + 6 + 30 + 6 + 22 + 6 + 28 + 6 + 30 + 6 + 24 + 6 + 28 + 8;
+    boxSource = full.removeFromTop (srcH);
     {
-        auto r = row (30);
-        loadInstButton.setBounds (r.removeFromLeft (130));
-        r.removeFromLeft (8);
-        instEditorButton.setBounds (r.removeFromLeft (90));
-        r.removeFromLeft (8);
-        clearInstButton.setBounds (r.removeFromLeft (110));
-    }
-    instLabel.setBounds (row (22));
-
-    // --- MIDI bounce + take recorder ---
-    {
-        auto r = row (28);
-        openMidiButton.setBounds (r.removeFromLeft (150));
-        r.removeFromLeft (8);
-        midiRecButton.setBounds (r.removeFromLeft (110));
-        r.removeFromLeft (8);
-        midiStatusLabel.setBounds (r);
-    }
-
-    // --- file player ---
-    {
-        auto r = row (30);
-        openFileButton.setBounds (r.removeFromLeft (150));
-        r.removeFromLeft (8);
-        playButton.setBounds (r.removeFromLeft (80));
-        r.removeFromLeft (8);
-        stopButton.setBounds (r.removeFromLeft (70));
-        r.removeFromLeft (8);
-        loopButton.setBounds (r.removeFromLeft (70));
-    }
-    {
-        auto r = row (26);
-        timeLabel.setBounds (r.removeFromRight (110));
-        r.removeFromRight (6);
-        posSlider.setBounds (r);
-    }
-    {
-        auto r = row (26);
-        preRenderButton.setBounds (r.removeFromLeft (130));
-        r.removeFromLeft (8);
-        renderLabel.setBounds (r);
-    }
-    {
-        auto r = row (26);
-        gpuFxButton.setBounds (r.removeFromLeft (130));
-        r.removeFromLeft (8);
-        gpuStatusLabel.setBounds (r);
-    }
-    if (! gpuModules.empty())
-    {
-        const int contentH = gpuPanelContentHeight();
-        auto vp = row (juce::jmin (340, contentH));
-        gpuViewport.setBounds (vp);
-        const int holderW = vp.getWidth() - (contentH > vp.getHeight() ? 14 : 0);
-        gpuPanelHolder.setSize (holderW, contentH);
-
-        int y = 0;
-        for (auto& gm : gpuModules)
+        auto in = boxSource.reduced (12);
+        in.removeFromTop (pad - 12);
         {
-            gm.enable->setBounds (0, y, holderW - 4, 24);
-            y += 28;
-            const int n = (int) gm.controls.size();
-            const int rows = (n + 1) / 2;
-            const int colW = holderW / 2;
-            for (int i = 0; i < n; ++i)
-            {
-                auto cell = juce::Rectangle<int> ((i % 2) * colW, y + (i / 2) * 26,
-                                                  colW - 10, 22);
-                auto& c = gm.controls[(size_t) i];
-                if (c.type == "bool")
-                    c.toggle->setBounds (cell);
-                else if (c.type == "choice")
-                {
-                    c.label->setBounds (cell.removeFromLeft (60));
-                    c.combo->setBounds (cell);
-                }
-                else
-                {
-                    c.label->setBounds (cell.removeFromLeft (118));
-                    c.slider->setBounds (cell);
-                }
-            }
-            y += rows * 26 + 6;
+            auto r = rowIn (in, 26);
+            sourceLabel.setBounds (r.removeFromLeft (60));
+            sourceCombo.setBounds (r.removeFromLeft (200));
+            r.removeFromLeft (10);
+            autoBackendButton.setBounds (r);
+        }
+        {   // instrument
+            auto r = rowIn (in, 28);
+            loadInstButton.setBounds (r.removeFromLeft (120));
+            r.removeFromLeft (6); instEditorButton.setBounds (r.removeFromLeft (80));
+            r.removeFromLeft (6); clearInstButton.setBounds (r.removeFromLeft (100));
+            r.removeFromLeft (10); instLabel.setBounds (r);
+        }
+        {   // MIDI file / bounce + take recorder
+            auto r = rowIn (in, 28);
+            openMidiButton.setBounds (r.removeFromLeft (130));
+            r.removeFromLeft (6); midiRecButton.setBounds (r.removeFromLeft (90));
+            r.removeFromLeft (8); midiStatusLabel.setBounds (r);
+        }
+        {   // file player transport
+            auto r = rowIn (in, 28);
+            openFileButton.setBounds (r.removeFromLeft (130));
+            r.removeFromLeft (6); playButton.setBounds (r.removeFromLeft (70));
+            r.removeFromLeft (6); stopButton.setBounds (r.removeFromLeft (62));
+            r.removeFromLeft (6); loopButton.setBounds (r.removeFromLeft (64));
+            r.removeFromLeft (10); timeLabel.setBounds (r.removeFromRight (104));
+            posSlider.setBounds (r);
+        }
+        {   // routing: live input pair + reface midi thru
+            auto r = rowIn (in, 24);
+            inputPairLabel.setBounds (r.removeFromLeft (86));
+            inputPairCombo.setBounds (r.removeFromLeft (110));
+            r.removeFromLeft (12);
+            midiOutLabel.setBounds (r.removeFromLeft (110));
+            midiOutCombo.setBounds (r.removeFromLeft (r.getWidth() - 170));
+            r.removeFromLeft (6); midiThruButton.setBounds (r);
         }
     }
-    else
-        gpuViewport.setBounds ({});
-    fileLabel.setBounds (row (22));
+    full.removeFromTop (arrow);
 
-    // --- FX stage ---
+    // ===== FX box (bottom, fixed) + OUT terminal =============================
+    const int fxH = pad + 30 + 6 + 30 + 6 + 22 + 10;
+    auto fxStrip = full.removeFromBottom (fxH);
+    boxOut = fxStrip.removeFromRight (74).reduced (0, 14);
+    fxStrip.removeFromRight (arrow);           // arrow gap to OUT
+    boxFx = fxStrip;
     {
-        auto r = row (30);
-        editorButton.setBounds (r.removeFromLeft (90));
-        r.removeFromLeft (8);
-        bypassButton.setBounds (r.removeFromLeft (110));
-        r.removeFromLeft (8);
-        clearButton.setBounds (r.removeFromLeft (110));
+        auto in = boxFx.reduced (12);
+        in.removeFromTop (pad - 12);
+        {
+            auto r = rowIn (in, 28);
+            recentLabel.setBounds (r.removeFromLeft (100));
+            recentCombo.setBounds (r.removeFromLeft (r.getWidth() - 130));
+            r.removeFromLeft (6); loadButton.setBounds (r);
+        }
+        {
+            auto r = rowIn (in, 28);
+            editorButton.setBounds (r.removeFromLeft (80));
+            r.removeFromLeft (6); bypassButton.setBounds (r.removeFromLeft (100));
+            r.removeFromLeft (6); clearButton.setBounds (r.removeFromLeft (100));
+            r.removeFromLeft (10); pluginLabel.setBounds (r);
+        }
     }
+    full.removeFromBottom (arrow);
 
-    pluginLabel.setBounds (row (24));
-    statusLabel.setBounds (area.removeFromBottom (24));
+    // ===== PROCESS box (fills the middle: PRE-RENDER + GPU chain) =============
+    boxProcess = full;
+    {
+        auto in = boxProcess.reduced (12);
+        in.removeFromTop (pad - 12);
+        {
+            auto r = rowIn (in, 26);
+            preRenderButton.setBounds (r.removeFromLeft (120));
+            r.removeFromLeft (8); renderLabel.setBounds (r);
+        }
+        {
+            auto r = rowIn (in, 26);
+            gpuFxButton.setBounds (r.removeFromLeft (120));
+            r.removeFromLeft (8); gpuStatusLabel.setBounds (r);
+        }
+        fileLabel.setBounds (in.removeFromBottom (20));
+        in.removeFromBottom (4);
+
+        if (! gpuModules.empty())
+        {
+            gpuViewport.setBounds (in);
+            const int contentH = gpuPanelContentHeight();
+            const int holderW = in.getWidth() - (contentH > in.getHeight() ? 14 : 0);
+            gpuPanelHolder.setSize (holderW, contentH);
+            int y = 0;
+            for (auto& gm : gpuModules)
+            {
+                gm.enable->setBounds (0, y, holderW - 4, 24);
+                y += 28;
+                const int n = (int) gm.controls.size();
+                const int rows = (n + 1) / 2;
+                const int colW = holderW / 2;
+                for (int i = 0; i < n; ++i)
+                {
+                    auto cell = juce::Rectangle<int> ((i % 2) * colW, y + (i / 2) * 26,
+                                                      colW - 10, 22);
+                    auto& c = gm.controls[(size_t) i];
+                    if (c.type == "bool")
+                        c.toggle->setBounds (cell);
+                    else if (c.type == "choice")
+                    {
+                        c.label->setBounds (cell.removeFromLeft (60));
+                        c.combo->setBounds (cell);
+                    }
+                    else
+                    {
+                        c.label->setBounds (cell.removeFromLeft (118));
+                        c.slider->setBounds (cell);
+                    }
+                }
+                y += rows * 26 + 6;
+            }
+        }
+        else
+            gpuViewport.setBounds ({});
+    }
 }

@@ -236,5 +236,13 @@ private:
 
     std::unique_ptr<juce::DocumentWindow> editorWindow, instEditorWindow;
 
+    //== signal-flow diagram layout ==
+    // paint() draws titled stage boxes + connecting arrows; resized() fills them.
+    juce::Rectangle<int> boxSource, boxProcess, boxFx, boxOut;
+    void drawStageBox (juce::Graphics&, juce::Rectangle<int>, const juce::String& title,
+                       juce::Colour accent) const;
+    void drawFlowArrow (juce::Graphics&, juce::Point<int> from, juce::Point<int> to,
+                        juce::Colour) const;
+
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MainComponent)
 };
