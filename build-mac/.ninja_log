@@ -36,3 +36,7 @@
 60	2279	1784040451471872003	CMakeFiles/VstTestBench.dir/Source/MainComponent.cpp.o	d344f2fef26516b0
 2279	2426	1784040453690502767	VstTestBench_artefacts/Release/VST TestBench.app/Contents/MacOS/VST TestBench	545743ae72e2cdff
 2	42	1784040453854929734	/Users/ichi/dev/vst-testbench/build-mac/CMakeFiles/cmake.verify_globs	ae492b251cc3d8e7
+3	47	1784041378234942368	/Users/ichi/dev/vst-testbench/build-mac/CMakeFiles/cmake.verify_globs	ae492b251cc3d8e7
+60	2259	1784041378291575151	CMakeFiles/VstTestBench.dir/Source/MainComponent.cpp.o	d344f2fef26516b0
+2259	2398	1784041380491042769	VstTestBench_artefacts/Release/VST TestBench.app/Contents/MacOS/VST TestBench	545743ae72e2cdff
+2	37	1784041380643599529	/Users/ichi/dev/vst-testbench/build-mac/CMakeFiles/cmake.verify_globs	ae492b251cc3d8e7

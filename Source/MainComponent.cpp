@@ -48,6 +48,15 @@ MainComponent::MainComponent()
     deviceManager.addAudioCallback (&player);
     deviceManager.addMidiInputDeviceCallback ({}, &player);   // feed MIDI into graph (for VSTi)
     deviceManager.addMidiInputDeviceCallback ({}, this);      // our own thru-to-Reface path
+
+   #if JUCE_MAC
+    // macOS には WIN のような保存済み MIDI 有効化状態が無い。空ID コールバックは
+    // 「有効化済みデバイス」からしか届かないので、接続中の全 MIDI 入力を明示有効化する。
+    // これで Reface の鍵盤が thru(→Reface) と VSTi(→graph→instrument) の両方に分岐する。
+    for (const auto& mi : juce::MidiInput::getAvailableDevices())
+        deviceManager.setMidiInputDeviceEnabled (mi.identifier, true);
+   #endif
+
     rebuildConnections();
 
     // === UI ===
@@ -1557,6 +1566,12 @@ void MainComponent::handleIncomingMidiMessage (juce::MidiInput*, const juce::Mid
 void MainComponent::changeListenerCallback (juce::ChangeBroadcaster*)
 {
     // Device layout may have changed; keep monitor/plugin wiring valid.
+   #if JUCE_MAC
+    // 起動後に挿した MIDI キーボード(Reface 等)も有効化して VSTi/thru に届かせる。
+    for (const auto& mi : juce::MidiInput::getAvailableDevices())
+        if (! deviceManager.isMidiInputDeviceEnabled (mi.identifier))
+            deviceManager.setMidiInputDeviceEnabled (mi.identifier, true);
+   #endif
     rebuildConnections();
 }
 
