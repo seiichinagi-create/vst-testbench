@@ -1,0 +1,17 @@
+# ninja log v7
+1	41	1784040130447116263	/Users/ichi/dev/vst-testbench/build-mac/JUCE/tools/CMakeFiles/cmake.verify_globs	1851e5bf9a313f1c
+47	117	1784040130492750743	extras/Build/juceaide/CMakeFiles/juceaide.dir/__/__/__/modules/juce_core/juce_core_CompilationTime.cpp.o	706de931452d98b9
+45	302	1784040130490962352	extras/Build/juceaide/CMakeFiles/juceaide.dir/__/__/__/modules/juce_graphics/juce_graphics_Sheenbidi.c.o	18ed5ed55af4c752
+302	1561	1784040130748188174	extras/Build/juceaide/CMakeFiles/juceaide.dir/__/__/__/modules/juce_data_structures/juce_data_structures.mm.o	394e6e1c925f33f
+42	1928	1784040130487784105	extras/Build/juceaide/CMakeFiles/juceaide.dir/__/juce_build_tools/juce_build_tools.cpp.o	c3c30516260509c5
+41	1954	1784040130487452443	extras/Build/juceaide/CMakeFiles/juceaide.dir/Main.cpp.o	353c0d4118db0f1
+46	2339	1784040130492095169	extras/Build/juceaide/CMakeFiles/juceaide.dir/__/__/__/modules/juce_events/juce_events.mm.o	b81af2987b29cc3b
+42	2355	1784040130488036810	extras/Build/juceaide/CMakeFiles/juceaide.dir/__/__/__/modules/juce_gui_basics/juce_gui_basics_2.cpp.o	d8904e38545c2473
+43	2715	1784040130488735592	extras/Build/juceaide/CMakeFiles/juceaide.dir/__/__/__/modules/juce_gui_basics/juce_gui_basics_5.cpp.o	df13c9c6c009a89d
+43	2818	1784040130488564552	extras/Build/juceaide/CMakeFiles/juceaide.dir/__/__/__/modules/juce_gui_basics/juce_gui_basics_4.cpp.o	1aaba01c94294a4c
+118	3247	1784040130563626200	extras/Build/juceaide/CMakeFiles/juceaide.dir/__/__/__/modules/juce_core/juce_core.mm.o	d870a8a3146c387
+42	3373	1784040130488356597	extras/Build/juceaide/CMakeFiles/juceaide.dir/__/__/__/modules/juce_gui_basics/juce_gui_basics_3.cpp.o	d9a0fe0f13dcb5bf
+43	4423	1784040130488892339	extras/Build/juceaide/CMakeFiles/juceaide.dir/__/__/__/modules/juce_gui_basics/juce_gui_basics.mm.o	187bdee106ac113e
+46	5039	1784040130491787840	extras/Build/juceaide/CMakeFiles/juceaide.dir/__/__/__/modules/juce_graphics/juce_graphics.mm.o	9f7488212d59d3a1
+44	5108	1784040130489737911	extras/Build/juceaide/CMakeFiles/juceaide.dir/__/__/__/modules/juce_graphics/juce_graphics_Harfbuzz.cpp.o	40798a33ffc6916
+5108	5288	1784040135554156156	extras/Build/juceaide/juceaide_artefacts/Custom/juceaide	384f7416c8d927e8

@@ -108,6 +108,7 @@ private:
     juce::File midiRecFile() const;
     juce::File autoBackendFile() const;
     juce::AudioPluginFormat* vst3Format() const;
+    juce::AudioPluginFormat* auFormat() const;   // macOS: AudioUnit ホスト
     int currentSourceMode() const;
 
     //== audio graph ==

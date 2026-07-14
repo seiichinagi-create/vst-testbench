@@ -1,0 +1,38 @@
+# ninja log v7
+1	42	1784040137153747629	/Users/ichi/dev/vst-testbench/build-mac/CMakeFiles/cmake.verify_globs	ae492b251cc3d8e7
+43	52	1784040137195924824	VstTestBench_artefacts/Release/VST TestBench.app/Contents/Resources/RecentFilesMenuTemplate.nib	b42879da588d3960
+43	53	1784040137195639078	VstTestBench_artefacts/Release/VST TestBench.app/Contents/Resources/AppIcon.icns	db1c8f15f49acac9
+43	145	1784040137296773982	VstTestBench_artefacts/JuceLibraryCode/JuceHeader.h	113241b75872dfd6
+43	145	1784040137296773982	/Users/ichi/dev/vst-testbench/build-mac/VstTestBench_artefacts/JuceLibraryCode/JuceHeader.h	113241b75872dfd6
+43	145	1784040137297052019	VstTestBench_artefacts/JuceLibraryCode/VstTestBench/PkgInfo	50c54b35be1d0925
+43	145	1784040137297052019	/Users/ichi/dev/vst-testbench/build-mac/VstTestBench_artefacts/JuceLibraryCode/VstTestBench/PkgInfo	50c54b35be1d0925
+151	930	1784040137304321208	CMakeFiles/VstTestBench.dir/Users/ichi/JUCE/modules/juce_graphics/juce_graphics_Sheenbidi.c.o	5efe4a5fa700abb3
+146	2544	1784040137298440417	CMakeFiles/VstTestBench.dir/Source/Main.cpp.o	262b202ee9465bc3
+146	4604	1784040137298685496	CMakeFiles/VstTestBench.dir/Source/MainComponent.cpp.o	d344f2fef26516b0
+4604	4663	1784040141756895770	CMakeFiles/VstTestBench.dir/Users/ichi/JUCE/modules/juce_core/juce_core_CompilationTime.cpp.o	ee1e54a1a996a9b9
+146	5230	1784040137299313863	CMakeFiles/VstTestBench.dir/Users/ichi/JUCE/modules/juce_gui_basics/juce_gui_basics_2.cpp.o	b7080bf806c65674
+146	5375	1784040137298855619	CMakeFiles/VstTestBench.dir/Users/ichi/JUCE/modules/juce_audio_utils/juce_audio_utils.mm.o	2e6c9833c6b09ce9
+5377	5445	1784040142529693137	CMakeFiles/VstTestBench.dir/Users/ichi/JUCE/modules/juce_audio_processors_headless/juce_audio_processors_headless_ara.cpp.o	9dde14ddfa1ff78e
+5446	5494	1784040142598403249	CMakeFiles/VstTestBench.dir/Users/ichi/JUCE/modules/juce_audio_processors_headless/juce_audio_processors_headless_lv2_libs.cpp.o	896f66c6f338808c
+2546	5720	1784040139699362478	CMakeFiles/VstTestBench.dir/Users/ichi/JUCE/modules/juce_events/juce_events.mm.o	e0ab561a68eadc54
+146	5968	1784040137299164531	CMakeFiles/VstTestBench.dir/Users/ichi/JUCE/modules/juce_gui_extra/juce_gui_extra.mm.o	3e6c1274911afd51
+147	6158	1784040137300006853	CMakeFiles/VstTestBench.dir/Users/ichi/JUCE/modules/juce_gui_basics/juce_gui_basics_5.cpp.o	f4c2a130e98e929d
+147	6907	1784040137299629441	CMakeFiles/VstTestBench.dir/Users/ichi/JUCE/modules/juce_gui_basics/juce_gui_basics_4.cpp.o	f07ee1aaf05aee37
+5230	7086	1784040142382711298	CMakeFiles/VstTestBench.dir/Users/ichi/JUCE/modules/juce_data_structures/juce_data_structures.mm.o	c656f0168fc8b8e6
+146	8904	1784040137299011409	CMakeFiles/VstTestBench.dir/Users/ichi/JUCE/modules/juce_audio_processors/juce_audio_processors.mm.o	bc485befde41b4e5
+147	9035	1784040137299471569	CMakeFiles/VstTestBench.dir/Users/ichi/JUCE/modules/juce_gui_basics/juce_gui_basics_3.cpp.o	842348f9fe5f7d8c
+5721	10885	1784040142873558943	CMakeFiles/VstTestBench.dir/Users/ichi/JUCE/modules/juce_audio_basics/juce_audio_basics.mm.o	87d48f40c624c2fd
+148	11404	1784040137301382125	CMakeFiles/VstTestBench.dir/Users/ichi/JUCE/modules/juce_gui_basics/juce_gui_basics.mm.o	727e8ff2df59353f
+6158	11752	1784040143311236756	CMakeFiles/VstTestBench.dir/Users/ichi/JUCE/modules/juce_audio_devices/juce_audio_devices.mm.o	25717854177f93b
+5968	14635	1784040143121204193	CMakeFiles/VstTestBench.dir/Users/ichi/JUCE/modules/juce_audio_formats/juce_audio_formats.mm.o	f32ee20eed89bbaa
+4663	15007	1784040141815683980	CMakeFiles/VstTestBench.dir/Users/ichi/JUCE/modules/juce_core/juce_core.mm.o	2b8dc239a9e7a243
+5494	15083	1784040142647307100	CMakeFiles/VstTestBench.dir/Users/ichi/JUCE/modules/juce_audio_processors_headless/juce_audio_processors_headless.mm.o	815615d2db15e703
+150	17644	1784040137302771689	CMakeFiles/VstTestBench.dir/Users/ichi/JUCE/modules/juce_graphics/juce_graphics_Harfbuzz.cpp.o	8c560bf2ca4e60d1
+930	17819	1784040138082890495	CMakeFiles/VstTestBench.dir/Users/ichi/JUCE/modules/juce_graphics/juce_graphics.mm.o	88352e8e41e9f295
+17820	17983	1784040154972666959	VstTestBench_artefacts/Release/VST TestBench.app/Contents/MacOS/VST TestBench	545743ae72e2cdff
+2	44	1784040155150132783	/Users/ichi/dev/vst-testbench/build-mac/CMakeFiles/cmake.verify_globs	ae492b251cc3d8e7
+2	46	1784040451413508079	/Users/ichi/dev/vst-testbench/build-mac/CMakeFiles/cmake.verify_globs	ae492b251cc3d8e7
+60	1250	1784040451471502175	CMakeFiles/VstTestBench.dir/Source/Main.cpp.o	262b202ee9465bc3
+60	2279	1784040451471872003	CMakeFiles/VstTestBench.dir/Source/MainComponent.cpp.o	d344f2fef26516b0
+2279	2426	1784040453690502767	VstTestBench_artefacts/Release/VST TestBench.app/Contents/MacOS/VST TestBench	545743ae72e2cdff
+2	42	1784040453854929734	/Users/ichi/dev/vst-testbench/build-mac/CMakeFiles/cmake.verify_globs	ae492b251cc3d8e7

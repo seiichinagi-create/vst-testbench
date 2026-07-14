@@ -165,6 +165,8 @@ MainComponent::MainComponent()
     addAndMakeVisible (renderLabel);
 
     // --- GPU FX (gpufx worker transforms the playable file) ---
+    // macOS では GPU ワーカー(CUDA/Windows前提)を積まないので UI ごと除外。
+   #if ! JUCE_MAC
     addAndMakeVisible (gpuFxButton);
     gpuFxButton.setTooltip ("Render the file through the gpufx worker (spectral rebuild on the GPU); "
                             "knob changes re-render and hot-swap at the playback position.");
@@ -179,6 +181,7 @@ MainComponent::MainComponent()
     gpuViewport.setViewedComponent (&gpuPanelHolder, false);
     gpuViewport.setScrollBarsShown (true, false);
     gpuViewport.setScrollBarThickness (12);
+   #endif
 
     juce::Component::SafePointer<MainComponent> weakThis (this);
     gpuWorker.onSchemaReady = [weakThis] (juce::var schema)
@@ -443,6 +446,14 @@ juce::AudioPluginFormat* MainComponent::vst3Format() const
     return nullptr;
 }
 
+juce::AudioPluginFormat* MainComponent::auFormat() const
+{
+    for (auto* f : formatManager.getFormats())
+        if (f->getName().containsIgnoreCase ("AudioUnit"))
+            return f;
+    return nullptr;
+}
+
 int MainComponent::currentSourceMode() const
 {
     const int id = sourceCombo.getSelectedId();
@@ -528,10 +539,17 @@ void MainComponent::showAudioSettings()
 //==============================================================================
 void MainComponent::loadPluginDialog (bool asInstrument)
 {
-    auto chooser = std::make_shared<juce::FileChooser> (
-        asInstrument ? "Select a VST3 instrument" : "Select a VST3 effect",
-        juce::File ("C:/Program Files/Common Files/VST3"),
-        "*.vst3");
+   #if JUCE_MAC
+    const auto startDir = juce::File::getSpecialLocation (juce::File::userHomeDirectory)
+                              .getChildFile ("Library/Audio/Plug-Ins/Components");
+    const juce::String filter = "*.vst3;*.component";
+    const juce::String what = asInstrument ? "Select an AU/VST3 instrument" : "Select an AU/VST3 effect";
+   #else
+    const juce::File startDir ("C:/Program Files/Common Files/VST3");
+    const juce::String filter = "*.vst3";
+    const juce::String what = asInstrument ? "Select a VST3 instrument" : "Select a VST3 effect";
+   #endif
+    auto chooser = std::make_shared<juce::FileChooser> (what, startDir, filter);
 
     chooser->launchAsync (juce::FileBrowserComponent::openMode
                           | juce::FileBrowserComponent::canSelectFiles
@@ -541,8 +559,12 @@ void MainComponent::loadPluginDialog (bool asInstrument)
             auto file = fc.getResult();
             if (file == juce::File{}) return;
 
+           #if JUCE_MAC
+            auto* fmt = file.hasFileExtension ("component") ? auFormat() : vst3Format();
+           #else
             auto* fmt = vst3Format();
-            if (fmt == nullptr) { setStatus ("VST3 format not available."); return; }
+           #endif
+            if (fmt == nullptr) { setStatus ("Plugin format not available."); return; }
 
             juce::OwnedArray<juce::PluginDescription> found;
             setStatus ("Scanning " + file.getFileName() + " ...");
