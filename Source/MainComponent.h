@@ -1,6 +1,7 @@
 #pragma once
 
 #include <juce_audio_utils/juce_audio_utils.h>
+#include "vendor/SnLookAndFeel.h"
 #include "FilePlayerProcessor.h"
 #include "RenderAheadEngine.h"
 #include "GpuFxWorker.h"
@@ -245,4 +246,7 @@ private:
                         juce::Colour) const;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MainComponent)
+
+private:
+    sn::KnobLookAndFeel snLaf;   // ★メンバの先頭=最後に壊れる(子より長生きさせる)
 };

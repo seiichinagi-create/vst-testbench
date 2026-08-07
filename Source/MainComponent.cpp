@@ -24,6 +24,7 @@ namespace
 //==============================================================================
 MainComponent::MainComponent()
 {
+    setLookAndFeel (&snLaf);      // つまみとフェーダーの共通デザイン(sn-lookandfeel)
     juce::addDefaultFormatsToManager (formatManager);
     audioFormats.registerBasicFormats();
     loadKnownPlugins();
@@ -331,7 +332,7 @@ MainComponent::MainComponent()
 }
 
 MainComponent::~MainComponent()
-{
+{ setLookAndFeel (nullptr);
     stopTimer();
     gpuWorker.shutdown();
     renderEngine.stopRender();
