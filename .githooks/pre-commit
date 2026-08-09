@@ -1,0 +1,5 @@
+#!/bin/sh
+# Reject non-ASCII in the source lines this commit adds.
+# Distributed from sn-lookandfeel/tools/ascii-guard. Do not edit in place.
+# Enable in a fresh clone with:  git config core.hooksPath .githooks
+python .githooks/check_ascii.py --staged || exit 1
