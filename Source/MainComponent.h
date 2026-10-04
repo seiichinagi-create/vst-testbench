@@ -17,7 +17,7 @@
 //   VST instrument <- MIDI in      >---> VST effect ---> Audio out
 //   Audio file player             /
 //
-//   MIDI in also goes thru to hardware (Reface CP) when enabled.
+//   MIDI in can also go thru to a hardware synth (MIDI out combo) when enabled.
 // No folder scanning: plugins are loaded one file at a time and cached.
 //==============================================================================
 class MainComponent : public juce::Component,
@@ -108,6 +108,10 @@ private:
     juce::File lastDirFile() const;
     juce::File midiRecFile() const;
     juce::File autoBackendFile() const;
+    juce::File inputPairFile() const;
+    juce::File midiOutFile() const;
+    juce::File midiThruFile() const;
+    bool ensureOutputDevice();
     juce::AudioPluginFormat* vst3Format() const;
     int currentSourceMode() const;
 
@@ -183,12 +187,12 @@ private:
     juce::Component gpuPanelHolder;      // controls live here, inside the viewport
     int gpuPanelContentHeight() const;
 
-    //== MIDI thru to Reface ==
+    //== MIDI thru to hardware (off by default; the chosen output is remembered) ==
     std::unique_ptr<juce::MidiOutput> midiOut;
     juce::CriticalSection            midiOutLock;
-    std::atomic<bool>                midiThru { true };
+    std::atomic<bool>                midiThru { false };
 
-    int inputPairStart = 2;   // 0-based physical channel -> 3/4 by default
+    int inputPairStart = 0;   // 0-based physical channel; remembered (live_input_pair.txt), 1/2 by default
 
     //== UI ==
     juce::TextButton   audioSettingsButton { "Audio / MIDI Settings" };
@@ -227,9 +231,9 @@ private:
     juce::ToggleButton gpuFxButton { "GPU FX" };
     juce::Label        gpuStatusLabel;
 
-    juce::ToggleButton midiThruButton { "MIDI thru -> Reface" };
+    juce::ToggleButton midiThruButton { "MIDI thru" };
     juce::ComboBox     midiOutCombo, inputPairCombo, recentCombo;
-    juce::Label        midiOutLabel  { {}, "Reface MIDI out:" };
+    juce::Label        midiOutLabel  { {}, "MIDI out:" };
     juce::Label        inputPairLabel{ {}, "Live input pair:" };
     juce::Label        recentLabel   { {}, "Cached plugins:" };
     juce::Label        pluginLabel;

@@ -34,11 +34,15 @@ DAWの重い機能を捨て、「MIDIスイッチング」＋「VST再生」だ�
   MIDI REC トグルで無効化可(録音中はボタンが `REC * N` 表示・OFF時は途中テイクを保存して閉じる)
 
 ```
-鍵盤 ─MIDI─▶ TestBench ─(thru)─▶ Reface CP ─音─▶ UR-RT2 in3/4 ─▶ VST ─▶ 出力
-                                      └ VSTi検査時は MIDI が VST にも入る
+音源(ギター等) ─▶ オーディオIF の入力ペア(既定 1/2) ─▶ VST ─▶ 出力
+鍵盤 ─MIDI─▶ TestBench ─(任意: MIDI thru)─▶ 外部シンセ   / VSTi検査時は MIDI が VST にも入る
 ```
 
-- プラグイン未ロード時は **in3/4 をそのまま出力にモニター**（配線チェック用）
+- **入力ペア・MIDI out・MIDI thru は前回の選択を記憶**(`%APPDATA%\VstTestBench\live_input_pair.txt` / `midi_out.txt` / `midi_thru.txt`)。
+  何も保存されていなければ **入力 1/2・MIDI thru オフ・MIDI out なし**(特定の機器を前提にしない)。
+  ★以前は reface CP 前提で「入力 3/4 固定・thru オン・名前に reface/cp を含む機器を自動選択」だった。reface を外したら入力に何も来ず、どのプラグインも無音に見えた(2026-10-04)
+- 保存したオーディオ機器が開けないとき(抜いた等)は **Windows Audio の既定出力へ自動で切り替え**、状態欄に出す(黙って無音にしない)
+- プラグイン未ロード時は **選んだ入力ペアをそのまま出力にモニター**（配線チェック用）
 - **フォルダスキャンしない**。VSTはファイル指定で1個ずつ読み、`KnownPluginList` をXMLキャッシュ
   （プラグイン800個環境でも起動時スキャンゼロ）
 

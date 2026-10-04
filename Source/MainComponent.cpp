@@ -32,6 +32,7 @@ MainComponent::MainComponent()
     // --- audio + MIDI device ---
     std::unique_ptr<juce::XmlElement> savedAudio (juce::XmlDocument::parse (audioStateFile()));
     deviceManager.initialise (8, 2, savedAudio.get(), true);   // request up to 8 inputs / 2 outputs
+    ensureOutputDevice();   // the saved device may be gone (unplugged): never start silent
     deviceManager.addChangeListener (this);
 
     // --- processor graph: build the fixed IO nodes + resident file player ---
@@ -48,7 +49,7 @@ MainComponent::MainComponent()
     player.setProcessor (&graph);
     deviceManager.addAudioCallback (&player);
     deviceManager.addMidiInputDeviceCallback ({}, &player);   // feed MIDI into graph (for VSTi)
-    deviceManager.addMidiInputDeviceCallback ({}, this);      // our own thru-to-Reface path
+    deviceManager.addMidiInputDeviceCallback ({}, this);      // our own MIDI thru path
     rebuildConnections();
 
     // === UI ===
@@ -79,8 +80,14 @@ MainComponent::MainComponent()
     clearButton.onClick         = [this] { removeEffect(); };
     clearInstButton.onClick     = [this] { removeInstrument(); };
 
-    midiThruButton.setToggleState (true, juce::dontSendNotification);
-    midiThruButton.onClick = [this] { midiThru = midiThruButton.getToggleState(); };
+    // MIDI thru to a hardware synth: off unless it was left on (no device assumed)
+    midiThru = midiThruFile().existsAsFile() && midiThruFile().loadFileAsString().trim() == "1";
+    midiThruButton.setToggleState (midiThru.load(), juce::dontSendNotification);
+    midiThruButton.onClick = [this]
+    {
+        midiThru = midiThruButton.getToggleState();
+        midiThruFile().replaceWithText (midiThru.load() ? "1" : "0");
+    };
     bypassButton.onClick   = [this]
     {
         // In pre-render mode the live FX node stays bypassed (render thread owns the sound).
@@ -288,19 +295,35 @@ MainComponent::MainComponent()
     inputPairCombo.addItem ("3 / 4", 2);
     inputPairCombo.addItem ("5 / 6", 3);
     inputPairCombo.addItem ("7 / 8", 4);
-    inputPairCombo.setSelectedId (2, juce::dontSendNotification);   // default 3/4
+    {   // live input pair: remembered; 1/2 when nothing was saved
+        const int saved = inputPairFile().existsAsFile() ? inputPairFile().loadFileAsString().trim().getIntValue() : 1;
+        const int id = juce::jlimit (1, 4, saved);
+        inputPairCombo.setSelectedId (id, juce::dontSendNotification);
+        inputPairStart = (id - 1) * 2;
+    }
     inputPairCombo.onChange = [this]
     {
         inputPairStart = (inputPairCombo.getSelectedId() - 1) * 2;
+        inputPairFile().replaceWithText (juce::String (inputPairCombo.getSelectedId()));
         rebuildConnections();
     };
 
     midiOutCombo.onChange = [this]
     {
         const auto id = midiOutCombo.getSelectedId();
-        if (id <= 0) { const juce::ScopedLock sl (midiOutLock); midiOut.reset(); return; }
+        if (id <= 0)
+        {
+            const juce::ScopedLock sl (midiOutLock);
+            midiOut.reset();
+            midiOutFile().replaceWithText ({});
+            return;
+        }
         auto devices = juce::MidiOutput::getAvailableDevices();
-        if (id - 1 < devices.size()) openMidiOut (devices[id - 1].identifier);
+        if (id - 1 < devices.size())
+        {
+            openMidiOut (devices[id - 1].identifier);
+            midiOutFile().replaceWithText (devices[id - 1].name);
+        }
     };
     recentCombo.onChange = [this]
     {
@@ -320,7 +343,11 @@ MainComponent::MainComponent()
 
     refreshMidiOutList();
     refreshRecentList();
-    setStatus ("Ready. Open Audio/MIDI Settings and pick UR-RT2 (ASIO).");
+    if (auto* dev = deviceManager.getCurrentAudioDevice())
+        setStatus ("Ready. Audio: " + deviceManager.getCurrentAudioDeviceType() + " / " + dev->getName()
+                   + ", live input " + inputPairCombo.getText() + ".");
+    else
+        setStatus ("Ready - no audio device opened. Open Audio/MIDI Settings.");
     pluginLabel.setText ("No FX loaded (source -> output monitor)", juce::dontSendNotification);
 
     // If the last session ended on the other backend (e.g. closed in file/WASAPI
@@ -371,6 +398,29 @@ juce::File MainComponent::audioStateFile() const { return appDir().getChildFile 
 juce::File MainComponent::lastDirFile()    const { return appDir().getChildFile ("last_audio_dir.txt"); }
 juce::File MainComponent::midiRecFile()    const { return appDir().getChildFile ("midi_rec.txt"); }
 juce::File MainComponent::autoBackendFile() const { return appDir().getChildFile ("auto_backend.txt"); }
+juce::File MainComponent::inputPairFile()   const { return appDir().getChildFile ("live_input_pair.txt"); }
+juce::File MainComponent::midiOutFile()     const { return appDir().getChildFile ("midi_out.txt"); }
+juce::File MainComponent::midiThruFile()    const { return appDir().getChildFile ("midi_thru.txt"); }
+
+// The saved setup can name a device that is no longer there; JUCE then opens
+// nothing (or the same absent ASIO driver) and the bench runs silent with no
+// error. Fall back to the system default output (Windows Audio) instead.
+bool MainComponent::ensureOutputDevice()
+{
+    auto* dev = deviceManager.getCurrentAudioDevice();
+    if (dev != nullptr && dev->isOpen() && dev->getActiveOutputChannels().countNumberOfSetBits() > 0)
+        return true;
+    for (auto* type : deviceManager.getAvailableDeviceTypes())
+        if (type->getTypeName() == "Windows Audio")
+        {
+            deviceManager.setCurrentAudioDeviceType ("Windows Audio", true);   // its default device
+            break;
+        }
+    dev = deviceManager.getCurrentAudioDevice();
+    setStatus (dev != nullptr ? "Saved audio device not available - using " + dev->getName()
+                              : juce::String ("No audio device could be opened."));
+    return dev != nullptr;
+}
 
 juce::File MainComponent::backendStateFile (const juce::String& typeName) const
 {
@@ -422,6 +472,7 @@ void MainComponent::applyBackendForMode (int mode)
     else
         deviceManager.setCurrentAudioDeviceType (want, true);   // first time: default device
 
+    ensureOutputDevice();
     rebuildConnections();
 
     // The device (and possibly its sample rate) changed under the cache.
@@ -483,11 +534,11 @@ void MainComponent::refreshMidiOutList()
     midiOutCombo.clear (juce::dontSendNotification);
     midiOutCombo.addItem ("(none)", -1);
     auto devices = juce::MidiOutput::getAvailableDevices();
+    const auto remembered = midiOutFile().existsAsFile() ? midiOutFile().loadFileAsString().trim() : juce::String();
     for (int i = 0; i < devices.size(); ++i)
     {
         midiOutCombo.addItem (devices[i].name, i + 1);
-        if (devices[i].name.containsIgnoreCase ("reface")
-            || devices[i].name.containsIgnoreCase ("cp"))
+        if (remembered.isNotEmpty() && devices[i].name == remembered)
             midiOutCombo.setSelectedId (i + 1, juce::sendNotificationSync);
     }
     if (midiOutCombo.getSelectedId() == 0)
@@ -499,7 +550,7 @@ void MainComponent::openMidiOut (const juce::String& identifier)
     auto opened = juce::MidiOutput::openDevice (identifier);
     const juce::ScopedLock sl (midiOutLock);
     midiOut = std::move (opened);
-    setStatus (midiOut != nullptr ? "Reface MIDI out opened: " + midiOut->getName()
+    setStatus (midiOut != nullptr ? "MIDI out opened: " + midiOut->getName()
                                   : "Failed to open MIDI out.");
 }
 
@@ -511,7 +562,7 @@ void MainComponent::showAudioSettings()
         0, 8,      // min / max input channels
         0, 2,      // min / max output channels
         true,      // show MIDI inputs
-        false,     // show MIDI outputs (we handle Reface via our own combo)
+        false,     // show MIDI outputs (MIDI out has its own combo)
         false,     // channels as stereo pairs -> false so 3/4 are individually selectable
         false);    // hide advanced
     selector->setSize (450, 480);
@@ -1784,7 +1835,7 @@ void MainComponent::resized()
             r.removeFromLeft (10); timeLabel.setBounds (r.removeFromRight (104));
             posSlider.setBounds (r);
         }
-        {   // routing: live input pair + reface midi thru
+        {   // routing: live input pair + MIDI thru to hardware
             auto r = rowIn (in, 24);
             inputPairLabel.setBounds (r.removeFromLeft (86));
             inputPairCombo.setBounds (r.removeFromLeft (110));
