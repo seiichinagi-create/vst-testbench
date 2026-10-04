@@ -62,10 +62,10 @@ cmake --build C:\dev\vst-testbench\build --config Release
 > （`Get-Process -Name "VST TestBench" | Stop-Process -Force`）。
 
 ## 使い方
-1. **Audio / MIDI Settings** → Type=**ASIO** / Device=**Yamaha Steinberg USB ASIO (UR-RT2)**
-   → Active input channels で **3 / 4** をチェック / MIDI Inputs で鍵盤を有効化
-2. **VST input pair** = **3 / 4**（デフォルト）
-3. **Reface MIDI out** で Reface CP を選択（名前に "reface" があれば自動選択）→ **MIDI thru → Reface** ON
+1. **Audio / MIDI Settings** → 使うオーディオIF(例: ASIO / Yamaha Steinberg USB ASIO (UR-RT2))
+   → Active input channels で使う入力をチェック / MIDI Inputs で鍵盤を有効化
+2. **Live input pair** = 音源をつないだ入力ペア(既定 1 / 2・選択は記憶)
+3. 外部シンセを鳴らすときだけ **MIDI out** で機器を選び **MIDI thru** を ON(既定は OFF・選択は記憶)
 4. **Load VST3 file...** で `.vst3` を1個選択（初期フォルダ `Common Files\VST3`）
    → 以後は **Recent plugins** からワンクリック（再スキャンなし）
 5. **Open Plugin UI** / **Bypass** で素通し比較 / **Remove Plugin** で外す
@@ -85,7 +85,7 @@ Source/MainComponent.*  AudioProcessorGraph ホスト本体
 
 ## 実装メモ
 - 中核は `juce::AudioProcessorGraph`（audioIn / audioOut / midiIn / plugin ノードを配線）
-- MIDI thru（→Reface）は `AudioDeviceManager` の MidiInputCallback で直接 `MidiOutput` に転送
+- MIDI thru(→外部シンセ)は `AudioDeviceManager` の MidiInputCallback で直接 `MidiOutput` に転送
 - 同じMIDIを `AudioProcessorPlayer` 経由でグラフにも供給（VSTi検査対応）
 - **JUCE 8.0.13 API変更**: `AudioPluginFormatManager::addDefaultFormats()` は削除
   → 自由関数 `juce::addDefaultFormatsToManager(mgr)` を使う
