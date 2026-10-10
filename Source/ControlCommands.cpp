@@ -762,7 +762,7 @@ juce::var MainComponent::startRigRender (const juce::var& req)
         auto stage = makeObj();
         put (stage, "role", role);
 
-        if (role != "inst" && src.hasProperty (juce::String (role == "master" ? "master_" : "") + "delay_actual"))
+        if ((role == "insert" || role == "master") && src.hasProperty (juce::String (role == "master" ? "master_" : "") + "delay_actual"))
         {
             const auto prefix = juce::String (role == "master" ? "master_" : "");
             put (stage, "kind", "delay");
@@ -773,13 +773,13 @@ juce::var MainComponent::startRigRender (const juce::var& req)
         }
         // test doubles that report what the host does: "playhead" (transport info written into the audio) and "gain"
         // (a host parameter that scales the audio)
-        if (role != "inst" && str (src, (juce::String (role == "master" ? "master_" : "") + "probe").toRawUTF8()).isNotEmpty())
+        if ((role == "insert" || role == "master") && str (src, (juce::String (role == "master" ? "master_" : "") + "probe").toRawUTF8()).isNotEmpty())
         {
             put (stage, "kind", "probe");
             put (stage, "probe", str (src, (juce::String (role == "master" ? "master_" : "") + "probe").toRawUTF8()));
             return stage;
         }
-        if (role != "inst" && src.hasProperty (juce::String (role == "master" ? "master_" : "") + "tail_t60"))
+        if ((role == "insert" || role == "master") && src.hasProperty (juce::String (role == "master" ? "master_" : "") + "tail_t60"))
         {
             const auto prefix = juce::String (role == "master" ? "master_" : "");
             put (stage, "kind", "tail");
@@ -793,7 +793,8 @@ juce::var MainComponent::startRigRender (const juce::var& req)
         if (what.isEmpty())
             return {};
         juce::PluginDescription desc;
-        if (! findPlugin (what, wantInst, desc))
+        // an ARA plug-in (Melodyne, SpectraLayers) may be listed as an instrument or as an effect
+        if (! findPlugin (what, wantInst, desc) && ! (role == "ara" && findPlugin (what, ! wantInst, desc)))
         {
             error = role + ": no plugin matching \"" + what + "\"";
             return {};
@@ -826,7 +827,7 @@ juce::var MainComponent::startRigRender (const juce::var& req)
             put (track, "impulse_at", num (t, "impulse_at", 1000.0));
             put (track, "impulse_amp", num (t, "impulse_amp", 0.1));
         }
-        else if (source == "file")
+        else if (source == "file" || source == "ara")
         {
             const auto f = resolvePath (str (t, "source_path"), appDir());
             if (! f.existsAsFile()) { error = "source_path: no such file " + f.getFullPathName(); return {}; }
@@ -834,6 +835,15 @@ juce::var MainComponent::startRigRender (const juce::var& req)
             for (const char* key : { "clip_start", "clip_offset", "clip_length", "clip_gain_db" })
                 if (t.hasProperty (key))
                     put (track, key, t[key]);
+
+            if (source == "ara")
+            {
+                // the ARA plug-in is the track's first stage and its source: it reads the file through an ARA document
+                auto ara = stageFor (t, "ara", false, error);
+                if (! error.isEmpty()) return {};
+                if (ara.isVoid()) { error = "give \"ara\" (a plug-in name or a .vst3 path)"; return {}; }
+                stages.add (ara);
+            }
         }
         else
         {

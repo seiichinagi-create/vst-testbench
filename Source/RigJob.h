@@ -20,6 +20,16 @@
 //==============================================================================
 namespace rigjob
 {
+    // A track whose source is an ARA document: the plug-in (stage 0 of the track) is bound to a document made from a
+    // clip of the file, and the render runs it as a playback renderer. The bench's worker sets the document up.
+    struct AraPlan
+    {
+        juce::AudioProcessor* plugin = nullptr;
+        std::shared_ptr<juce::AudioBuffer<float>> data;
+        double sampleRate = 48000.0;
+        juce::int64 start = 0, offset = 0, length = 0;
+    };
+
     inline bool buildStage (const juce::var& st, juce::AudioPluginFormatManager& formats, const RigRender::Spec& spec,
                             RigRender::Stage& out, juce::String& error,
                             const std::function<void (const juce::String&)>& note)
@@ -107,7 +117,8 @@ namespace rigjob
 
     inline bool buildSpec (const juce::var& job, juce::AudioPluginFormatManager& formats,
                            RigRender::Spec& spec, juce::String& error,
-                           const std::function<void (const juce::String&)>& note)
+                           const std::function<void (const juce::String&)>& note,
+                           std::vector<AraPlan>* araPlans = nullptr)
     {
         auto num = [&job] (const char* k, double d) { return job.hasProperty (k) ? (double) job[k] : d; };
 
@@ -136,6 +147,7 @@ namespace rigjob
         for (const auto& tj : *tracks)
         {
             RigRender::Track tr;
+            AraPlan pendingAra;
             const auto source = tj["source"].toString();
             auto tnum = [&tj] (const char* k, double d) { return tj.hasProperty (k) ? (double) tj[k] : d; };
 
@@ -144,7 +156,7 @@ namespace rigjob
                 tr.impulseAt = (juce::int64) tnum ("impulse_at", 1000.0);
                 tr.stages.push_back ({ "source", std::make_unique<RigRender::ImpulseSource> (tr.impulseAt, (float) tnum ("impulse_amp", 0.1)) });
             }
-            else if (source == "file")
+            else if (source == "file" || source == "ara")
             {
                 juce::WavAudioFormat wav;
                 const juce::File f (tj["source_path"].toString());
@@ -165,9 +177,25 @@ namespace rigjob
                 const juce::int64 clipOffset = juce::jlimit<juce::int64> (0, data->getNumSamples(), toSamples ("clip_offset", 0.0));
                 const juce::int64 clipLength = tj.hasProperty ("clip_length") ? toSamples ("clip_length", 0.0) : -1;
                 const float gain = (float) juce::Decibels::decibelsToGain (tnum ("clip_gain_db", 0.0));
-                auto clip = std::make_unique<RigRender::FileSource> (data, clipStart, clipOffset, clipLength, gain);
-                tr.sourceSamples = clip->endOnTimeline();
-                tr.stages.push_back ({ "source", std::move (clip) });
+                if (source == "ara")
+                {
+                    // the plug-in reads the file itself, through the ARA document: no source stage, the plug-in is stage 0
+                    const juce::int64 inFile = (juce::int64) data->getNumSamples() - clipOffset;
+                    const juce::int64 len = clipLength < 0 ? inFile : juce::jmin (clipLength, inFile);
+                    tr.sourceSamples = clipStart + len;
+                    pendingAra = { nullptr, data, spec.sampleRate, clipStart, clipOffset, len };
+                    if (gain != 1.0f)
+                    {
+                        error = "ara: clip_gain_db is not applied by an ARA playback region";
+                        return false;
+                    }
+                }
+                else
+                {
+                    auto clip = std::make_unique<RigRender::FileSource> (data, clipStart, clipOffset, clipLength, gain);
+                    tr.sourceSamples = clip->endOnTimeline();
+                    tr.stages.push_back ({ "source", std::move (clip) });
+                }
             }
             else
             {
@@ -184,6 +212,16 @@ namespace rigjob
                         return false;
                     tr.stages.push_back (std::move (stage));
                 }
+            if (source == "ara")
+            {
+                if (tr.stages.empty() || araPlans == nullptr)
+                {
+                    error = "ara: the track needs the ARA plug-in as its first stage";
+                    return false;
+                }
+                pendingAra.plugin = tr.stages[0].plugin.get();
+                araPlans->push_back (pendingAra);
+            }
             spec.tracks.push_back (std::move (tr));
         }
 

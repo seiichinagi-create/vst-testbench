@@ -38,6 +38,11 @@
               the bpm sent is the bpm seen, and the position advances by bpm/60/sr quarter notes per sample.
 12. in-block automation   a parameter change at sample N must take effect at sample N whatever the block pattern. The
               quantised mode is the control: it moves the change to a block boundary.
+14. ARA playback       the plug-in is handed an ARA DOCUMENT (one audio source, one playback region = the clip) instead of
+              a stream, is bound to it as a playback renderer and renders it. An ARA plug-in that has been given nothing to
+              edit must be transparent: its output equals the plain clip render (same clip_start / clip_offset /
+              clip_length) sample for sample, with no extra latency. Control: the same comparison against a clip one sample
+              later must fail.
 13. audio clips        a stereo audio clip on a track: where it sits on the timeline (clip_start), where in the file it starts
               (clip_offset), how long it is (clip_length) and its gain. Marks at known places in the file must come out at
               the computed places and levels, and nothing outside the clip may be heard. The clip is also the model of an
@@ -494,6 +499,53 @@ def audio_clip(rig, bad):
         bad.append(f"audio clip: placed marks {clip} (length {n_clip}), expected {want_clip}")
 
 
+def ara_playback(rig, a, bad, notes):
+    if not os.path.exists(a.ara):
+        print(f"  ARA: skipped ({a.ara} is not installed)")
+        return
+    t = np.arange(2 * SR_) / SR_
+    x = np.zeros((2 * SR_, 2))
+    x[:, 0] = 0.2 * np.sin(2 * np.pi * 440 * t) * (t < 1.0)
+    x[:, 1] = 0.2 * np.sin(2 * np.pi * 660 * t) * (t >= 1.0)
+    x[int(0.5 * SR_), :] += 0.5
+    data = x.astype("<f4").tobytes()
+    path = abs_data(rig, "ara_in.wav")
+    with open(path, "wb") as f:
+        f.write(b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVE" + b"fmt " +
+                struct.pack("<IHHIIHH", 16, 3, 2, SR_, SR_ * 8, 8, 32) + b"data" + struct.pack("<I", len(data)) + data)
+
+    cases = [("the whole file", {}),
+             ("placed at 0.25 s", dict(clip_start=0.25)),
+             ("0.5 s taken from 0.3 s into the file, placed at 0.1 s", dict(clip_start=0.1, clip_offset=0.3, clip_length=0.5))]
+    for name, clip in cases:
+        try:
+            res = rig.render("ara_a.wav", source="ara", source_path=path, ara=a.ara, tail=0.5, **clip)
+        except RuntimeError as e:
+            print(f"  ARA: skipped ({str(e)[:90]})")
+            return
+        rig.render("ara_r.wav", source="file", source_path=path, tail=0.5, **clip)
+        got, ref = rig.read("ara_a.wav"), rig.read("ara_r.wav")
+        same = np.array_equal(got, ref)
+        lat = res["chain_latency"]
+        d = db(np.abs(got[:len(ref)] - ref[:len(got)]).max() / max(np.abs(ref).max(), 1e-12))
+        print(f"  ARA ({a.ara_name}), {name}: {'identical to the plain clip render' if same else f'DIFFERENT, {d:.1f} dB re peak'}; "
+              f"declared latency {lat}, length {len(got) // 2 / SR_:.4f} s")
+        if not same:
+            bad.append(f"ARA ({name}): not transparent, {d:.1f} dB re peak away from the plain clip render")
+        if lat != 0:
+            notes.append(f"{a.ara_name}: declares {lat} samples of latency in ARA playback")
+
+    # control: a clip one sample later is not the same render, so the comparison above could have failed
+    rig.render("ara_a.wav", source="ara", source_path=path, ara=a.ara, tail=0.5, clip_start=0.25)
+    rig.render("ara_r.wav", source="file", source_path=path, tail=0.5, clip_start=0.25 + 1.0 / SR_)
+    got, ref = rig.read("ara_a.wav"), rig.read("ara_r.wav")
+    n = min(len(got), len(ref))
+    diff = db(np.abs(got[:n] - ref[:n]).max() / np.abs(ref).max())
+    print(f"    control, a plain clip one sample later: {diff:.1f} dB re peak away (must stay above -60)")
+    if diff < -60:
+        bad.append("ARA: the control did not show a one-sample shift, so the comparison could not have told")
+
+
 def instance_interference(rig, plugs, notes):
     """Two instances of one instrument playing different notes: the two-track render must equal the sum of the
     separate renders (and an idle second instance must not change the first). Findings go to `notes`: a plugin that
@@ -556,9 +608,12 @@ def main():
     ap.add_argument("--late-limit", type=int, default=LATE_LIMIT)
     ap.add_argument("--multi-inst", default="Matryoshka Guitar", help="instrument for the three-track test (one that sums correctly)")
     ap.add_argument("--interference", action="append", default=None, help="instruments to check for instance interference")
+    ap.add_argument("--ara", default=r"C:\Program Files\Common Files\VST3\Celemony\Melodyne\Melodyne.vst3",
+                    help="an ARA plug-in (VST3) for the ARA playback test; skipped if it is not there")
     ap.add_argument("--master-fx", action="append", default=None, help="master effects whose tail is measured (default: Spring Reverb, Tape Echoes)")
     a = ap.parse_args()
     a.fx = a.fx or [a.insert]
+    a.ara_name = os.path.splitext(os.path.basename(a.ara))[0]
     a.master_fx = a.master_fx if a.master_fx is not None else ["Spring Reverb", "Tape Echoes"]
     a.interference = a.interference if a.interference is not None else ["Matryoshka Guitar", "Retrophie SN", "PAGANIHANDS", "Flesh808", "Bass Cafeteria"]
     notes = []
@@ -623,6 +678,7 @@ def main():
     transport_info(rig, bad)
     block_automation(rig, bad)
     audio_clip(rig, bad)
+    ara_playback(rig, a, bad, notes)
 
     # 9: instance interference (findings about plugins)
     instance_interference(rig, a.interference, notes)
