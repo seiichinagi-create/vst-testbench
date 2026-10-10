@@ -65,6 +65,7 @@ private:
     // (AUDIO again when none is loaded). Applied when the mode or what is loaded changes, not on every rebuild: the
     // mute buttons are the user's in between.
     void applyModePreset();
+    void updateSolo();       // silence the tracks that are not soloed while any track is
     juce::String describeTrack (int index) const;       // 0 AUDIO, 1..3 INST, 4 MASTER: what the mixer shows under the name
     void refreshMidiOutList();
     void refreshRecentList();

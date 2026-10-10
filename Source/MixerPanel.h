@@ -15,6 +15,7 @@ public:
     {
         std::function<void (int)> load, editor, remove;      // track 1..3 (INST)
         std::function<juce::String (int)> describe;          // what the track plays: a plug-in name, a file, the live input
+        std::function<void()> soloChanged;                   // a solo button was pressed: the host recomputes who is silenced
     };
 
     MixerPanel (TrackStrip* const (&strips)[4], TrackStrip* master, MidiChannelFilter* const (&filters)[4], Hooks h)
@@ -118,6 +119,15 @@ private:
                 addAndMakeVisible (midi);
             }
 
+            if (idx != masterIndex)
+            {
+                solo.setButtonText ("S");
+                solo.setClickingTogglesState (true);
+                solo.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xffe0c24a));
+                solo.onClick = [this] { strip->setSolo (solo.getToggleState()); if (owner.hooks.soloChanged) owner.hooks.soloChanged(); };
+                addAndMakeVisible (solo);
+            }
+
             mute.setButtonText ("M");
             mute.setClickingTogglesState (true);
             mute.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xffd9534f));
@@ -155,6 +165,8 @@ private:
                 gain.setValue (strip->getGainDb(), juce::dontSendNotification);
             if (! balance.isMouseButtonDown() && std::abs (balance.getValue() - strip->getBalance()) > 0.005)
                 balance.setValue (strip->getBalance(), juce::dontSendNotification);
+            if (index != masterIndex && solo.getToggleState() != strip->isSolo())
+                solo.setToggleState (strip->isSolo(), juce::dontSendNotification);
             if (mute.getToggleState() != strip->isMuted())
                 mute.setToggleState (strip->isMuted(), juce::dontSendNotification);
             if (filter != nullptr && ! midi.hasKeyboardFocus (true))
@@ -190,8 +202,9 @@ private:
                 r.removeFromTop (3);
             }
             auto b = r.removeFromBottom (22);
-            mute.setBounds (b.removeFromLeft (26));
-            b.removeFromLeft (4);
+            mute.setBounds (b.removeFromLeft (24));
+            b.removeFromLeft (2);
+            if (index != masterIndex) { solo.setBounds (b.removeFromLeft (24)); b.removeFromLeft (3); }
             balance.setBounds (b);
             r.removeFromBottom (3);
             auto m = r.removeFromRight (18);
@@ -238,7 +251,7 @@ private:
         TrackStrip* strip;
         MidiChannelFilter* filter;
         juce::Label title, info;
-        juce::TextButton loadBtn { "Load" }, uiBtn { "UI" }, delBtn { "x" }, mute;
+        juce::TextButton loadBtn { "Load" }, uiBtn { "UI" }, delBtn { "x" }, mute, solo;
         juce::TextEditor midi;
         juce::Slider gain, balance;
         juce::Rectangle<int> meterArea;

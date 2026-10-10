@@ -85,6 +85,7 @@ juce::var MainComponent::trackInfo (int t) const
     put (o, "gain_db", (double) strip->getGainDb());
     put (o, "balance", (double) strip->getBalance());
     put (o, "mute", strip->isMuted());
+    if (t >= 0) put (o, "solo", strip->isSolo());
     if (t == trkAudio)
         put (o, "source", currentSourceMode() == srcFile ? "file" : "live");
     if (t >= trkInst1)
@@ -256,7 +257,7 @@ juce::var MainComponent::handleControl (const juce::var& req)
     }
 
     //-- mixer: tracks (docs/TRACKS.md) ----------------------------------------
-    // track = audio | inst1 | inst2 | inst3 | master;  gain_db, balance (-1..1), mute, midi_channels (INST tracks)
+    // track = audio | inst1 | inst2 | inst3 | master;  gain_db, balance (-1..1), mute, solo, midi_channels (INST tracks)
     if (cmd == "track_set")
     {
         const int t = trackIndexOf (str (req, "track").toLowerCase());
@@ -265,6 +266,12 @@ juce::var MainComponent::handleControl (const juce::var& req)
         if (req.hasProperty ("gain_db")) strip->setGainDb ((float) (double) req["gain_db"]);
         if (req.hasProperty ("balance")) strip->setBalance ((float) (double) req["balance"]);
         if (req.hasProperty ("mute"))    strip->setMuted (flag (req, "mute", false));
+        if (req.hasProperty ("solo"))
+        {
+            if (t < 0) return fail ("the master has no solo");
+            strip->setSolo (flag (req, "solo", false));
+            updateSolo();
+        }
         if (req.hasProperty ("midi_channels"))
         {
             if (t < trkInst1) return fail ("midi_channels applies to inst1, inst2 and inst3");

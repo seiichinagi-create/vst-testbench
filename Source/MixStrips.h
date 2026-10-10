@@ -26,6 +26,10 @@ public:
     float getGainDb() const         { return gainDb.load(); }
     float getBalance() const        { return balance.load(); }
     bool  isMuted() const           { return muted.load(); }
+    // Solo: the mixer sets `soloSilenced` on every track that is not soloed while any track is (MainComponent::updateSolo).
+    void  setSolo (bool b)          { solo.store (b); }
+    bool  isSolo() const            { return solo.load(); }
+    void  setSoloSilenced (bool b)  { soloSilenced.store (b); }
 
     // Peak since the previous read, per side (the meter's source).
     float takePeakL() { return peakL.exchange (0.0f); }
@@ -48,7 +52,7 @@ public:
         const int n = buffer.getNumSamples();
         const int chans = buffer.getNumChannels();
         float tl, tr;
-        gains (gainDb.load(), balance.load(), muted.load(), tl, tr);
+        gains (gainDb.load(), balance.load(), muted.load() || soloSilenced.load(), tl, tr);
         if (first) { lastL = tl; lastR = tr; first = false; }
 
         const float targets[2] = { tl, tr };
@@ -96,7 +100,7 @@ public:
 
 private:
     std::atomic<float> gainDb { 0.0f }, balance { 0.0f }, peakL { 0.0f }, peakR { 0.0f };
-    std::atomic<bool> muted { false };
+    std::atomic<bool> muted { false }, solo { false }, soloSilenced { false };
     float lastL = 1.0f, lastR = 1.0f;   // audio thread only
     bool first = true;
 

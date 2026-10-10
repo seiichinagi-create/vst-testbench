@@ -44,3 +44,13 @@ mg = play(2, "mm"); print("ch2 MASTER at -6 dB:", mg, " (expected about", round(
 tb.call("track_set", track="master", gain_db=0)
 tb.call("track_set", track="inst1", midi_channels=[1, 2])
 print("ch2 reaching both INST 1 and INST 2:", play(2, "both"))
+
+# solo: soloing INST 2 silences INST 1 (a note on channel 1) and leaves INST 2 alone; un-soloing brings INST 1 back
+tb.call("track_set", track="inst1", midi_channels=[1]); tb.call("track_set", track="inst2", midi_channels=[2], gain_db=0, mute=False)
+alone = play(1, "solo0")
+tb.call("track_set", track="inst2", solo=True)
+silenced = play(1, "solo1")
+still = play(2, "solo2")
+tb.call("track_set", track="inst2", solo=False)
+back = play(1, "solo3")
+print("solo: INST 1 alone", alone, "| INST 2 soloed -> INST 1", silenced, "| INST 2 itself", still, "| solo off -> INST 1", back)

@@ -78,6 +78,7 @@ MainComponent::MainComponent()
         };
         hooks.remove = [this] (int t) { if (t == trkInst1) removeInstrument(); else removeExtraInstrument (t); };
         hooks.describe = [this] (int t) { return describeTrack (t); };
+        hooks.soloChanged = [this] { updateSolo(); };
         mixerPanel = std::make_unique<MixerPanel> (strips, masterStrip, midiFilters, std::move (hooks));
         addAndMakeVisible (*mixerPanel);
     }
@@ -824,6 +825,15 @@ void MainComponent::removeInstrument()
     applyModePreset();
     instLabel.setText ("No instrument loaded", juce::dontSendNotification);
     setStatus ("Instrument removed.");
+}
+
+void MainComponent::updateSolo()
+{
+    bool any = false;
+    for (int t = 0; t < numTracks; ++t)
+        any = any || strips[t]->isSolo();
+    for (int t = 0; t < numTracks; ++t)
+        strips[t]->setSoloSilenced (any && ! strips[t]->isSolo());
 }
 
 void MainComponent::applyModePreset()
