@@ -8,6 +8,7 @@
 // Fixed-topology test rig, rendered offline and headless:
 //
 //   MIDI -> VSTi -> [insert FX] -> [master FX] -> wav
+//   (dryParallel: the VSTi also goes straight to the output, so the graph must delay it by the chain's latency)
 //
 // A throw-away AudioProcessorGraph is built for every render, so no state is
 // carried over between runs and the result depends only on the plugins, their
@@ -37,6 +38,7 @@ public:
         int block = 512;
         double tailSeconds = 2.0;
         bool compensate = true;
+        bool dryParallel = false;             // also send the instrument straight to the output: a second, shorter path for the graph's PDC to align
         int settleMs = 0;                     // wait after prepareToPlay so async plugin work (capture loads) can land
         juce::File out;
     };
@@ -89,12 +91,15 @@ private:
         if (body > 150'000'000) { fail ("too long to render"); return; }
 
         //-- build the graph: MIDI -> inst -> insert -> master -> out ---------
+        // One rebuild only, inside prepareToPlay: every add* below would otherwise queue an async rebuild
+        // on the message thread that can interleave with it (graph latency read 0 in 2 of 10 renders).
+        const auto none = Graph::UpdateKind::none;
         Graph graph;
         graph.setPlayConfigDetails (0, 2, sr, block);
         graph.setNonRealtime (true);
 
-        auto outNode  = graph.addNode (std::make_unique<Graph::AudioGraphIOProcessor> (Graph::AudioGraphIOProcessor::audioOutputNode));
-        auto midiNode = graph.addNode (std::make_unique<Graph::AudioGraphIOProcessor> (Graph::AudioGraphIOProcessor::midiInputNode));
+        auto outNode  = graph.addNode (std::make_unique<Graph::AudioGraphIOProcessor> (Graph::AudioGraphIOProcessor::audioOutputNode), {}, none);
+        auto midiNode = graph.addNode (std::make_unique<Graph::AudioGraphIOProcessor> (Graph::AudioGraphIOProcessor::midiInputNode), {}, none);
 
         std::vector<Graph::Node::Ptr> nodes;
         std::vector<juce::String> roles;
@@ -105,11 +110,11 @@ private:
             st.plugin->setNonRealtime (true);
             st.plugin->setPlayConfigDetails (st.plugin->getTotalNumInputChannels(),
                                              st.plugin->getTotalNumOutputChannels(), sr, block);
-            nodes.push_back (graph.addNode (std::move (st.plugin)));
+            nodes.push_back (graph.addNode (std::move (st.plugin), {}, none));
         }
 
         graph.addConnection ({ { midiNode->nodeID, Graph::midiChannelIndex },
-                               { nodes[0]->nodeID, Graph::midiChannelIndex } });
+                               { nodes[0]->nodeID, Graph::midiChannelIndex } }, none);
 
         for (size_t i = 0; i < nodes.size(); ++i)
         {
@@ -117,16 +122,48 @@ private:
             const auto dest = i + 1 < nodes.size() ? nodes[i + 1] : outNode;
             const int ins = i + 1 < nodes.size() ? dest->getProcessor()->getTotalNumInputChannels() : 2;
             for (int ch = 0; ch < juce::jmin (2, outs, ins); ++ch)
-                graph.addConnection ({ { nodes[i]->nodeID, ch }, { dest->nodeID, ch } });
+                graph.addConnection ({ { nodes[i]->nodeID, ch }, { dest->nodeID, ch } }, none);
             // mono source into a stereo destination: feed both sides
             if (outs == 1 && ins >= 2)
-                graph.addConnection ({ { nodes[i]->nodeID, 0 }, { dest->nodeID, 1 } });
+                graph.addConnection ({ { nodes[i]->nodeID, 0 }, { dest->nodeID, 1 } }, none);
         }
 
-        graph.prepareToPlay (sr, block);
-        if (spec.settleMs > 0)
-            wait (spec.settleMs);   // the message thread is free meanwhile: async updates run now, not mid-render
-        const int graphLatency = graph.getLatencySamples();
+        if (spec.dryParallel && nodes.size() > 1)
+        {
+            const int outs = nodes[0]->getProcessor()->getTotalNumOutputChannels();
+            for (int ch = 0; ch < juce::jmin (2, outs); ++ch)
+                graph.addConnection ({ { nodes[0]->nodeID, ch }, { outNode->nodeID, ch } }, none);
+            if (outs == 1)
+                graph.addConnection ({ { nodes[0]->nodeID, 0 }, { outNode->nodeID, 1 } }, none);
+        }
+
+        // The graph builds its delay compensation inside prepareToPlay from the latencies the plugins declare
+        // THEN. A plugin that declares late (Legacy Distortion, after an async capture load) can leave the graph
+        // with 0 while the plugins say 4: the dry path then goes uncompensated and the render is wrong without
+        // any error. So: settle, compare the graph's total with the sum of the declared latencies, and if they
+        // differ drop the sequence (releaseResources) and prepare again. Never render on a mismatch.
+        int graphLatency = 0, declaredSum = 0, attempts = 0;
+        for (; attempts < 5; ++attempts)
+        {
+            if (attempts > 0)
+                graph.releaseResources();
+            graph.prepareToPlay (sr, block);
+            if (spec.settleMs > 0)
+                wait (spec.settleMs);   // the message thread is free meanwhile: async updates run now, not mid-render
+            graphLatency = graph.getLatencySamples();
+            declaredSum = 0;
+            for (auto& n : nodes)
+                declaredSum += n->getProcessor()->getLatencySamples();
+            if (graphLatency == declaredSum)
+                break;
+        }
+        if (graphLatency != declaredSum)
+        {
+            graph.releaseResources();
+            fail ("graph latency " + juce::String (graphLatency) + " never matched the declared sum "
+                  + juce::String (declaredSum) + " after " + juce::String (attempts) + " tries");
+            return;
+        }
 
         //-- declared latency, read now that everything is prepared -----------
         auto stagesInfo = juce::Array<juce::var>();
@@ -211,7 +248,9 @@ private:
         put (r, "stages", stagesInfo);
         put (r, "chain_latency", chainLatency);
         put (r, "graph_latency", graphLatency);
+        put (r, "prepare_attempts", attempts + 1);
         put (r, "compensated", spec.compensate);
+        put (r, "dry_parallel", spec.dryParallel);
         put (r, "peak_db", peak > 1.0e-6 ? 20.0 * std::log10 (peak) : -120.0);
         finish (r);
     }

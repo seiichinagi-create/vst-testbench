@@ -776,7 +776,7 @@ juce::var MainComponent::handleControl (const juce::var& req)
 //==============================================================================
 // rig_render: inst=<name|path> [insert=<name|path>] [master=<name|path>]
 //             events=[...] out=<wav> [rate] [block] [tail] [compensate]
-//             [settle=<ms, default 500>] [inst_state|insert_state|master_state=<file from save_state>]
+//             [dry_parallel] [settle=<ms, default 500>] [inst_state|insert_state|master_state=<file from save_state>]
 // Fresh plugin instances, fresh graph, no audio device: the result depends only on the inputs.
 // Asynchronous like the MIDI bounce: poll status until busy is false, then read status.rig.
 //==============================================================================
@@ -790,6 +790,7 @@ juce::var MainComponent::startRigRender (const juce::var& req)
     spec.block       = juce::jlimit (32, 8192, (int) num (req, "block", 512));
     spec.tailSeconds = juce::jmax (0.0, num (req, "tail", 2.0));
     spec.compensate  = flag (req, "compensate", true);
+    spec.dryParallel = flag (req, "dry_parallel", false);
     spec.settleMs    = juce::jlimit (0, 10000, (int) num (req, "settle", 500.0));
     spec.out         = resolvePath (str (req, "out", "rig.wav"), appDir());
 
