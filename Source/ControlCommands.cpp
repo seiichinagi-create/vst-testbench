@@ -78,7 +78,7 @@ juce::var MainComponent::controlStatus() const
     put (o, "source", mode == srcLive ? "live" : mode == srcInstrument ? "inst" : "file");
     put (o, "status_text", statusLabel.getText());
 
-    const bool busy = pendingLoads > 0 || bounceEngine.isBouncing() || rigWorker.isRunning() || offlineInstLoading || offlineFxLoading
+    const bool busy = pendingLoads > 0 || bounceEngine.isBouncing() || rigWorker.isRunning() || araProbePending || offlineInstLoading || offlineFxLoading
                       || firstBouncePending || (preRenderActive() && renderEngine.isRendering())
                       || (preRenderActive() && fxStale.load());
     put (o, "busy", busy);
@@ -133,6 +133,8 @@ juce::var MainComponent::controlStatus() const
     }
     if (! rigResult.isVoid())
         put (o, "rig", rigResult);
+    if (! araProbeResult.isVoid())
+        put (o, "ara_probe", araProbeResult);
     put (o, "prerender", preRenderActive());
     put (o, "gpu_fx", gpuFxButton.getToggleState());
 
@@ -506,6 +508,10 @@ juce::var MainComponent::handleControl (const juce::var& req)
     if (cmd == "rig_render")
         return startRigRender (req);
 
+    //-- ARA ---------------------------------------------------------------------
+    if (cmd == "ara_probe")
+        return startAraProbe (req);
+
     //-- MPE -------------------------------------------------------------------
     if (cmd == "mpe")
     {
@@ -699,7 +705,7 @@ juce::var MainComponent::handleControl (const juce::var& req)
             "ping", "status", "list_plugins", "load_plugin", "remove_plugin", "set_bypass",
             "list_params", "set_param", "set_params", "save_state", "load_state",
             "show_editor", "screenshot", "set_source", "load_audio", "play", "stop", "seek", "loop",
-            "prerender", "rig_render", "load_midi", "export_midi", "mpe", "midi_send", "midi_play", "midi_play_file", "midi_stop",
+            "prerender", "rig_render", "ara_probe", "load_midi", "export_midi", "mpe", "midi_send", "midi_play", "midi_play_file", "midi_stop",
             "record_start", "record_stop", "analyze", "audio_devices", "set_audio" }).joinIntoString (" "));
         put (o, "doc", "docs/CONTROL.md");
         return o;
@@ -898,4 +904,82 @@ juce::var MainComponent::startRigRender (const juce::var& req)
     put (o, "started", true);
     put (o, "note", "asynchronous, in a worker process: poll status until busy is false, then read status.rig");
     return o;
+}
+
+//==============================================================================
+// ara_probe: name=<plug-in> (any cached plug-in, instrument or effect) or path=<.vst3>
+// Asks the VST3 format for the plug-in's ARA factory WITHOUT creating an instance, and reports what the factory
+// declares. Asynchronous: poll status until busy is false, then read status.ara_probe.
+//==============================================================================
+juce::var MainComponent::startAraProbe (const juce::var& req)
+{
+#if JUCE_PLUGINHOST_ARA
+    if (araProbePending) return fail ("an ARA probe is already running");
+
+    const auto what = str (req, "name", str (req, "path"));
+    if (what.isEmpty()) return fail ("give \"name\" (a cached plug-in) or \"path\" (a .vst3)");
+
+    juce::PluginDescription desc;
+    bool found = false;
+    if (what.endsWithIgnoreCase (".vst3") || juce::File::isAbsolutePath (what))
+    {
+        if (auto* fmt = vst3Format())
+        {
+            juce::OwnedArray<juce::PluginDescription> types;
+            knownPlugins.scanAndAddFile (juce::File (what).getFullPathName(), true, types, *fmt);
+            if (! types.isEmpty()) { desc = *types.getFirst(); found = true; }
+        }
+    }
+    else
+    {
+        for (const auto& t : knownPlugins.getTypes())
+            if (t.name.equalsIgnoreCase (what)) { desc = t; found = true; break; }
+        if (! found)
+            for (const auto& t : knownPlugins.getTypes())
+                if (t.name.containsIgnoreCase (what)) { desc = t; found = true; break; }
+    }
+    if (! found) return fail ("no plug-in matching \"" + what + "\"");
+
+    araProbePending = true;
+    araProbeResult = juce::var();
+    formatManager.createARAFactoryAsync (desc,
+        [safe = juce::Component::SafePointer<MainComponent> (this), name = desc.name] (juce::ARAFactoryResult result)
+        {
+            if (safe == nullptr)
+                return;
+            auto r = makeObj();
+            put (r, "plugin", name);
+            if (auto* f = result.araFactory.get())
+            {
+                put (r, "ara", true);
+                put (r, "plug_in_name", juce::String (f->plugInName));
+                put (r, "manufacturer", juce::String (f->manufacturerName));
+                put (r, "version", juce::String (f->version));
+                put (r, "factory_id", juce::String (f->factoryID));
+                put (r, "ara_api_generation_lowest", (int) f->lowestSupportedApiGeneration);
+                put (r, "ara_api_generation_highest", (int) f->highestSupportedApiGeneration);
+                put (r, "document_archive_id", juce::String (f->documentArchiveID));
+                put (r, "supported_playback_transformations", (juce::int64) f->supportedPlaybackTransformationFlags);
+                juce::Array<juce::var> types;
+                for (ARA::ARASize i = 0; i < f->analyzeableContentTypesCount; ++i)
+                    types.add ((int) f->analyzeableContentTypes[i]);
+                put (r, "analyzeable_content_types", types);
+            }
+            else
+            {
+                put (r, "ara", false);
+                put (r, "error", result.errorMessage);
+            }
+            safe->araProbeResult = r;
+            safe->araProbePending = false;
+        });
+
+    auto o = makeObj();
+    put (o, "started", true);
+    put (o, "note", "asynchronous: poll status until busy is false, then read status.ara_probe");
+    return o;
+#else
+    juce::ignoreUnused (req);
+    return fail ("this build has no ARA hosting (the ARA SDK was not found when it was configured)");
+#endif
 }

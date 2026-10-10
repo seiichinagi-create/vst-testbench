@@ -98,6 +98,7 @@ private:
     juce::AudioProcessor* processorForRole (const juce::String& role) const;
     juce::MidiMessageSequence sequenceFromEvents (const juce::var& events, juce::String& error) const;
     juce::var startRigRender (const juce::var& request);   // rig_render: fixed inst -> insert -> master, offline
+    juce::var startAraProbe (const juce::var& request);     // ara_probe: does this plug-in offer an ARA factory? (async)
 
     //== GPU FX (gpufx worker renders the playable file) ==
     void setGpuFxEnabled (bool);
@@ -181,6 +182,8 @@ private:
     //== MPE / AI control state ==
     mpe::Config mpeConfig;
     juce::String mpeNote;                       // what the loaded MIDI file looked like
+    juce::var araProbeResult;                   // last ara_probe result, shown in status
+    bool araProbePending = false;
     RigWorkerClient rigWorker;                  // rig_render runs in a separate worker process
     juce::var rigResult;                        // last rig_render result, shown in status
     int pendingLoads = 0;                       // async plugin loads in flight (message thread)

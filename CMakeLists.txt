@@ -4,6 +4,17 @@ set(CMAKE_CXX_STANDARD 17)
 
 add_subdirectory("C:/JUCE" "${CMAKE_CURRENT_BINARY_DIR}/JUCE" EXCLUDE_FROM_ALL)
 
+# --- ARA hosting (Celemony's Audio Random Access): enabled only if the SDK is there ---------------------
+# Recursive clone of https://github.com/Celemony/ARA_SDK (JUCE 8 documents releases/2.1.0).
+set(ARA_SDK_DIR "C:/dev/ara_sdk" CACHE PATH "Celemony ARA SDK folder")
+if(EXISTS "${ARA_SDK_DIR}/ARA_API/ARAInterface.h")
+    message(STATUS "ARA SDK found -> enabling JUCE_PLUGINHOST_ARA (${ARA_SDK_DIR})")
+    juce_set_ara_sdk_path("${ARA_SDK_DIR}")
+    set(VSTTB_HAS_ARA ON)
+else()
+    message(STATUS "ARA SDK not found at ${ARA_SDK_DIR} -> no ARA hosting")
+endif()
+
 juce_add_gui_app(VstTestBench
     PRODUCT_NAME "VST TestBench"
     COMPANY_NAME "SeiNagi"
@@ -31,6 +42,10 @@ if(EXISTS "${ASIO_SDK_DIR}/common/iasiodrv.h")
     target_compile_definitions(VstTestBench PRIVATE JUCE_ASIO=1)
 else()
     message(WARNING "ASIO SDK not found at ${ASIO_SDK_DIR} -> falling back to WASAPI/DirectSound")
+endif()
+
+if(VSTTB_HAS_ARA)
+    target_compile_definitions(VstTestBench PRIVATE JUCE_PLUGINHOST_ARA=1)
 endif()
 
 target_compile_definitions(VstTestBench PRIVATE
