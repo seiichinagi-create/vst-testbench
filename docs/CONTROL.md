@@ -4,6 +4,7 @@
 
 * Channels are never remapped anywhere: live MIDI, the MIDI-file bounce, the take recorder and MIDI thru all keep the channel of every message, so per-note pitch bend, channel pressure and slide (CC74) reach the instrument as played.
 * **MPE button** (next to MIDI REC; remembered): sends the lower-zone setup (15 members, +/-48 st member bend, +/-2 st master bend) to the loaded VSTi (on toggle and on instrument load), and prepends it to a MIDI file that has no MPE zone message before the bounce. Files that already carry RPN 6 are left alone. Toggling re-bounces the loaded file.
+* **TOP-BEND button**: for a ONE-channel file whose pitch bend is meant for the highest sounding note only. Each note moves to its own MPE member channel; the bend goes to the current top note. A note starts un-bent; when a higher note-on becomes the top, the old top's bend returns to centre (the bend does not move). CC / program / channel pressure go to the master channel; the source bend range (RPN 0, default 2 st) is rescaled to the member range. Files that already carry an MPE setup are left alone. File bounce / file play only, not live keys. Test file: `tools/make_topbend_test.py`.
 * Within one timestamp, note-ons are delivered after every other event, so a note never starts with the previous note's bend / slide still applied.
 * The status line reports what the file looked like: `MPE zone setup in file, 7 note channels`, `no MPE zone setup, 2 note channels (zone setup added)`.
 * The dashcam take recorder keeps the zone setup (RPN) and the first note's bend / pressure / slide, which arrive before the first note-on.
@@ -25,6 +26,8 @@ Client: `python tools/tb.py <cmd> key=value ...` (or a JSON body), `--wait` bloc
 | set_source | `mode=live\|inst\|file` | |
 | load_audio, play, stop, seek, loop, prerender | | file player |
 | load_midi | `path`, `mpe=true\|false` | offline bounce through the VSTi, then `play` |
+| top_bend | `on` | TOP-BEND switch (see above); `load_midi top_bend=true` sets it for that load |
+| export_midi | `path` | write what the instrument receives (after TOP-BEND / zone setup) as an SMF, for inspection |
 | mpe | `on`, `members`, `member_pb`, `master_pb`, `send` | |
 | midi_send | `events=[...]` | immediate, live |
 | midi_play / midi_play_file | `events=[...]` / `path` | timed, real time, own thread |

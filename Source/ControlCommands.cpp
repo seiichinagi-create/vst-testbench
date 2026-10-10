@@ -191,6 +191,7 @@ juce::var MainComponent::controlStatus() const
     {
         auto p = makeObj();
         put (p, "enabled", mpeConfig.enabled);
+        put (p, "top_bend", topBend);
         put (p, "members", mpeConfig.members);
         put (p, "member_pitchbend_semitones", mpeConfig.memberPB);
         put (p, "master_pitchbend_semitones", mpeConfig.masterPB);
@@ -531,11 +532,47 @@ juce::var MainComponent::handleControl (const juce::var& req)
         // The file is about to be (re)loaded anyway: do not start a second bounce for the old file.
         if (req.hasProperty ("mpe") && flag (req, "mpe", false) != mpeConfig.enabled)
             setMpeEnabled (flag (req, "mpe", false), false);
+        if (req.hasProperty ("top_bend") && flag (req, "top_bend", false) != topBend)
+            setTopBend (flag (req, "top_bend", false), false);
         loadMidiFile (f);
         auto o = makeObj();
         put (o, "started", true);
         put (o, "analysis", mpeNote);
         put (o, "note", "bounce is asynchronous: poll status until busy is false, then play");
+        return o;
+    }
+
+    if (cmd == "top_bend")
+    {
+        setTopBend (flag (req, "on", true));
+        auto o = makeObj();
+        put (o, "top_bend", topBend);
+        return o;
+    }
+
+    // Write what the instrument actually receives (after TOP-BEND / zone setup) as an SMF.
+    if (cmd == "export_midi")
+    {
+        if (midiSequence.getNumEvents() == 0) return fail ("no MIDI file loaded");
+        const auto file = resolvePath (str (req, "path", "export.mid"), appDir());
+        juce::MidiMessageSequence ticks;
+        ticks.addEvent (juce::MidiMessage::tempoMetaEvent (500000), 0.0);
+        for (int i = 0; i < midiSequence.getNumEvents(); ++i)
+        {
+            auto m = midiSequence.getEventPointer (i)->message;
+            if (m.isTempoMetaEvent() || m.isEndOfTrackMetaEvent()) continue;
+            m.setTimeStamp (m.getTimeStamp() * 1920.0);   // 120 bpm, 960 tpq
+            ticks.addEvent (m);
+        }
+        ticks.addEvent (juce::MidiMessage::endOfTrack(), ticks.getEndTime() + 960.0);
+        juce::MidiFile mf;
+        mf.setTicksPerQuarterNote (960);
+        mf.addTrack (ticks);
+        file.deleteFile();
+        juce::FileOutputStream out (file);
+        if (! out.openedOk() || ! mf.writeTo (out)) return fail ("cannot write " + file.getFullPathName());
+        auto o = makeObj();
+        put (o, "path", file.getFullPathName());
         return o;
     }
 
@@ -585,9 +622,8 @@ juce::var MainComponent::handleControl (const juce::var& req)
             for (int t = 0; t < mf.getNumTracks(); ++t)
                 seq.addSequence (*mf.getTrack (t), 0.0);
             seq.sort();
-            if (mpeConfig.enabled && ! mpe::hasZoneSetup (seq))
-                mpe::prependZoneSetup (seq, mpeConfig);
-            mpe::noteOnsLast (seq);
+            juce::String note;
+            seq = prepareMidiForInstrument (std::move (seq), note);
         }
         if (seq.getNumEvents() == 0) return fail ("no events");
         if (instrumentNode == nullptr && ! flag (req, "allow_no_inst", false))
@@ -733,7 +769,7 @@ juce::var MainComponent::handleControl (const juce::var& req)
             "ping", "status", "list_plugins", "load_plugin", "remove_plugin", "set_bypass",
             "list_params", "set_param", "set_params", "save_state", "load_state",
             "show_editor", "screenshot", "set_source", "load_audio", "play", "stop", "seek", "loop",
-            "prerender", "load_midi", "mpe", "midi_send", "midi_play", "midi_play_file", "midi_stop",
+            "prerender", "load_midi", "top_bend", "export_midi", "mpe", "midi_send", "midi_play", "midi_play_file", "midi_stop",
             "record_start", "record_stop", "analyze", "audio_devices", "set_audio" }).joinIntoString (" "));
         put (o, "doc", "docs/CONTROL.md");
         return o;

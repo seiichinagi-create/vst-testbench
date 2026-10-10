@@ -113,4 +113,163 @@ namespace mpe
         }
         seq = std::move (out);
     }
+
+    // ---------------------------------------------------------------------
+    // TOP-BEND: a one-channel file whose pitch bend is meant for the highest
+    // sounding note only. One channel cannot do that (bend hits every note), so
+    // each note is moved to its own MPE member channel and the source bend is
+    // routed to the member channel of the current top note.
+    //   * a note always starts with its channel bend at centre;
+    //   * when a higher note-on takes over as top, the old top's bend returns to
+    //     centre (the bend does NOT move to the new top);
+    //   * source CC / program / channel pressure go to the master channel (1),
+    //     which an MPE zone applies to every member;
+    //   * the source bend range (RPN 0, default 2 st) is rescaled to the member
+    //     range, and the source RPN messages are dropped.
+    // Input: sorted, times in seconds. Notes of each source channel are handled
+    // independently; members come from one shared pool (channels 2..members+1).
+    struct TopBendResult { juce::MidiMessageSequence seq; int notes = 0; int bends = 0; int steals = 0; };
+
+    inline TopBendResult topBendSplit (const juce::MidiMessageSequence& in, const Config& cfg)
+    {
+        TopBendResult res;
+        const int first = 2, last = juce::jlimit (2, 16, 1 + cfg.members);
+        const int poolSize = last - first + 1;
+
+        struct Member { bool busy = false; int srcCh = 0, note = 0; double freedAt = -1.0; double startedAt = 0.0; };
+        Member pool[17];
+        struct Src { int bendValue = 8192; double rangeSemi = 2.0; int rpnMsb = 127, rpnLsb = 127, dataMsb = 2, dataLsb = 0; };
+        Src src[17];
+
+        auto emit = [&res] (juce::MidiMessage m, double t) { m.setTimeStamp (t); res.seq.addEvent (m); };
+        const int centre = 8192;
+
+        auto rawFor = [&cfg] (const Src& s)
+        {
+            const double norm = ((double) s.bendValue - 8192.0) / 8192.0;           // -1..1 of the source range
+            const double v = norm * s.rangeSemi / (double) juce::jmax (1, cfg.memberPB);
+            return juce::jlimit (0, 16383, 8192 + juce::roundToInt (v * 8192.0));
+        };
+
+        auto topOf = [&pool, first, last] (int srcCh) -> int   // member channel carrying the highest note, 0 = none
+        {
+            int best = 0, bestNote = -1;
+            for (int c = first; c <= last; ++c)
+                if (pool[c].busy && pool[c].srcCh == srcCh && pool[c].note > bestNote)
+                    { bestNote = pool[c].note; best = c; }
+            return best;
+        };
+
+        for (int i = 0; i < in.getNumEvents(); ++i)
+        {
+            const auto& m = in.getEventPointer (i)->message;
+            const double t = m.getTimeStamp();
+
+            if (m.isMetaEvent() || m.getChannel() == 0)
+            {
+                emit (m, t);
+                continue;
+            }
+            const int sc = m.getChannel();
+
+            if (m.isNoteOn())
+            {
+                const int note = m.getNoteNumber();
+                // same key still sounding: release it first
+                for (int c = first; c <= last; ++c)
+                    if (pool[c].busy && pool[c].srcCh == sc && pool[c].note == note)
+                    {
+                        emit (juce::MidiMessage::noteOff (c, note, (juce::uint8) 0), t);
+                        pool[c].busy = false; pool[c].freedAt = t;
+                    }
+
+                // free member, least recently released first; else steal the oldest note
+                int pick = 0;
+                for (int c = first; c <= last; ++c)
+                    if (! pool[c].busy && (pick == 0 || pool[c].freedAt < pool[pick].freedAt))
+                        pick = c;
+                if (pick == 0)
+                {
+                    for (int c = first; c <= last; ++c)
+                        if (pick == 0 || pool[c].startedAt < pool[pick].startedAt) pick = c;
+                    emit (juce::MidiMessage::noteOff (pick, pool[pick].note, (juce::uint8) 0), t);
+                    ++res.steals;
+                }
+
+                const int oldTop = topOf (sc);
+                emit (juce::MidiMessage::pitchWheel (pick, centre), t);   // note starts un-bent
+                emit (juce::MidiMessage::noteOn (pick, note, m.getVelocity()), t);
+                pool[pick] = { true, sc, note, -1.0, t };
+                ++res.notes;
+
+                if (oldTop != 0 && pool[oldTop].note < note)
+                    emit (juce::MidiMessage::pitchWheel (oldTop, centre), t);   // top changed: old top back to centre
+                continue;
+            }
+
+            if (m.isNoteOff())
+            {
+                const int note = m.getNoteNumber();
+                for (int c = first; c <= last; ++c)
+                    if (pool[c].busy && pool[c].srcCh == sc && pool[c].note == note)
+                    {
+                        emit (juce::MidiMessage::noteOff (c, note, m.getVelocity()), t);
+                        pool[c].busy = false; pool[c].freedAt = t;
+                        break;
+                    }
+                continue;
+            }
+
+            if (m.isPitchWheel())
+            {
+                src[sc].bendValue = m.getPitchWheelValue();
+                if (const int top = topOf (sc))
+                {
+                    emit (juce::MidiMessage::pitchWheel (top, rawFor (src[sc])), t);
+                    ++res.bends;
+                }
+                continue;
+            }
+
+            if (m.isController())
+            {
+                const int cc = m.getControllerNumber(), v = m.getControllerValue();
+                if (cc == 101) { src[sc].rpnMsb = v; continue; }
+                if (cc == 100) { src[sc].rpnLsb = v; continue; }
+                if (cc == 6 || cc == 38)
+                {
+                    if (src[sc].rpnMsb == 0 && src[sc].rpnLsb == 0)   // pitch bend range
+                    {
+                        if (cc == 6)  src[sc].dataMsb = v; else src[sc].dataLsb = v;
+                        src[sc].rangeSemi = src[sc].dataMsb + src[sc].dataLsb / 100.0;
+                    }
+                    continue;   // RPN data never reaches the members
+                }
+                emit (juce::MidiMessage::controllerEvent (1, cc, v), t);
+                continue;
+            }
+
+            if (m.isChannelPressure() || m.isProgramChange())
+            {
+                auto copy = m;
+                copy.setChannel (1);
+                emit (copy, t);
+                continue;
+            }
+            // poly pressure: follow its note to the member channel
+            if (m.isAftertouch())
+            {
+                for (int c = first; c <= last; ++c)
+                    if (pool[c].busy && pool[c].srcCh == sc && pool[c].note == m.getNoteNumber())
+                    {
+                        emit (juce::MidiMessage::aftertouchChange (c, m.getNoteNumber(), m.getAfterTouchValue()), t);
+                        break;
+                    }
+                continue;
+            }
+            emit (m, t);
+        }
+        juce::ignoreUnused (poolSize);
+        return res;
+    }
 }
