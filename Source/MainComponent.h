@@ -9,6 +9,7 @@
 #include "MidiTakeRecorder.h"
 #include "MpeSupport.h"
 #include "OutputTap.h"
+#include "RigRender.h"
 #include "ControlServer.h"
 
 //==============================================================================
@@ -96,6 +97,7 @@ private:
     juce::var controlStatus() const;
     juce::AudioProcessor* processorForRole (const juce::String& role) const;
     juce::MidiMessageSequence sequenceFromEvents (const juce::var& events, juce::String& error) const;
+    juce::var startRigRender (const juce::var& request);   // rig_render: fixed inst -> insert -> master, offline
 
     //== GPU FX (gpufx worker renders the playable file) ==
     void setGpuFxEnabled (bool);
@@ -179,6 +181,8 @@ private:
     //== MPE / AI control state ==
     mpe::Config mpeConfig;
     juce::String mpeNote;                       // what the loaded MIDI file looked like
+    RigRender rigRender;                        // headless fixed-topology render (rig_render)
+    juce::var rigResult;                        // last rig_render result, shown in status
     int pendingLoads = 0;                       // async plugin loads in flight (message thread)
     Graph::Node::Ptr tapNode;
     OutputTap* outputTap = nullptr;             // owned by the graph node

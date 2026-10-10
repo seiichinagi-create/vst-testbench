@@ -25,6 +25,7 @@ Client: `python tools/tb.py <cmd> key=value ...` (or a JSON body), `--wait` bloc
 | set_bypass, show_editor, screenshot | `screenshot target=main\|fx\|inst path=x.png` | PNG for vision; relative paths land in `%APPDATA%\VstTestBench` |
 | set_source | `mode=live\|inst\|file` | |
 | load_audio, play, stop, seek, loop, prerender | | file player |
+| rig_render | `inst`, `insert`, `master` (name or .vst3 path), `events`, `out`, `rate`, `block`, `tail`, `compensate`, `settle` (ms, default 500), `<role>_state` | fixed headless rig MIDI -> VSTi -> insert -> master, rendered offline from fresh instances; async, result in `status.rig` (declared latencies per stage, peak). `tools/rig_test.py` checks latency and repeatability. **settle**: Legacy Distortion loads its capture asynchronously and flips its declared latency 4 -> 0 when it lands; with settle=0 that raced the render (4 of 60 renders differed, latency read 0 or 4), with 500 ms 0 of 60 |
 | load_midi | `path`, `mpe=true\|false` | offline bounce through the VSTi, then `play` |
 | export_midi | `path` | write what the instrument receives (after TOP-BEND / zone setup) as an SMF, for inspection |
 | mpe | `on`, `members`, `member_pb`, `master_pb`, `send` | |

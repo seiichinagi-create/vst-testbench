@@ -143,7 +143,7 @@ juce::var MainComponent::controlStatus() const
     put (o, "source", mode == srcLive ? "live" : mode == srcInstrument ? "inst" : "file");
     put (o, "status_text", statusLabel.getText());
 
-    const bool busy = pendingLoads > 0 || bounceEngine.isBouncing() || offlineInstLoading || offlineFxLoading
+    const bool busy = pendingLoads > 0 || bounceEngine.isBouncing() || rigRender.isRunning() || offlineInstLoading || offlineFxLoading
                       || firstBouncePending || (preRenderActive() && renderEngine.isRendering())
                       || (preRenderActive() && fxStale.load());
     put (o, "busy", busy);
@@ -196,6 +196,8 @@ juce::var MainComponent::controlStatus() const
         put (p, "master_pitchbend_semitones", mpeConfig.masterPB);
         put (o, "mpe", p);
     }
+    if (! rigResult.isVoid())
+        put (o, "rig", rigResult);
     put (o, "prerender", preRenderActive());
     put (o, "gpu_fx", gpuFxButton.getToggleState());
 
@@ -565,6 +567,10 @@ juce::var MainComponent::handleControl (const juce::var& req)
         return o;
     }
 
+    //-- fixed test rig: MIDI -> VSTi -> insert -> master, offline --------------
+    if (cmd == "rig_render")
+        return startRigRender (req);
+
     //-- MPE -------------------------------------------------------------------
     if (cmd == "mpe")
     {
@@ -758,11 +764,100 @@ juce::var MainComponent::handleControl (const juce::var& req)
             "ping", "status", "list_plugins", "load_plugin", "remove_plugin", "set_bypass",
             "list_params", "set_param", "set_params", "save_state", "load_state",
             "show_editor", "screenshot", "set_source", "load_audio", "play", "stop", "seek", "loop",
-            "prerender", "load_midi", "export_midi", "mpe", "midi_send", "midi_play", "midi_play_file", "midi_stop",
+            "prerender", "rig_render", "load_midi", "export_midi", "mpe", "midi_send", "midi_play", "midi_play_file", "midi_stop",
             "record_start", "record_stop", "analyze", "audio_devices", "set_audio" }).joinIntoString (" "));
         put (o, "doc", "docs/CONTROL.md");
         return o;
     }
 
     return fail ("unknown cmd \"" + cmd + "\" (try cmd=help)");
+}
+
+//==============================================================================
+// rig_render: inst=<name|path> [insert=<name|path>] [master=<name|path>]
+//             events=[...] out=<wav> [rate] [block] [tail] [compensate]
+//             [settle=<ms, default 500>] [inst_state|insert_state|master_state=<file from save_state>]
+// Fresh plugin instances, fresh graph, no audio device: the result depends only on the inputs.
+// Asynchronous like the MIDI bounce: poll status until busy is false, then read status.rig.
+//==============================================================================
+juce::var MainComponent::startRigRender (const juce::var& req)
+{
+    if (rigRender.isRunning())
+        return fail ("a rig render is already running");
+
+    RigRender::Spec spec;
+    spec.sampleRate  = num (req, "rate", 48000.0);
+    spec.block       = juce::jlimit (32, 8192, (int) num (req, "block", 512));
+    spec.tailSeconds = juce::jmax (0.0, num (req, "tail", 2.0));
+    spec.compensate  = flag (req, "compensate", true);
+    spec.settleMs    = juce::jlimit (0, 10000, (int) num (req, "settle", 500.0));
+    spec.out         = resolvePath (str (req, "out", "rig.wav"), appDir());
+
+    juce::String error;
+    spec.sequence = sequenceFromEvents (req["events"], error);
+    if (error.isNotEmpty()) return fail (error);
+
+    auto* fmt = vst3Format();
+    if (fmt == nullptr) return fail ("VST3 format not available");
+
+    struct Slot { const char* role; bool wantInst; bool required; };
+    for (const Slot slot : { Slot { "inst", true, true }, Slot { "insert", false, false }, Slot { "master", false, false } })
+    {
+        const auto what = str (req, slot.role);
+        if (what.isEmpty())
+        {
+            if (slot.required) return fail ("give \"inst\" (a cached name or a .vst3 path)");
+            continue;
+        }
+
+        juce::PluginDescription desc;
+        bool found = false;
+        if (what.endsWithIgnoreCase (".vst3") || juce::File::isAbsolutePath (what))
+        {
+            juce::OwnedArray<juce::PluginDescription> types;
+            knownPlugins.scanAndAddFile (juce::File (what).getFullPathName(), true, types, *fmt);
+            if (! types.isEmpty()) { desc = *types.getFirst(); found = true; }
+        }
+        else
+        {
+            auto types = knownPlugins.getTypes();
+            for (const auto& t : types)
+                if (t.isInstrument == slot.wantInst && t.name.equalsIgnoreCase (what)) { desc = t; found = true; break; }
+            if (! found)
+                for (const auto& t : types)
+                    if (t.isInstrument == slot.wantInst && t.name.containsIgnoreCase (what)) { desc = t; found = true; break; }
+        }
+        if (! found) return fail (juce::String (slot.role) + ": no plugin matching \"" + what + "\"");
+
+        juce::String err;
+        auto plugin = formatManager.createPluginInstance (desc, spec.sampleRate, spec.block, err);
+        if (plugin == nullptr) return fail (juce::String (slot.role) + ": load failed: " + err);
+
+        const auto stateKey = juce::String (slot.role) + "_state";
+        if (str (req, stateKey.toRawUTF8()).isNotEmpty())
+        {
+            juce::MemoryBlock state;
+            if (! resolvePath (str (req, stateKey.toRawUTF8()), appDir()).loadFileAsData (state))
+                return fail ("cannot read " + stateKey);
+            plugin->setStateInformation (state.getData(), (int) state.getSize());
+            // same JUCE-VST3 wrapper trap as the offline clones: a bypass PARAMETER may travel in the state
+            if (auto* bypass = plugin->getBypassParameter())
+                bypass->setValueNotifyingHost (0.0f);
+        }
+
+        spec.stages.push_back ({ slot.role, std::move (plugin) });
+    }
+
+    rigResult = juce::var();
+    rigRender.onDone = [safe = juce::Component::SafePointer<MainComponent> (this)] (juce::var r)
+    {
+        if (safe != nullptr)
+            safe->rigResult = std::move (r);
+    };
+    rigRender.start (std::move (spec));
+
+    auto o = makeObj();
+    put (o, "started", true);
+    put (o, "note", "asynchronous: poll status until busy is false, then read status.rig");
+    return o;
 }
