@@ -9,6 +9,9 @@
 //   track 1:  source -> insert ...            >--> master (first node = the summing input) -> ... -> output
 //   track N:  ...                            /
 //
+//   a track's last node (its strip) also feeds, post-fader, two send buses:
+//       send level node -> bus input -> [bus FX] -> return strip ---> master (summed with the tracks)
+//
 // The offline rig (RigRender) builds its graph with this class, and the live bench is meant to do the same
 // (docs/TRACKS.md), so that "what the bench plays" and "what the rig renders" are the same graph by construction
 // and the null test between them means something.
@@ -18,6 +21,9 @@ class MixGraph
 {
 public:
     using Graph = juce::AudioProcessorGraph;
+
+    // `Placed::track` for the nodes of send bus n is busBase + n (tracks count from 0, the master is -1).
+    static constexpr int busBase = 100;
 
     struct Placed
     {
@@ -98,6 +104,24 @@ public:
         ++numTracks;
     }
 
+    // A send bus: its chain (the FX slot, then the return strip) in series, the last into the summing input. Returns the node the
+    // sends feed. Call after setMaster.
+    Graph::Node::Ptr addBus (const std::vector<Graph::Node::Ptr>& chain)
+    {
+        for (size_t i = 0; i + 1 < chain.size(); ++i)
+            connect (chain[i], chain[i + 1]);
+        connect (chain.back(), masterIn);
+        return chain.front();
+    }
+
+    // The post-fader send of a track: its last node -> the send level node -> the bus input.
+    void addSend (Graph::Node::Ptr trackOut, Graph::Node::Ptr level, Graph::Node::Ptr busIn, int track, int bus)
+    {
+        connect (trackOut, level);
+        connect (level, busIn);
+        sends.push_back ({ track, bus });
+    }
+
     // MIDI into a node (a VSTi's MIDI input, from a feeder or from the host's MIDI input node).
     void connectMidi (Graph::Node::Ptr from, Graph::Node::Ptr to)
     {
@@ -115,12 +139,17 @@ public:
     {
         perTrack.assign ((size_t) numTracks, 0);
         int masterLat = 0;
+        int busLat[8] = {};
         for (auto& p : placedNodes)
         {
             const int l = p.node->getProcessor()->getLatencySamples();
-            if (p.track < 0) masterLat += l; else perTrack[(size_t) p.track] += l;
+            if (p.track < 0)               masterLat += l;
+            else if (p.track >= busBase)   busLat[juce::jlimit (0, 7, p.track - busBase)] += l;
+            else                           perTrack[(size_t) p.track] += l;
         }
-        const int longest = perTrack.empty() ? 0 : *std::max_element (perTrack.begin(), perTrack.end());
+        int longest = perTrack.empty() ? 0 : *std::max_element (perTrack.begin(), perTrack.end());
+        for (auto& sd : sends)                     // a track that feeds a bus is as late as the track plus the bus
+            longest = juce::jmax (longest, perTrack[(size_t) sd.first] + busLat[sd.second]);
         return longest + masterLat;
     }
 
@@ -132,5 +161,6 @@ private:
     Graph::UpdateKind kind;
     Graph::Node::Ptr outNode, masterIn;
     std::vector<Placed> placedNodes;
+    std::vector<std::pair<int, int>> sends;     // (track, bus)
     int numTracks = 0;
 };

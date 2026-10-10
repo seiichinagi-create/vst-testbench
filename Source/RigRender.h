@@ -382,6 +382,7 @@ public:
         juce::int64 impulseAt = -1;           // >= 0: stages[0] is an ImpulseSource at this sample; no MIDI
         juce::int64 sourceSamples = -1;       // >= 0: stages[0] is a FileSource of this many samples; no MIDI
         juce::MidiMessageSequence sequence;   // seconds, for a VSTi source
+        Stage send[2];                        // the post-fader send level (a TrackStrip) to bus 1 / 2; plugin null = no send
     };
 
     // tracks -> (summed) -> master -> out. The graph delays every track by what the longest one needs.
@@ -389,6 +390,7 @@ public:
     {
         std::vector<Track> tracks;
         std::vector<Stage> master;
+        std::vector<Stage> bus[2];            // send bus 1 / 2: [FX slot, return strip]; empty = no bus
         double sampleRate = 48000.0;
         int block = 512;                      // the largest block; also what the plug-ins are prepared for
         std::vector<int> blockPattern;        // block lengths used in turn (each clamped to 1..block); empty = always `block`
@@ -489,6 +491,23 @@ private:
             masterNodes.push_back (mix.place (std::move (st.plugin), st.role, -1));
         mix.setMaster (masterNodes);
 
+        Graph::Node::Ptr busIn[2];
+        for (int n = 0; n < 2; ++n)
+        {
+            // a bus nothing is sent to is not built: its FX would sit in the graph with a latency and no input, and the
+            // graph's total would no longer be what the declared latencies add up to
+            bool fed = false;
+            for (auto& t : spec.tracks)
+                fed = fed || t.send[n].plugin != nullptr;
+            if (! fed)
+                continue;
+            std::vector<Graph::Node::Ptr> nodes;
+            for (auto& st : spec.bus[n])
+                nodes.push_back (mix.place (std::move (st.plugin), st.role, MixGraph::busBase + n));
+            if (! nodes.empty())
+                busIn[n] = mix.addBus (nodes);
+        }
+
         Graph::Node::Ptr firstSource;
         bool firstTrackHasMore = false;
         for (size_t ti = 0; ti < spec.tracks.size(); ++ti)
@@ -502,6 +521,9 @@ private:
             if (midiTrack)
                 mix.connectMidi (mix.addNode (std::make_unique<MidiFeeder> (tr.sequence, sr)), chain[0]);
             mix.addTrack (chain);        // in series, the last one summed with the other tracks at the master's input (or the output)
+            for (int n = 0; n < 2; ++n)
+                if (tr.send[n].plugin != nullptr && busIn[n] != nullptr)
+                    mix.addSend (chain.back(), mix.place (std::move (tr.send[n].plugin), "send", (int) ti), busIn[n], (int) ti, n);
 
             if (ti == 0) { firstSource = chain[0]; firstTrackHasMore = chain.size() > 1 || ! masterNodes.empty(); }
         }

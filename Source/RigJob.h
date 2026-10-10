@@ -218,6 +218,18 @@ namespace rigjob
                     return false;
             }
 
+            // post-fader sends to the two buses (dB; absent = no send)
+            for (int n = 0; n < 2; ++n)
+            {
+                const auto key = "send" + juce::String (n + 1) + "_db";
+                if (tj.hasProperty (key.toRawUTF8()))
+                {
+                    auto level = std::make_unique<TrackStrip>();
+                    level->setGainDb ((float) (double) tj[key.toRawUTF8()]);
+                    tr.send[n] = { "send", std::move (level) };
+                }
+            }
+
             if (auto* stages = tj["stages"].getArray())
                 for (const auto& st : *stages)
                 {
@@ -265,6 +277,17 @@ namespace rigjob
                                                (float) (double) (*pt.getArray())[1] });
                 spec.automation.push_back (std::move (au));
             }
+
+        // send buses: "bus1" / "bus2" = [stage...] (the FX slot, then the return strip)
+        for (int n = 0; n < 2; ++n)
+            if (auto* bus = job[("bus" + juce::String (n + 1)).toRawUTF8()].getArray())
+                for (const auto& st : *bus)
+                {
+                    RigRender::Stage stage;
+                    if (! buildStage (st, formats, spec, stage, error, note))
+                        return false;
+                    spec.bus[n].push_back (std::move (stage));
+                }
 
         if (auto* master = job["master"].getArray())
             for (const auto& st : *master)

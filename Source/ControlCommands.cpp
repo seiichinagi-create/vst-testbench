@@ -893,10 +893,13 @@ juce::var MainComponent::startRigRender (const juce::var& req)
     {
         auto stage = makeObj();
         put (stage, "role", role);
+        // test doubles (delay / tail / probe) stand in for the FX of the insert, the master and the send buses (keys: bus1_delay_actual ...)
+        const bool isDoubleSlot = role == "insert" || role == "master" || role.startsWith ("bus");
+        const juce::String slotPrefix = role == "master" ? juce::String ("master_") : role.startsWith ("bus") ? role + "_" : juce::String();
 
-        if ((role == "insert" || role == "master") && src.hasProperty (juce::String (role == "master" ? "master_" : "") + "delay_actual"))
+        if (isDoubleSlot && src.hasProperty (slotPrefix + "delay_actual"))
         {
-            const auto prefix = juce::String (role == "master" ? "master_" : "");
+            const auto prefix = slotPrefix;
             put (stage, "kind", "delay");
             put (stage, "delay_actual", (int) num (src, (prefix + "delay_actual").toRawUTF8(), 0.0));
             put (stage, "delay_declared", (int) num (src, (prefix + "delay_declared").toRawUTF8(),
@@ -905,15 +908,15 @@ juce::var MainComponent::startRigRender (const juce::var& req)
         }
         // test doubles that report what the host does: "playhead" (transport info written into the audio) and "gain"
         // (a host parameter that scales the audio)
-        if ((role == "insert" || role == "master") && str (src, (juce::String (role == "master" ? "master_" : "") + "probe").toRawUTF8()).isNotEmpty())
+        if (isDoubleSlot && str (src, (slotPrefix + "probe").toRawUTF8()).isNotEmpty())
         {
             put (stage, "kind", "probe");
-            put (stage, "probe", str (src, (juce::String (role == "master" ? "master_" : "") + "probe").toRawUTF8()));
+            put (stage, "probe", str (src, (slotPrefix + "probe").toRawUTF8()));
             return stage;
         }
-        if ((role == "insert" || role == "master") && src.hasProperty (juce::String (role == "master" ? "master_" : "") + "tail_t60"))
+        if (isDoubleSlot && src.hasProperty (slotPrefix + "tail_t60"))
         {
-            const auto prefix = juce::String (role == "master" ? "master_" : "");
+            const auto prefix = slotPrefix;
             put (stage, "kind", "tail");
             put (stage, "tail_t60", num (src, (prefix + "tail_t60").toRawUTF8(), 1.0));
             put (stage, "tail_declared", num (src, (prefix + "tail_declared").toRawUTF8(),
@@ -1011,6 +1014,9 @@ juce::var MainComponent::startRigRender (const juce::var& req)
         if (auto strip = stripFor (t, {}); ! strip.isVoid())
             stages.add (strip);
         put (track, "stages", stages);
+        for (const char* key : { "send1_db", "send2_db" })        // post-fader sends to the two buses
+            if (t.hasProperty (key))
+                put (track, key, t[key]);
         return track;
     };
 
@@ -1057,6 +1063,20 @@ juce::var MainComponent::startRigRender (const juce::var& req)
     if (auto strip = stripFor (req, "master_"); ! strip.isVoid())
         master.add (strip);
     put (job, "master", master);
+
+    for (int n = 1; n <= 2; ++n)                                    // send buses: bus1 / bus2 = the FX, bus1_gain_db ... = the return strip
+    {
+        const auto role = "bus" + juce::String (n);
+        auto fx = stageFor (req, role, false, error);
+        if (! error.isEmpty()) return fail (error);
+        if (fx.isVoid())
+            continue;
+        juce::Array<juce::var> stages;
+        stages.add (fx);
+        if (auto ret = stripFor (req, role + "_"); ! ret.isVoid())
+            stages.add (ret);
+        put (job, role, stages);
+    }
 
     rigResult = juce::var();
     rigWorker.onDone = [safe = juce::Component::SafePointer<MainComponent> (this)] (juce::var r)
