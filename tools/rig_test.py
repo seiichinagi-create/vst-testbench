@@ -38,6 +38,10 @@
               the bpm sent is the bpm seen, and the position advances by bpm/60/sr quarter notes per sample.
 12. in-block automation   a parameter change at sample N must take effect at sample N whatever the block pattern. The
               quantised mode is the control: it moves the change to a block boundary.
+13. audio clips        a stereo audio clip on a track: where it sits on the timeline (clip_start), where in the file it starts
+              (clip_offset), how long it is (clip_length) and its gain. Marks at known places in the file must come out at
+              the computed places and levels, and nothing outside the clip may be heard. The clip is also the model of an
+              ARA playback region.
 """
 import argparse, hashlib, os, struct, sys, time
 import numpy as np
@@ -456,6 +460,40 @@ def block_automation(rig, bad):
         bad.append("automation: the control (block-quantised) landed on the exact samples, so the test could not tell")
 
 
+def audio_clip(rig, bad):
+    # a file with marks at known places: L 1.0 at 0.12 s, R 0.5 at 0.40 s, both 0.2 at 0.75 s
+    x = np.zeros((SR_, 2))
+    x[int(0.12 * SR_), 0] = 1.0
+    x[int(0.40 * SR_), 1] = 0.5
+    x[int(0.75 * SR_), :] = 0.2
+    data = x.astype("<f4").tobytes()
+    path = abs_data(rig, "clip_marks.wav")
+    with open(path, "wb") as f:
+        f.write(b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVE" + b"fmt " +
+                struct.pack("<IHHIIHH", 16, 3, 2, SR_, SR_ * 8, 8, 32) + b"data" + struct.pack("<I", len(data)) + data)
+
+    def marks(**kw):
+        rig.render("clip_out.wav", source="file", source_path=path, tail=0.0, **kw)
+        y = rig.read("clip_out.wav").reshape(-1, 2)
+        found = [(int(i), round(float(y[i, 0]), 3), round(float(y[i, 1]), 3)) for i in np.nonzero(np.abs(y).max(axis=1) > 1e-6)[0]]
+        return found, len(y)
+
+    whole, n_whole = marks()
+    want_whole = [(int(0.12 * SR_), 1.0, 0.0), (int(0.40 * SR_), 0.0, 0.5), (int(0.75 * SR_), 0.2, 0.2)]
+    # clip: start 0.25 s on the timeline, from 0.10 s into the file, 0.35 s long (covers file time 0.10..0.45), -6.0206 dB
+    clip, n_clip = marks(clip_start=0.25, clip_offset=0.10, clip_length=0.35, clip_gain_db=-6.0206)
+    t_l = round((0.25 + (0.12 - 0.10)) * SR_)
+    t_r = round((0.25 + (0.40 - 0.10)) * SR_)
+    want_clip = [(t_l, 0.5, 0.0), (t_r, 0.0, 0.25)]
+    print(f"  audio clip: whole file marks at {[m[0] for m in whole]}; clip (start 0.25 s, offset 0.10 s, length 0.35 s, -6 dB) "
+          f"marks at {[m[0] for m in clip]} levels {[m[1:] for m in clip]}, length {n_clip / SR_:.4f} s "
+          f"(expected {[m[0] for m in want_clip]} and {(0.25 + 0.35):.4f} s)")
+    if whole != want_whole or n_whole != SR_:
+        bad.append(f"audio clip: the whole file did not come out as it went in ({whole})")
+    if clip != want_clip or abs(n_clip - round(0.60 * SR_)) > 1:
+        bad.append(f"audio clip: placed marks {clip} (length {n_clip}), expected {want_clip}")
+
+
 def instance_interference(rig, plugs, notes):
     """Two instances of one instrument playing different notes: the two-track render must equal the sum of the
     separate renders (and an idle second instance must not change the first). Findings go to `notes`: a plugin that
@@ -584,6 +622,7 @@ def main():
     variable_blocks(rig, a, bad, notes)
     transport_info(rig, bad)
     block_automation(rig, bad)
+    audio_clip(rig, bad)
 
     # 9: instance interference (findings about plugins)
     instance_interference(rig, a.interference, notes)

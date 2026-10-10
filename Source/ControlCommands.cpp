@@ -716,7 +716,8 @@ juce::var MainComponent::handleControl (const juce::var& req)
 
 //==============================================================================
 // rig_render. One track at the top level:
-//     inst=<name|path> | source=impulse [impulse_at] [impulse_amp] | source=file source_path=<wav>
+//     inst=<name|path> | source=impulse [impulse_at] [impulse_amp]
+//     | source=file source_path=<wav> [clip_start=<s on the timeline>] [clip_offset=<s into the file>] [clip_length=<s>] [clip_gain_db]
 //     [insert=<name|path> | delay_actual=<n> [delay_declared=<m>] | tail_t60=<s> [tail_declared=<s>]]
 //     events=[...]  [inst_state|insert_state=<file>]  [inst_params|insert_params={name: 0..1}]
 //   or several: tracks=[ {the same keys}, ... ]  (summed; the graph aligns them by their declared latencies)
@@ -830,6 +831,9 @@ juce::var MainComponent::startRigRender (const juce::var& req)
             const auto f = resolvePath (str (t, "source_path"), appDir());
             if (! f.existsAsFile()) { error = "source_path: no such file " + f.getFullPathName(); return {}; }
             put (track, "source_path", f.getFullPathName());
+            for (const char* key : { "clip_start", "clip_offset", "clip_length", "clip_gain_db" })
+                if (t.hasProperty (key))
+                    put (track, key, t[key]);
         }
         else
         {

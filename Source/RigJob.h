@@ -159,8 +159,15 @@ namespace rigjob
                 reader->read (data.get(), 0, (int) reader->lengthInSamples, 0, true, true);
                 if (reader->numChannels == 1)
                     data->copyFrom (1, 0, *data, 0, 0, data->getNumSamples());
-                tr.sourceSamples = data->getNumSamples();
-                tr.stages.push_back ({ "source", std::make_unique<RigRender::FileSource> (data) });
+                // the clip: where it sits on the timeline, where in the file it starts, how long, how loud (seconds / dB)
+                const auto toSamples = [&] (const char* key, double fallback) { return (juce::int64) std::llround (tnum (key, fallback) * spec.sampleRate); };
+                const juce::int64 clipStart  = toSamples ("clip_start", 0.0);
+                const juce::int64 clipOffset = juce::jlimit<juce::int64> (0, data->getNumSamples(), toSamples ("clip_offset", 0.0));
+                const juce::int64 clipLength = tj.hasProperty ("clip_length") ? toSamples ("clip_length", 0.0) : -1;
+                const float gain = (float) juce::Decibels::decibelsToGain (tnum ("clip_gain_db", 0.0));
+                auto clip = std::make_unique<RigRender::FileSource> (data, clipStart, clipOffset, clipLength, gain);
+                tr.sourceSamples = clip->endOnTimeline();
+                tr.stages.push_back ({ "source", std::move (clip) });
             }
             else
             {

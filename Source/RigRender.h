@@ -64,14 +64,24 @@ public:
         float amp;
     };
 
-    // Plays a pre-loaded stereo buffer from sample 0, then silence. The source for feeding one render's
-    // output into the next (a chain split in two must equal the chain rendered whole).
+    // An audio clip on a track: `length` samples of a pre-loaded stereo buffer, starting at `offset` in the file, placed
+    // at `start` on the timeline, times a gain; silence everywhere else. The source for feeding one render's output into
+    // the next (a chain split in two must equal the chain rendered whole) and the model of an ARA playback region.
     class FileSource : public juce::AudioProcessor
     {
     public:
-        explicit FileSource (std::shared_ptr<juce::AudioBuffer<float>> data)
+        FileSource (std::shared_ptr<juce::AudioBuffer<float>> data, juce::int64 startOnTimeline = 0,
+                    juce::int64 offsetInFile = 0, juce::int64 lengthInSamples = -1, float gainLinear = 1.0f)
             : juce::AudioProcessor (BusesProperties().withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
-              buffer (std::move (data)) {}
+              buffer (std::move (data)), start (startOnTimeline), offset (offsetInFile), gain (gainLinear)
+        {
+            const juce::int64 inFile = (juce::int64) buffer->getNumSamples() - offset;
+            length = lengthInSamples < 0 ? inFile : juce::jmin (lengthInSamples, inFile);
+            length = juce::jmax<juce::int64> (0, length);
+        }
+
+        // where the clip ends on the timeline
+        juce::int64 endOnTimeline() const { return start + length; }
 
         const juce::String getName() const override { return "FileSource"; }
         void prepareToPlay (double, int) override { pos = 0; }
@@ -79,11 +89,14 @@ public:
         void processBlock (juce::AudioBuffer<float>& b, juce::MidiBuffer&) override
         {
             b.clear();
-            const int total = buffer->getNumSamples();
-            const int n = juce::jmax (0, juce::jmin (b.getNumSamples(), total - pos));
-            for (int c = 0; c < juce::jmin (b.getNumChannels(), buffer->getNumChannels()); ++c)
-                b.copyFrom (c, 0, *buffer, c, pos, n);
-            pos += b.getNumSamples();
+            const juce::int64 n = b.getNumSamples();
+            const juce::int64 from = juce::jmax (pos, start);                  // overlap of [pos, pos+n) with the clip
+            const juce::int64 to = juce::jmin (pos + n, start + length);
+            if (to > from)
+                for (int c = 0; c < juce::jmin (b.getNumChannels(), buffer->getNumChannels()); ++c)
+                    b.copyFromWithRamp (c, (int) (from - pos), buffer->getReadPointer (c) + (offset + (from - start)),
+                                        (int) (to - from), gain, gain);
+            pos += n;
         }
         double getTailLengthSeconds() const override { return 0.0; }
         bool acceptsMidi() const override { return false; }
@@ -93,14 +106,15 @@ public:
         int getNumPrograms() override { return 1; }
         int getCurrentProgram() override { return 0; }
         void setCurrentProgram (int) override {}
-        const juce::String getProgramName (int) override { return {}; }
+        const juce::String getProgramName (int) override { return "Default"; }
         void changeProgramName (int, const juce::String&) override {}
         void getStateInformation (juce::MemoryBlock&) override {}
         void setStateInformation (const void*, int) override {}
 
     private:
         std::shared_ptr<juce::AudioBuffer<float>> buffer;
-        int pos = 0;
+        juce::int64 start = 0, offset = 0, length = 0, pos = 0;
+        float gain = 1.0f;
     };
 
     // Delays by `actual` samples and DECLARES `declared`. A device whose true behaviour is known, to check
