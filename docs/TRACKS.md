@@ -90,3 +90,42 @@ AUDIO(ファイル) ─ インサート ─────────────�
 **観測した1件**: 5本を続けて回した1回だけ、`rig_test` のあとでベンチが応答しなくなった(状態に `audio` が無く、そのあとの制御も返らない)。
 同じ並びを新しく起動したアプリで2回やり直しても再現しなかった(原因は未特定・ASIO ドライバの不安定さが疑わしい=README にある既知の性質)。
 再現したら、そのときの状態(`status`・ベンチのログ)を取って追う。検査スクリプトは、バックエンド切り替え直後に `audio` が一瞬無いことを待つようにした。
+
+## 追加(2026-10-11): インサート・センドリターン・MIDI ファイルの複数インストルメント・リグによる焼き込み
+
+```
+track:  source -> [INSERT] -> strip -+-> master sum
+                                     +-> send 1 level -> BUS 1: [FX] -> return strip -> master sum
+                                     +-> send 2 level -> BUS 2: [FX] -> return strip -> master sum
+master: sum -> [master FX] -> master strip -> tap -> out
+```
+
+- **インサート**: 各トラック(AUDIO・INST 1〜3)に1スロット。**センドは独立した2系統**(SEND 1・SEND 2)で、トラックのストリップの**後ろ**(フェーダー後)から送る。バスは FX スロット+リターン(音量・バランス・ミュート)。FX の無いバスは作らない(センドもつながない)。
+- **`MixGraph`**: `addBus` / `addSend`・遅延補償はバスを含めて数える(`declaredLatency`)。リグ(`RigRender`)とライブが同じ組み立て。入力の無いバスをグラフに置くとその遅延がグラフの遅延に数えられて申告とずれるので、**センドが1本も来ないバスはリグでは作らない**。
+- **制御 API**: `role=insert_audio` / `insert_inst1..3` / `send1` / `send2`(`load_plugin`・`remove_plugin`・`show_editor`・`list_params`・`set_param`)・`track_set` の `send1_db` / `send2_db`(-100 = オフ)・`track=send1|send2`(リターンの音量・バランス・ミュート)。
+- **INST 2・3 の MIDI ファイルのバウンス**: INST 2/3 に MIDI がある、または INST 1 が全チャンネルでない → リグがインストルメントトラックをまとめてバウンス(インサートとストリップを含む・センドとバスは含めない=AUDIO のセンドがライブで掛かるため)。INST 1 だけが全チャンネルのときは従来のプロセス内バウンス(速い)。つまみ・ストリップ・チャンネルの変更で自動再バウンス。
+- **PRE-RENDER**: AUDIO・MASTER のストリップをキャッシュに焼く(AUDIO ストリップ → FX → マスターストリップの順)。**インサートかセンドバスが入っているとリグが全体を焼く**(`status.prerender_mode` が `rig`・変更の800ms後に自動で焼き直し・焼き上がりを2面のキャッシュで入れ替え)。インサートのないときは従来のプロセス内エンジン(カーソル先の部分更新つき)。
+- **ソースモードの無音**(プリセット)とユーザーの M ボタンを別のフラグにした(`TrackStrip::modeSilenced`)。`render_mix` は M ボタンとソロだけを見る。
+
+### 検査(最終ビルド)
+
+| 検査 | 結果 |
+|---|---|
+| `tools/rig_sends.py` | 送りの量・リターン・2系統・遅延補償(申告どおりなら1つのピーク・嘘なら2つに割れる)・送りなし/バスなし |
+| `tools/live_vs_rig.py --slots` | インサート+センドバス(FX+リターン)つきでライブの録音と `render_mix` が **-222.6 dB(ビット一致)**・対照 -20.5 dB |
+| `tools/prerender_strips.py` | ストリップを焼いたキャッシュとライブ -217.4 dB・`--slots`(リグで焼く)-218.8 dB(ビット一致) |
+| `tools/midi_multi_inst.py` | INST 1・INST 2 を別チャンネルに割り当てた MIDI のバウンス: 両方=INST 1 だけ+INST 2 だけ(-152 dB) |
+
+**メモ(プラグイン側の性質)**: Spring Reverb は同じ状態でも**ライブの2回で再現しない**(+1.6 dB)=時間で動き続ける変調と余韻を持つので、ライブとリグの一致の検査には使えない(再現する Legacy Distortion を使う)。
+
+### Celemony Melodyne と歌声合成のテスト
+
+- **Melodyne 5.4.1(`Celemony\Melodyne\Melodyne.vst3`)**: ARA ファクトリを持つ(API 世代 2〜5)。AUDIO のインサートとして読み込める・エディタが開く・パラメータ3つ(Pitch・Formant・Volume)・**音は素通し**(挿入なしとの残差 -226.3 dB)・リグ(`render_mix`)でも同じ(-226.3 dB・1.8 秒)。トランスファー前はパラメータを動かしても音は変わらない(取り込んだ素材がないため)。ARA としての再生(`source=ara`)は `rig_test` の第14〜15項で検査済み(通常クリップとビット一致・遅延 0)。
+- **VOCALOID**: VST のプラグインは**入っていない**(VOCALOID4 の音源ライブラリと API `VOCALOIDApi4` だけ。VOCALOID4 Editor for Cubase は Cubase の拡張で、VST ホストには載らない)。
+- **Synthesizer V Studio(VST3 `synthv-studio-plugin-x64.vst3`)**: INST 2 に読み込める・エディタが開く・2081 パラメータ(MIDI CC の割り当て)・ノートを送っても**無音**(トラックに歌声データベースと歌詞がないため。重音テト AI と Mai は入っている)。歌わせるには SynthV 側にプロジェクトが要る。
+
+### 見つけて直したこと(2026-10-11)
+
+- **プラグインのキャッシュ(`known_plugins.xml`)に、存在しないファイルのエントリが残る**: 入れ子になった配備(`Flesh808.vst3\Flesh808.vst3`)の跡で、名前で探すと先頭の存在しないものを選んで「No compatible plug-in format exists」で失敗した(ライブでもリグでも・検査が静かに落ちた)。**起動時に、存在しないファイルのエントリを取り除く**ようにした。
+- 全検査(最終ビルド): `rig_test`(基準と差 0 行)・`rig_sends`・`tracks_smoke`・`live_vs_rig`(通常・`--strips`・`--slots`)・`prerender_strips`(通常・`--slots`)・`midi_multi_inst`・`render_mix_midi` がすべて PASS。
+

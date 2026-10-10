@@ -635,6 +635,19 @@ void MainComponent::loadKnownPlugins()
 {
     if (auto xml = juce::XmlDocument::parse (cacheFile()))
         knownPlugins.recreateFromXml (*xml);
+
+    // A plug-in that moved or was installed twice (a nested copy: Flesh808.vst3\Flesh808.vst3) leaves entries whose file is gone;
+    // a lookup by name would pick the first one and fail with "No compatible plug-in format exists". Drop them.
+    auto types = knownPlugins.getTypes();
+    bool pruned = false;
+    for (const auto& t : types)
+        if (juce::File::isAbsolutePath (t.fileOrIdentifier) && ! juce::File (t.fileOrIdentifier).exists())
+        {
+            knownPlugins.removeType (t);
+            pruned = true;
+        }
+    if (pruned)
+        saveKnownPlugins();
 }
 
 void MainComponent::saveKnownPlugins()
