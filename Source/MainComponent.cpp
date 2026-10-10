@@ -68,6 +68,19 @@ MainComponent::MainComponent()
     }
     midiFilters[trkInst2]->setMask (0);   // INST 2 / 3 get no MIDI until channels are assigned (INST 1: every channel)
     midiFilters[trkInst3]->setMask (0);
+    {
+        MixerPanel::Hooks hooks;
+        hooks.load   = [this] (int t) { loadPluginDialog (true, t); };
+        hooks.editor = [this] (int t)
+        {
+            if (t == trkInst1) toggleEditorFor (instrumentNode, currentInstrumentName, instEditorWindow);
+            else               toggleEditorFor (extra (t).node, extra (t).name, extra (t).editor);
+        };
+        hooks.remove = [this] (int t) { if (t == trkInst1) removeInstrument(); else removeExtraInstrument (t); };
+        hooks.describe = [this] (int t) { return describeTrack (t); };
+        mixerPanel = std::make_unique<MixerPanel> (strips, masterStrip, midiFilters, std::move (hooks));
+        addAndMakeVisible (*mixerPanel);
+    }
 
     player.setProcessor (&graph);
     deviceManager.addAudioCallback (&player);
@@ -134,6 +147,7 @@ MainComponent::MainComponent()
             setGpuFxEnabled (false);       // GPU FX transforms the playable file
         applyBackendForMode (currentSourceMode());
         rebuildConnections();
+        applyModePreset();
         switch (currentSourceMode())
         {
             case srcInstrument: setStatus (instrumentNode != nullptr ? "Source: VSTi -> FX"
@@ -401,11 +415,13 @@ MainComponent::MainComponent()
     }
 
     startTimerHz (10);
-    setSize (760, 880);   // flow-diagram layout: SOURCE / PROCESS / FX+OUT boxes
+    applyModePreset();
+    setSize (760, 880 + mixerHeight);   // flow-diagram layout: SOURCE / PROCESS / FX+OUT boxes
 }
 
 MainComponent::~MainComponent()
 { setLookAndFeel (nullptr);
+    mixerPanel = nullptr;
     stopTimer();
     controlServer.stop();
     midiScheduler.stop();
@@ -631,7 +647,7 @@ void MainComponent::showAudioSettings()
 }
 
 //==============================================================================
-void MainComponent::loadPluginDialog (bool asInstrument)
+void MainComponent::loadPluginDialog (bool asInstrument, int track)
 {
     auto chooser = std::make_shared<juce::FileChooser> (
         asInstrument ? "Select a VST3 instrument" : "Select a VST3 effect",
@@ -641,7 +657,7 @@ void MainComponent::loadPluginDialog (bool asInstrument)
     chooser->launchAsync (juce::FileBrowserComponent::openMode
                           | juce::FileBrowserComponent::canSelectFiles
                           | juce::FileBrowserComponent::canSelectDirectories,
-        [this, chooser, asInstrument] (const juce::FileChooser& fc)
+        [this, chooser, asInstrument, track] (const juce::FileChooser& fc)
         {
             auto file = fc.getResult();
             if (file == juce::File{}) return;
@@ -658,7 +674,7 @@ void MainComponent::loadPluginDialog (bool asInstrument)
             if (found.isEmpty())
                 setStatus ("No plugin found in " + file.getFileName());
             else
-                loadPluginFromDescription (*found.getFirst(), asInstrument);
+                loadPluginFromDescription (*found.getFirst(), asInstrument, track);
         });
 }
 
@@ -755,6 +771,7 @@ void MainComponent::setInstrumentNode (std::unique_ptr<juce::AudioPluginInstance
     applyBackendForMode (srcInstrument);
 
     rebuildConnections();
+    applyModePreset();
     instLabel.setText ("Inst: " + desc.name + "  ("
                        + juce::String (instrumentNode->getProcessor()->getTotalNumOutputChannels()) + " out)",
                        juce::dontSendNotification);
@@ -804,8 +821,29 @@ void MainComponent::removeInstrument()
     }
     currentInstrumentName = {};
     rebuildConnections();
+    applyModePreset();
     instLabel.setText ("No instrument loaded", juce::dontSendNotification);
     setStatus ("Instrument removed.");
+}
+
+void MainComponent::applyModePreset()
+{
+    const bool anyInst = instrumentNode != nullptr || extra (trkInst2).node != nullptr || extra (trkInst3).node != nullptr;
+    const bool instSounds = currentSourceMode() == srcInstrument && anyInst;
+    strips[trkAudio]->setMuted (instSounds);
+    for (int t = trkInst1; t < numTracks; ++t)
+        strips[t]->setMuted (! instSounds);
+}
+
+juce::String MainComponent::describeTrack (int index) const
+{
+    if (index == 0)
+        return currentSourceMode() == srcFile ? (filePlayer != nullptr && filePlayer->hasFile() ? "file: " + currentOriginalFile.getFileName() : juce::String ("file: (none)"))
+                                              : "live in " + juce::String (inputPairStart + 1) + "/" + juce::String (inputPairStart + 2);
+    if (index == 4)
+        return effectNode != nullptr ? "FX: " + currentEffectName : juce::String ("no FX");
+    const auto name = index == trkInst1 ? currentInstrumentName : extra (index).name;
+    return name.isNotEmpty() ? name : juce::String ("-");
 }
 
 int MainComponent::trackFromRole (const juce::String& role)
@@ -828,6 +866,7 @@ void MainComponent::setExtraInstrument (int track, std::unique_ptr<juce::AudioPl
     e.node = graph.addNode (std::move (instance));
     e.name = desc.name;
     rebuildConnections();
+    strips[track]->setMuted (false);       // a track loaded next to the others is meant to be heard
     setStatus ("Loaded " + desc.name + " into INST " + juce::String (track)
                + (midiFilters[track]->getMask() == 0 ? " (it gets no MIDI until channels are set: track_set midi_channels)" : ""));
 }
@@ -843,6 +882,7 @@ void MainComponent::removeExtraInstrument (int track)
     }
     e.name = {};
     rebuildConnections();
+    applyModePreset();
     setStatus ("INST " + juce::String (track) + " removed.");
 }
 
@@ -858,14 +898,6 @@ void MainComponent::rebuildConnections()
     //   track:   source -> strip              (AUDIO: the file player or the live input; INST 1: the VSTi, after its MIDI filter)
     //   master:  [FX insert] -> master strip -> tap -> device out
     MixGraph mix (graph, audioOutNode, Graph::UpdateKind::sync);
-
-    // The legacy source mode still decides which tracks sound (the others sit muted at their strip, connected):
-    // live / file -> AUDIO; VSTi -> INST 1 (AUDIO again when no instrument is loaded: the old fallback to the live input).
-    const bool anyInst = instrumentNode != nullptr || extra (trkInst2).node != nullptr || extra (trkInst3).node != nullptr;
-    const bool instSounds = mode == srcInstrument && anyInst;
-    strips[trkAudio]->setMuted (instSounds);
-    for (int t = trkInst1; t < numTracks; ++t)
-        strips[t]->setMuted (! instSounds);
 
     // --- master ---
     std::vector<Graph::Node::Ptr> masterChain;
@@ -894,6 +926,9 @@ void MainComponent::rebuildConnections()
         mix.connectMidi (midiFilterNode[t], inst);
         mix.addTrack ({ mix.adopt (inst, "inst", t), mix.adopt (stripNode[t], "strip", t) });
     }
+
+    if (mixerPanel != nullptr)
+        mixerPanel->refresh();     // what the strips say follows what is loaded
 }
 
 //==============================================================================
@@ -994,6 +1029,7 @@ void MainComponent::finishAudioFileLoad (std::unique_ptr<juce::AudioFormatReader
     sourceCombo.setSelectedId (srcFile, juce::dontSendNotification);
     applyBackendForMode (srcFile);
     rebuildConnections();
+    applyModePreset();
     setStatus ("Loaded " + original.getFileName() + " (source switched to file player)");
 
     // The old GPU render belongs to the previous file: play dry until the
@@ -1581,7 +1617,7 @@ void MainComponent::buildGpuPanel (const juce::var& describeResponse)
 
     // The panel lives in a viewport capped at 340 px: five modules of chain
     // outgrow any window, so the chain scrolls instead of the app growing.
-    setSize (680, juce::jmax (846, 690 + juce::jmin (340, gpuPanelContentHeight())));
+    setSize (680, mixerHeight + juce::jmax (846, 690 + juce::jmin (340, gpuPanelContentHeight())));
 }
 
 int MainComponent::gpuPanelContentHeight() const
@@ -1914,7 +1950,8 @@ void MainComponent::paint (juce::Graphics& g)
                        cOut (0xff5fe08a);
     drawStageBox (g, boxSource,  "SOURCE  (switchable)",         cSrc);
     drawStageBox (g, boxProcess, "PROCESS  (offline render chain)", cProc);
-    drawStageBox (g, boxFx,      "FX  VST3",                     cFx);
+    drawStageBox (g, boxMixer,   "MIXER  (tracks -> master)",    juce::Colour (0xff5fe0d0));
+    drawStageBox (g, boxFx,      "MASTER FX  VST3",              cFx);
 
     // OUT terminal
     if (! boxOut.isEmpty())
@@ -1938,9 +1975,12 @@ void MainComponent::paint (juce::Graphics& g)
     if (! boxSource.isEmpty() && ! boxProcess.isEmpty())
         drawFlowArrow (g, { boxSource.getCentreX(), boxSource.getBottom() },
                           { boxProcess.getCentreX(), boxProcess.getY() }, cSrc.withAlpha (0.8f));
-    if (! boxProcess.isEmpty() && ! boxFx.isEmpty())
+    if (! boxProcess.isEmpty() && ! boxMixer.isEmpty())
         drawFlowArrow (g, { boxProcess.getCentreX(), boxProcess.getBottom() },
-                          { boxProcess.getCentreX(), boxFx.getY() }, cProc.withAlpha (0.8f));
+                          { boxProcess.getCentreX(), boxMixer.getY() }, cProc.withAlpha (0.8f));
+    if (! boxMixer.isEmpty() && ! boxFx.isEmpty())
+        drawFlowArrow (g, { boxMixer.getCentreX(), boxMixer.getBottom() },
+                          { boxMixer.getCentreX(), boxFx.getY() }, juce::Colour (0xff5fe0d0).withAlpha (0.8f));
     if (! boxFx.isEmpty() && ! boxOut.isEmpty())
         drawFlowArrow (g, { boxFx.getRight(), boxFx.getCentreY() },
                           { boxOut.getX(), boxOut.getCentreY() }, cFx.withAlpha (0.8f));
@@ -2039,6 +2079,12 @@ void MainComponent::resized()
             r.removeFromLeft (10); pluginLabel.setBounds (r);
         }
     }
+    full.removeFromBottom (arrow);
+
+    // ===== MIXER box (tracks -> master), above the FX box (the master insert) =====
+    boxMixer = full.removeFromBottom (mixerHeight);
+    if (mixerPanel != nullptr)
+        mixerPanel->setBounds (boxMixer.reduced (12).withTrimmedTop (pad - 12));
     full.removeFromBottom (arrow);
 
     // ===== PROCESS box (fills the middle: PRE-RENDER + GPU chain) =============

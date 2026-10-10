@@ -10,6 +10,7 @@
 #include "MpeSupport.h"
 #include "OutputTap.h"
 #include "MixStrips.h"
+#include "MixerPanel.h"
 #include "RigWorkerClient.h"
 #include "ControlServer.h"
 
@@ -45,7 +46,7 @@ private:
 
     //== actions ==
     void showAudioSettings();
-    void loadPluginDialog (bool asInstrument);
+    void loadPluginDialog (bool asInstrument, int track = 1);
     void loadPluginFromDescription (const juce::PluginDescription&, bool asInstrument, int track = 1);
     void setEffectNode (std::unique_ptr<juce::AudioPluginInstance>, const juce::PluginDescription&);
     void setInstrumentNode (std::unique_ptr<juce::AudioPluginInstance>, const juce::PluginDescription&);
@@ -60,6 +61,11 @@ private:
     static int trackIndexOf (const juce::String&);
     juce::var trackInfo (int track) const;                 // -1 = master
     void rebuildConnections();
+    // The legacy source mode as a preset for the strips: live / file -> AUDIO sounds; VSTi -> the instruments sound
+    // (AUDIO again when none is loaded). Applied when the mode or what is loaded changes, not on every rebuild: the
+    // mute buttons are the user's in between.
+    void applyModePreset();
+    juce::String describeTrack (int index) const;       // 0 AUDIO, 1..3 INST, 4 MASTER: what the mixer shows under the name
     void refreshMidiOutList();
     void refreshRecentList();
     void openMidiOut (const juce::String& identifier);
@@ -304,7 +310,9 @@ private:
 
     //== signal-flow diagram layout ==
     // paint() draws titled stage boxes + connecting arrows; resized() fills them.
-    juce::Rectangle<int> boxSource, boxProcess, boxFx, boxOut;
+    juce::Rectangle<int> boxSource, boxProcess, boxMixer, boxFx, boxOut;
+    static constexpr int mixerHeight = 214;
+    std::unique_ptr<MixerPanel> mixerPanel;
     void drawStageBox (juce::Graphics&, juce::Rectangle<int>, const juce::String& title,
                        juce::Colour accent) const;
     void drawFlowArrow (juce::Graphics&, juce::Point<int> from, juce::Point<int> to,

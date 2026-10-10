@@ -270,6 +270,7 @@ juce::var MainComponent::handleControl (const juce::var& req)
             if (t < trkInst1) return fail ("midi_channels applies to inst1, inst2 and inst3");
             midiFilters[t]->setMask (maskFromChannels (req["midi_channels"]));
         }
+        if (mixerPanel != nullptr) mixerPanel->refresh();
         return trackInfo (t);
     }
     if (cmd == "track_status")
