@@ -85,17 +85,50 @@ MainComponent::MainComponent()
     loadTracks();
     {
         MixerPanel::Hooks hooks;
-        hooks.load   = [this] (int t) { loadPluginDialog (true, t); };
-        hooks.editor = [this] (int t)
+        // a slot id from the panel's (index, insert): the insert of a track, the FX of a send bus, or (INST) the instrument itself
+        auto slotOf = [] (int index, bool insert)
         {
-            if (t == trkInst1) toggleEditorFor (instrumentNode, currentInstrumentName, instEditorWindow);
-            else               toggleEditorFor (extra (t).node, extra (t).name, extra (t).editor);
+            if (insert)                          return (int) slotInsertBase + index;
+            if (index >= MixerPanel::firstBus)   return (int) slotBusBase + index - MixerPanel::firstBus;
+            return -1;
         };
-        hooks.remove = [this] (int t) { if (t == trkInst1) removeInstrument(); else removeExtraInstrument (t); };
-        hooks.describe = [this] (int t) { return describeTrack (t); };
+        hooks.load = [this, slotOf] (int i, bool insert)
+        {
+            if (const int slot = slotOf (i, insert); slot >= 0) loadPluginDialog (false, slot);
+            else                                                 loadPluginDialog (true, i);
+        };
+        hooks.editor = [this, slotOf] (int i, bool insert)
+        {
+            if (const int slot = slotOf (i, insert); slot >= 0)   toggleEditorFor (fxSlot (slot).node, fxSlot (slot).name, fxSlot (slot).editor);
+            else if (i == trkInst1)                               toggleEditorFor (instrumentNode, currentInstrumentName, instEditorWindow);
+            else                                                  toggleEditorFor (extra (i).node, extra (i).name, extra (i).editor);
+        };
+        hooks.remove = [this, slotOf] (int i, bool insert)
+        {
+            if (const int slot = slotOf (i, insert); slot >= 0)   removeSlotEffect (slot);
+            else if (i == trkInst1)                               removeInstrument();
+            else                                                  removeExtraInstrument (i);
+        };
+        hooks.describe = [this] (int i, bool insert) { return describeTrack (i, insert); };
         hooks.soloChanged = [this] { updateSolo(); };
-        hooks.stripChanged = [this] (int t) { markMixChanged (t == MixerPanel::masterIndex ? -1 : t); };
-        mixerPanel = std::make_unique<MixerPanel> (strips, masterStrip, midiFilters, std::move (hooks));
+        hooks.stripChanged = [this] (int i)
+        {
+            if (i < numTracks)                            markMixChanged (i);
+            else if (i == MixerPanel::masterIndex)        markMixChanged (-1);
+        };
+
+        MixerPanel::Wiring wire;
+        for (int t = 0; t < numTracks; ++t)
+        {
+            wire.strip[t] = strips[t];
+            wire.filter[t] = midiFilters[t];
+            for (int n = 0; n < 2; ++n)
+                wire.send[t][n] = sendLevel[t][n];
+        }
+        wire.strip[MixerPanel::firstBus] = busReturn[0];
+        wire.strip[MixerPanel::firstBus + 1] = busReturn[1];
+        wire.strip[MixerPanel::masterIndex] = masterStrip;
+        mixerPanel = std::make_unique<MixerPanel> (wire, std::move (hooks));
         addAndMakeVisible (*mixerPanel);
     }
 
@@ -433,7 +466,7 @@ MainComponent::MainComponent()
 
     startTimerHz (10);
     applyModePreset();
-    setSize (760, 880 + mixerHeight);   // flow-diagram layout: SOURCE / PROCESS / FX+OUT boxes
+    setSize (960, 880 + mixerHeight);   // flow-diagram layout: SOURCE / PROCESS / FX+OUT boxes
 }
 
 MainComponent::~MainComponent()
@@ -950,12 +983,19 @@ void MainComponent::markMixChanged (int track)
     }
 }
 
-juce::String MainComponent::describeTrack (int index) const
+juce::String MainComponent::describeTrack (int index, bool insert) const
 {
+    if (insert)
+        return index >= 0 && index < numTracks ? insertSlot[index].name : juce::String();
     if (index == 0)
         return currentSourceMode() == srcFile ? (filePlayer != nullptr && filePlayer->hasFile() ? "file: " + currentOriginalFile.getFileName() + (preRenderActive() ? " (baked)" : "") : juce::String ("file: (none)"))
                                               : "live in " + juce::String (inputPairStart + 1) + "/" + juce::String (inputPairStart + 2);
-    if (index == 4)
+    if (index >= MixerPanel::firstBus && index < MixerPanel::masterIndex)
+    {
+        const auto& name = busSlot[index - MixerPanel::firstBus].name;
+        return name.isNotEmpty() ? name : juce::String ("-");
+    }
+    if (index == MixerPanel::masterIndex)
         return preRenderActive() ? juce::String ("baked into the cache")
                                  : effectNode != nullptr ? "FX: " + currentEffectName : juce::String ("no FX");
     const auto name = index == trkInst1 ? currentInstrumentName : extra (index).name;
@@ -1845,7 +1885,7 @@ void MainComponent::buildGpuPanel (const juce::var& describeResponse)
 
     // The panel lives in a viewport capped at 340 px: five modules of chain
     // outgrow any window, so the chain scrolls instead of the app growing.
-    setSize (680, mixerHeight + juce::jmax (846, 690 + juce::jmin (340, gpuPanelContentHeight())));
+    setSize (960, mixerHeight + juce::jmax (846, 690 + juce::jmin (340, gpuPanelContentHeight())));
 }
 
 int MainComponent::gpuPanelContentHeight() const

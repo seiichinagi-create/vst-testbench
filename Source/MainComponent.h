@@ -69,7 +69,9 @@ private:
     // A strip, a MIDI channel mask or a plug-in of a track changed: the pre-render cache (AUDIO strip, master) and the MIDI
     // bounce (INST tracks) are stale. track: 0 AUDIO, 1..3 INST, 4 / -1 master.
     void markMixChanged (int track);
-    juce::String describeTrack (int index) const;       // 0 AUDIO, 1..3 INST, 4 MASTER: what the mixer shows under the name
+    // What the mixer shows under a strip name (insert = false) or in its insert slot (insert = true).
+    // index: 0 AUDIO, 1..3 INST, 4..5 SEND 1-2, 6 MASTER (the mixer panel's numbering).
+    juce::String describeTrack (int index, bool insert = false) const;
     void refreshMidiOutList();
     void refreshRecentList();
     void openMidiOut (const juce::String& identifier);
@@ -347,7 +349,7 @@ private:
     //== signal-flow diagram layout ==
     // paint() draws titled stage boxes + connecting arrows; resized() fills them.
     juce::Rectangle<int> boxSource, boxProcess, boxMixer, boxFx, boxOut;
-    static constexpr int mixerHeight = 214;
+    static constexpr int mixerHeight = 300;
     std::unique_ptr<MixerPanel> mixerPanel;
     void drawStageBox (juce::Graphics&, juce::Rectangle<int>, const juce::String& title,
                        juce::Colour accent) const;
