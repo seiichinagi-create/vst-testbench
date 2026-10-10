@@ -4,6 +4,7 @@
 #include <atomic>
 #include <algorithm>
 #include <functional>
+#include "MixGraph.h"
 
 //==============================================================================
 // Fixed-topology test rig, rendered offline and headless:
@@ -480,42 +481,15 @@ private:
         graph.setPlayConfigDetails (0, 2, sr, block);
         graph.setNonRealtime (true);
 
-        auto outNode = graph.addNode (std::make_unique<Graph::AudioGraphIOProcessor> (Graph::AudioGraphIOProcessor::audioOutputNode), {}, none);
-
-        struct Placed { Graph::Node::Ptr node; juce::String role; int track; };   // track -1 = master
-        std::vector<Placed> placed;
-        auto place = [&] (Stage& st, int track)
-        {
-            st.plugin->enableAllBuses();
-            st.plugin->setNonRealtime (true);
-            st.plugin->setPlayConfigDetails (st.plugin->getTotalNumInputChannels(),
-                                             st.plugin->getTotalNumOutputChannels(), sr, block);
-            auto node = graph.addNode (std::move (st.plugin), {}, none);
-            placed.push_back ({ node, st.role, track });
-            return node;
-        };
-        // audio from `from` into `to` (to == null: the output node)
-        auto connect = [&] (Graph::Node::Ptr from, Graph::Node::Ptr to)
-        {
-            const int outs = from->getProcessor()->getTotalNumOutputChannels();
-            const auto dest = to != nullptr ? to : outNode;
-            const int ins = to != nullptr ? to->getProcessor()->getTotalNumInputChannels() : 2;
-            for (int ch = 0; ch < juce::jmin (2, outs, ins); ++ch)
-                graph.addConnection ({ { from->nodeID, ch }, { dest->nodeID, ch } }, none);
-            if (outs == 1 && ins >= 2)       // mono into stereo: feed both sides
-                graph.addConnection ({ { from->nodeID, 0 }, { dest->nodeID, 1 } }, none);
-        };
+        // The topology (placing, wiring, summing at the master) is MixGraph's: the live bench builds the same graph.
+        MixGraph mix (graph, sr, block, /*nonRealtime*/ true);
+        const auto& placed = mix.placed();
 
         std::vector<Graph::Node::Ptr> masterNodes;
         for (auto& st : spec.master)
-            masterNodes.push_back (place (st, -1));
-        const Graph::Node::Ptr masterIn = masterNodes.empty() ? Graph::Node::Ptr() : masterNodes.front();
-        for (size_t i = 0; i + 1 < masterNodes.size(); ++i)
-            connect (masterNodes[i], masterNodes[i + 1]);
-        if (! masterNodes.empty())
-            connect (masterNodes.back(), nullptr);
+            masterNodes.push_back (mix.place (std::move (st.plugin), st.role, -1));
+        mix.setMaster (masterNodes);
 
-        std::vector<int> trackLatency (spec.tracks.size(), 0);
         Graph::Node::Ptr firstSource;
         bool firstTrackHasMore = false;
         for (size_t ti = 0; ti < spec.tracks.size(); ++ti)
@@ -523,24 +497,18 @@ private:
             auto& tr = spec.tracks[ti];
             std::vector<Graph::Node::Ptr> chain;
             for (auto& st : tr.stages)
-                chain.push_back (place (st, (int) ti));
+                chain.push_back (mix.place (std::move (st.plugin), st.role, (int) ti));
 
             const bool midiTrack = tr.impulseAt < 0 && tr.sourceSamples < 0;
             if (midiTrack)
-            {
-                auto feeder = graph.addNode (std::make_unique<MidiFeeder> (tr.sequence, sr), {}, none);
-                graph.addConnection ({ { feeder->nodeID, Graph::midiChannelIndex },
-                                       { chain[0]->nodeID, Graph::midiChannelIndex } }, none);
-            }
-            for (size_t i = 0; i + 1 < chain.size(); ++i)
-                connect (chain[i], chain[i + 1]);
-            connect (chain.back(), masterIn);        // summed with the other tracks at the master's input (or the output)
+                mix.connectMidi (mix.addNode (std::make_unique<MidiFeeder> (tr.sequence, sr)), chain[0]);
+            mix.addTrack (chain);        // in series, the last one summed with the other tracks at the master's input (or the output)
 
             if (ti == 0) { firstSource = chain[0]; firstTrackHasMore = chain.size() > 1 || ! masterNodes.empty(); }
         }
 
         if (spec.dryParallel && firstSource != nullptr && firstTrackHasMore)
-            connect (firstSource, nullptr);
+            mix.connect (firstSource, nullptr);
 
         // The graph builds its delay compensation inside prepareToPlay from the latencies the plugins declare
         // THEN. A plugin that declares late (Legacy Distortion, after an async capture load) can leave the graph
@@ -548,17 +516,8 @@ private:
         // any error. So: settle, compare the graph's total with what the declared latencies add up to (the
         // longest track plus the master), and if they differ drop the sequence (releaseResources) and prepare
         // again. Never render on a mismatch.
-        auto declaredTotal = [&] ()
-        {
-            std::fill (trackLatency.begin(), trackLatency.end(), 0);
-            int masterLat = 0;
-            for (auto& p : placed)
-            {
-                const int l = p.node->getProcessor()->getLatencySamples();
-                if (p.track < 0) masterLat += l; else trackLatency[(size_t) p.track] += l;
-            }
-            return *std::max_element (trackLatency.begin(), trackLatency.end()) + masterLat;
-        };
+        std::vector<int> trackLatency;
+        auto declaredTotal = [&] () { return mix.declaredLatency (trackLatency); };
         int graphLatency = 0, declaredSum = 0, attempts = 0;
         for (; attempts < 5; ++attempts)
         {
