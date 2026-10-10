@@ -86,6 +86,8 @@ juce::var MainComponent::trackInfo (int t) const
     put (o, "balance", (double) strip->getBalance());
     put (o, "mute", strip->isMuted());
     if (t >= 0) put (o, "solo", strip->isSolo());
+    if (t >= 0) put (o, "silenced_by_mode", strip->isModeSilenced());
+    put (o, "sounding", t < 0 ? ! strip->isMuted() : strip->isSounding());
     if (t == trkAudio)
         put (o, "source", currentSourceMode() == srcFile ? "file" : "live");
     if (t >= trkInst1)
@@ -136,7 +138,7 @@ juce::var MainComponent::controlStatus() const
     put (o, "source", mode == srcLive ? "live" : mode == srcInstrument ? "inst" : "file");
     put (o, "status_text", statusLabel.getText());
 
-    const bool busy = pendingLoads > 0 || bounceEngine.isBouncing() || rigWorker.isRunning() || araProbePending || offlineInstLoading || offlineFxLoading
+    const bool busy = pendingLoads > 0 || bounceRunning() || rigWorker.isRunning() || araProbePending || offlineInstLoading || offlineFxLoading
                       || firstBouncePending || (preRenderActive() && renderEngine.isRendering())
                       || (preRenderActive() && fxStale.load());
     put (o, "busy", busy);
@@ -171,7 +173,7 @@ juce::var MainComponent::controlStatus() const
         auto m = makeObj();
         put (m, "file", currentMidiFile.getFullPathName());
         put (m, "chain_active", midiChainActive());
-        put (m, "bouncing", bounceEngine.isBouncing());
+        put (m, "bouncing", bounceRunning());
         put (m, "bounce_progress", (double) bounceEngine.progress.load());
         put (m, "status", midiStatusLabel.getText());
         put (m, "analysis", mpeNote);
@@ -279,6 +281,7 @@ juce::var MainComponent::handleControl (const juce::var& req)
         }
         if (mixerPanel != nullptr) mixerPanel->refresh();
         saveTracks();
+        markMixChanged (t);
         return trackInfo (t);
     }
     if (cmd == "track_status")
@@ -1058,8 +1061,13 @@ juce::var MainComponent::startRigRender (const juce::var& req)
     rigResult = juce::var();
     rigWorker.onDone = [safe = juce::Component::SafePointer<MainComponent> (this)] (juce::var r)
     {
-        if (safe != nullptr)
-            safe->rigResult = std::move (r);
+        if (safe == nullptr)
+            return;
+        safe->rigResult = r;
+        auto done = std::move (safe->rigExtraDone);     // a caller that wants to act on the result (the MIDI bounce)
+        safe->rigExtraDone = nullptr;
+        if (done)
+            done (r);
     };
     if (! rigWorker.start (job, num (req, "timeout", 600.0), appDir(), error)) return fail (error);
 
@@ -1104,11 +1112,10 @@ namespace
     }
 }
 
-juce::var MainComponent::startRenderMix (const juce::var& req)
+juce::var MainComponent::buildMixRequest (const MixOptions& opt, const juce::var& req, juce::StringArray& left)
 {
     auto rq = makeObj();
     juce::Array<juce::var> tracks;
-    juce::StringArray left;       // what was not rendered, and why
     const auto dir = appDir();
 
     auto saveState = [&dir] (juce::AudioProcessor& p, const juce::String& name)
@@ -1120,10 +1127,11 @@ juce::var MainComponent::startRenderMix (const juce::var& req)
         return f.getFullPathName();
     };
 
-    // --- AUDIO: the file in the player ---
-    if (strips[trkAudio]->isAudible())
+    // --- AUDIO: the file in the player (not when it is itself the bounce of the MIDI file: the instruments are rendered directly) ---
+    if (opt.audio && strips[trkAudio]->isAudible())
     {
-        if (currentSourceMode() != srcFile)         left.add ("AUDIO (the live input is not a file)");
+        if (midiChainActive())                      left.add ("AUDIO (it is the bounce of the MIDI file: the instruments are rendered directly)");
+        else if (currentSourceMode() != srcFile)    left.add ("AUDIO (the live input is not a file)");
         else if (! filePlayer->hasFile())           left.add ("AUDIO (no file loaded)");
         else
         {
@@ -1137,16 +1145,14 @@ juce::var MainComponent::startRenderMix (const juce::var& req)
     }
 
     // --- INST 1..3: the loaded MIDI file through the instrument, on the channels the track listens to ---
-    for (int tr = trkInst1; tr < numTracks; ++tr)
+    for (int tr = trkInst1; opt.insts && tr < numTracks; ++tr)
     {
         const auto inst = tr == trkInst1 ? instrumentNode : extra (tr).node;
         if (inst == nullptr || ! strips[tr]->isAudible())
             continue;
         const auto name = "INST " + juce::String (tr);
         if (midiSequence.getNumEvents() == 0)       { left.add (name + " (no MIDI file loaded)"); continue; }
-        juce::String note;
-        const auto seq = prepareMidiForInstrument (midiSequence, note);
-        const auto events = eventsFromSequence (seq, midiFilters[tr]->getMask());
+        const auto events = eventsFromSequence (midiSequence, midiFilters[tr]->getMask());   // midiSequence is already prepared (MPE, TOP-BEND)
         if (events.getArray() == nullptr || events.getArray()->isEmpty())
             { left.add (name + " (no MIDI on its channels)"); continue; }
 
@@ -1159,20 +1165,19 @@ juce::var MainComponent::startRenderMix (const juce::var& req)
         put (t, "balance", (double) strips[tr]->getBalance());
         tracks.add (t);
     }
-
-    if (tracks.isEmpty())
-        return fail ("nothing to render: no sounding track with a file (AUDIO) or a loaded MIDI file (INST)"
-                     + (left.isEmpty() ? juce::String() : " - left out: " + left.joinIntoString ("; ")));
     put (rq, "tracks", tracks);
 
     // --- MASTER: the FX insert (unless bypassed) and the master strip ---
-    if (effectNode != nullptr && ! bypassButton.getToggleState())
+    if (opt.master)
     {
-        put (rq, "master", currentEffectName);
-        put (rq, "master_state", saveState (*effectNode->getProcessor(), "master"));
+        if (effectNode != nullptr && ! bypassButton.getToggleState())
+        {
+            put (rq, "master", currentEffectName);
+            put (rq, "master_state", saveState (*effectNode->getProcessor(), "master"));
+        }
+        put (rq, "master_gain_db", (double) masterStrip->getGainDb());
+        put (rq, "master_balance", (double) masterStrip->getBalance());
     }
-    put (rq, "master_gain_db", (double) masterStrip->getGainDb());
-    put (rq, "master_balance", (double) masterStrip->getBalance());
 
     const auto setup = deviceManager.getAudioDeviceSetup();
     put (rq, "rate", req.hasProperty ("rate") ? req["rate"] : juce::var (setup.sampleRate > 0 ? setup.sampleRate : 48000.0));
@@ -1181,12 +1186,91 @@ juce::var MainComponent::startRenderMix (const juce::var& req)
     put (rq, "compensate", flag (req, "compensate", true));
     put (rq, "out", str (req, "out", "mix.wav"));
     if (req.hasProperty ("timeout")) put (rq, "timeout", req["timeout"]);
+    return rq;
+}
+
+juce::var MainComponent::startRenderMix (const juce::var& req)
+{
+    juce::StringArray left;
+    auto rq = buildMixRequest ({}, req, left);
+    if (rq["tracks"].getArray() == nullptr || rq["tracks"].getArray()->isEmpty())
+        return fail ("nothing to render: no sounding track with a file (AUDIO) or a loaded MIDI file (INST)"
+                     + (left.isEmpty() ? juce::String() : " - left out: " + left.joinIntoString ("; ")));
 
     auto r = startRigRender (rq);
     if (auto* o = r.getDynamicObject())
         if (! left.isEmpty())
             o->setProperty ("left_out", left.joinIntoString ("; "));
     return r;
+}
+
+// Is a bounce by the in-process engine (one instrument, every channel: fast, the same audio) not enough?
+// INST 2 / 3 with MIDI on their channels, or INST 1 listening to only some channels, need the rig.
+bool MainComponent::instrumentsNeedRig() const
+{
+    auto hasEvents = [this] (int t)
+    {
+        const auto mask = midiFilters[t]->getMask();
+        for (int i = 0; i < midiSequence.getNumEvents(); ++i)
+        {
+            const int ch = midiSequence.getEventPointer (i)->message.getChannel();
+            if (ch >= 1 && (mask & (1u << (ch - 1))) != 0)
+                return true;
+        }
+        return false;
+    };
+    for (int t = trkInst2; t < numTracks; ++t)
+        if (extra (t).node != nullptr && hasEvents (t))
+            return true;
+    return instrumentNode != nullptr && midiFilters[trkInst1]->getMask() != 0xFFFFu;
+}
+
+bool MainComponent::startMidiMixBounce()
+{
+    ++bounceGeneration;
+    const auto out = appDir().getChildFile (juce::String::formatted ("midi_bounce_%04d.wav", bounceGeneration));
+    auto o = makeObj();
+    put (o, "out", out.getFullPathName());
+    put (o, "tail", 4.0);          // the ring-out the in-process bounce gives
+    put (o, "compensate", true);
+
+    juce::StringArray left;
+    auto rq = buildMixRequest ({ false, true, false }, o, left);     // the instruments only: AUDIO and the master FX stay live
+    if (rq["tracks"].getArray() == nullptr || rq["tracks"].getArray()->isEmpty())
+    {
+        firstBouncePending = false;
+        midiStatusLabel.setText ("MIDI: no instrument track has MIDI on its channels", juce::dontSendNotification);
+        setStatus ("No instrument track listens to a channel the MIDI file uses (set the channels in the strips).");
+        return false;
+    }
+
+    const auto r = startRigRender (rq);
+    if (r.hasProperty ("error"))                    // fail() answers with an "error"
+    {
+        firstBouncePending = false;
+        midiStatusLabel.setText ("MIDI: rig bounce did not start: " + r["error"].toString(), juce::dontSendNotification);
+        return false;
+    }
+
+    multiBounceRunning = true;
+    const double t0 = juce::Time::getMillisecondCounterHiRes();
+    rigExtraDone = [safe = juce::Component::SafePointer<MainComponent> (this), out, t0] (const juce::var& result)
+    {
+        if (safe == nullptr)
+            return;
+        safe->multiBounceRunning = false;
+        const bool ok = (bool) result.getProperty ("ok", false);
+        juce::String info = result["error"].toString();
+        if (ok)
+        {
+            const double seconds = (double) result.getProperty ("samples", 0) / juce::jmax (1.0, (double) result.getProperty ("sample_rate", 48000.0));
+            const double elapsed = (juce::Time::getMillisecondCounterHiRes() - t0) / 1000.0;
+            info = juce::String::formatted ("rig, %.1fx realtime", elapsed > 0.01 ? seconds / elapsed : 0.0);
+        }
+        safe->handleBounceDone (ok, out, info);
+    };
+    midiStatusLabel.setText ("MIDI: bouncing the instrument tracks (rig) ...", juce::dontSendNotification);
+    return true;
 }
 
 //==============================================================================

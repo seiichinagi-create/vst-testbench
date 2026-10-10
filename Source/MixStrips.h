@@ -26,7 +26,12 @@ public:
     float getGainDb() const         { return gainDb.load(); }
     float getBalance() const        { return balance.load(); }
     bool  isMuted() const           { return muted.load(); }
+    // The user's mix: not muted by the M button, not silenced by another track's solo. What a render or a bounce takes.
     bool  isAudible() const         { return ! muted.load() && ! soloSilenced.load(); }
+    // The source-mode preset (live / file: AUDIO; VSTi: the instruments) silences the other tracks in the live graph only.
+    void  setModeSilenced (bool b)  { modeSilenced.store (b); }
+    bool  isModeSilenced() const    { return modeSilenced.load(); }
+    bool  isSounding() const        { return isAudible() && ! modeSilenced.load(); }
     // Solo: the mixer sets `soloSilenced` on every track that is not soloed while any track is (MainComponent::updateSolo).
     void  setSolo (bool b)          { solo.store (b); }
     bool  isSolo() const            { return solo.load(); }
@@ -53,7 +58,7 @@ public:
         const int n = buffer.getNumSamples();
         const int chans = buffer.getNumChannels();
         float tl, tr;
-        gains (gainDb.load(), balance.load(), muted.load() || soloSilenced.load(), tl, tr);
+        gains (gainDb.load(), balance.load(), muted.load() || soloSilenced.load() || modeSilenced.load(), tl, tr);
         if (first) { lastL = tl; lastR = tr; first = false; }
 
         const float targets[2] = { tl, tr };
@@ -101,7 +106,7 @@ public:
 
 private:
     std::atomic<float> gainDb { 0.0f }, balance { 0.0f }, peakL { 0.0f }, peakR { 0.0f };
-    std::atomic<bool> muted { false }, solo { false }, soloSilenced { false };
+    std::atomic<bool> muted { false }, solo { false }, soloSilenced { false }, modeSilenced { false };
     float lastL = 1.0f, lastR = 1.0f;   // audio thread only
     bool first = true;
 

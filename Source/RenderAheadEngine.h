@@ -120,6 +120,13 @@ public:
         startThread (juce::Thread::Priority::low);
     }
 
+    // The mixer strips the cache has to include (docs/TRACKS.md): the AUDIO strip acts on the file before the FX, the master
+    // strip on the FX output. Linear gains per side (TrackStrip::gains); 1 = untouched. Call before startRender.
+    void setStripGains (float audioL, float audioR, float masterL, float masterR)
+    {
+        preL = audioL; preR = audioR; postL = masterL; postR = masterR;
+    }
+
     void stopRender()            { stopThread (5000); }
     bool isRendering() const     { return isThreadRunning(); }
 
@@ -156,6 +163,8 @@ private:
             {
                 reader.read (&buf, 0, toRead, readPos, true, true);
                 readPos += toRead;
+                if (preL != 1.0f)                           buf.applyGain (0, 0, toRead, preL);
+                if (preR != 1.0f && buf.getNumChannels() > 1) buf.applyGain (1, 0, toRead, preR);
             }
             else if (fx == nullptr)
                 break;   // dry copy: nothing left to read
@@ -177,6 +186,8 @@ private:
             const int w = (int) juce::jmin ((juce::int64) produced, writeEnd - written);
             if (w > 0)
             {
+                if (postL != 1.0f)                              buf.applyGain (0, start, w, postL);
+                if (postR != 1.0f && buf.getNumChannels() > 1)  buf.applyGain (1, start, w, postR);
                 for (int ch = 0; ch < 2; ++ch)
                     cache->data.copyFrom (ch, (int) written, buf,
                                           juce::jmin (ch, buf.getNumChannels() - 1), start, w);
@@ -273,6 +284,7 @@ private:
     RenderCache* cache = nullptr;
     juce::int64 cursor = 0;
     juce::int64 quickWindow = 0;
+    float preL = 1.0f, preR = 1.0f, postL = 1.0f, postR = 1.0f;   // strip gains (setStripGains)
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (RenderAheadEngine)
 };

@@ -80,6 +80,7 @@ MainComponent::MainComponent()
         hooks.remove = [this] (int t) { if (t == trkInst1) removeInstrument(); else removeExtraInstrument (t); };
         hooks.describe = [this] (int t) { return describeTrack (t); };
         hooks.soloChanged = [this] { updateSolo(); };
+        hooks.stripChanged = [this] (int t) { markMixChanged (t == MixerPanel::masterIndex ? -1 : t); };
         mixerPanel = std::make_unique<MixerPanel> (strips, masterStrip, midiFilters, std::move (hooks));
         addAndMakeVisible (*mixerPanel);
     }
@@ -439,7 +440,7 @@ MainComponent::~MainComponent()
         instrumentNode->getProcessor()->removeListener (this);
     editorWindow = nullptr;
     instEditorWindow = nullptr;
-    for (auto& e : extraInst) e.editor = nullptr;
+    for (auto& e : extraInst) { e.editor = nullptr; if (e.node != nullptr) e.node->getProcessor()->removeListener (this); }
     deviceManager.removeMidiInputDeviceCallback ({}, this);
     deviceManager.removeMidiInputDeviceCallback ({}, &player);
     midiRecorder.closeAndSave();   // an open take survives app close
@@ -886,18 +887,34 @@ void MainComponent::applyModePreset()
 {
     const bool anyInst = instrumentNode != nullptr || extra (trkInst2).node != nullptr || extra (trkInst3).node != nullptr;
     const bool instSounds = currentSourceMode() == srcInstrument && anyInst;
-    strips[trkAudio]->setMuted (instSounds);
+    strips[trkAudio]->setModeSilenced (instSounds);
     for (int t = trkInst1; t < numTracks; ++t)
-        strips[t]->setMuted (! instSounds);
+        strips[t]->setModeSilenced (! instSounds);
+}
+
+void MainComponent::markMixChanged (int track)
+{
+    const auto now = juce::Time::getMillisecondCounter();
+    if (track <= trkAudio || track >= numTracks)       // AUDIO and the master are baked into the pre-render cache
+    {
+        fxStale = true;
+        lastParamChangeMs = now;
+    }
+    if (track >= trkInst1 && track < numTracks)        // an instrument track is baked into the MIDI bounce
+    {
+        instStale = true;
+        lastInstChangeMs = now;
+    }
 }
 
 juce::String MainComponent::describeTrack (int index) const
 {
     if (index == 0)
-        return currentSourceMode() == srcFile ? (filePlayer != nullptr && filePlayer->hasFile() ? "file: " + currentOriginalFile.getFileName() : juce::String ("file: (none)"))
+        return currentSourceMode() == srcFile ? (filePlayer != nullptr && filePlayer->hasFile() ? "file: " + currentOriginalFile.getFileName() + (preRenderActive() ? " (baked)" : "") : juce::String ("file: (none)"))
                                               : "live in " + juce::String (inputPairStart + 1) + "/" + juce::String (inputPairStart + 2);
     if (index == 4)
-        return effectNode != nullptr ? "FX: " + currentEffectName : juce::String ("no FX");
+        return preRenderActive() ? juce::String ("baked into the cache")
+                                 : effectNode != nullptr ? "FX: " + currentEffectName : juce::String ("no FX");
     const auto name = index == trkInst1 ? currentInstrumentName : extra (index).name;
     return name.isNotEmpty() ? name : juce::String ("-");
 }
@@ -916,13 +933,18 @@ void MainComponent::setExtraInstrument (int track, std::unique_ptr<juce::AudioPl
     auto& e = extra (track);
     e.editor = nullptr;
     if (e.node != nullptr)
+    {
+        e.node->getProcessor()->removeListener (this);
         graph.removeNode (e.node->nodeID);
+    }
 
     configureInstance (*instance, deviceManager);
     e.node = graph.addNode (std::move (instance));
     e.name = desc.name;
+    e.node->getProcessor()->addListener (this);          // knob changes re-bounce the MIDI chain, like INST 1
+    extraProc[track - trkInst2] = e.node->getProcessor();
     rebuildConnections();
-    strips[track]->setMuted (false);       // a track loaded next to the others is meant to be heard
+    strips[track]->setModeSilenced (false);   // a track loaded next to the others is meant to be heard
     setStatus ("Loaded " + desc.name + " into INST " + juce::String (track)
                + (midiFilters[track]->getMask() == 0 ? " (it gets no MIDI until channels are set: track_set midi_channels)" : ""));
 }
@@ -931,8 +953,10 @@ void MainComponent::removeExtraInstrument (int track)
 {
     auto& e = extra (track);
     e.editor = nullptr;
+    extraProc[track - trkInst2] = nullptr;
     if (e.node != nullptr)
     {
+        e.node->getProcessor()->removeListener (this);
         graph.removeNode (e.node->nodeID);
         e.node = nullptr;
     }
@@ -955,22 +979,32 @@ void MainComponent::rebuildConnections()
     //   master:  [FX insert] -> master strip -> tap -> device out
     MixGraph mix (graph, audioOutNode, Graph::UpdateKind::sync);
 
+    // While the PRE-RENDER cache plays, it already holds the AUDIO strip, the master FX and the master strip: none of them is in the
+    // live path (docs/TRACKS.md).
+    const bool baked = preRenderActive();
+
     // --- master ---
     std::vector<Graph::Node::Ptr> masterChain;
-    if (effectNode != nullptr && ! preRenderActive())     // pre-render: the FX is already baked into the cache
+    if (! baked)
     {
-        masterChain.push_back (mix.adopt (effectNode, "insert", -1));
-        mix.connectMidi (midiInNode, effectNode);          // MIDI-controlled effects
+        if (effectNode != nullptr)
+        {
+            masterChain.push_back (mix.adopt (effectNode, "insert", -1));
+            mix.connectMidi (midiInNode, effectNode);          // MIDI-controlled effects
+        }
+        masterChain.push_back (mix.adopt (masterStripNode, "master", -1));
     }
-    masterChain.push_back (mix.adopt (masterStripNode, "master", -1));
     masterChain.push_back (mix.adopt (tapNode, "master", -1));
     mix.setMaster (masterChain);
 
     // --- AUDIO track: the file player, or the live input (also the fallback when no instrument is loaded) ---
     const bool fileSource = mode == srcFile;
-    mix.addTrack ({ mix.adopt (fileSource ? filePlayerNode : audioInNode, "source", trkAudio),
-                    mix.adopt (stripNode[trkAudio], "strip", trkAudio) },
-                  fileSource ? 0 : inputPairStart);
+    if (baked)
+        mix.addTrack ({ mix.adopt (filePlayerNode, "source", trkAudio) });
+    else
+        mix.addTrack ({ mix.adopt (fileSource ? filePlayerNode : audioInNode, "source", trkAudio),
+                        mix.adopt (stripNode[trkAudio], "strip", trkAudio) },
+                      fileSource ? 0 : inputPairStart);
 
     // --- INST 1..3: MIDI in -> the track's channel filter -> the VSTi -> strip ---
     for (int t = trkInst1; t < numTracks; ++t)
@@ -1114,7 +1148,7 @@ bool MainComponent::midiChainActive() const
 
 void MainComponent::abandonMidiChain()
 {
-    if (currentMidiFile == juce::File() && ! bounceEngine.isBouncing())
+    if (currentMidiFile == juce::File() && ! bounceRunning())
         return;
     bounceEngine.stopBounce();
     currentMidiFile = juce::File();
@@ -1127,7 +1161,7 @@ void MainComponent::abandonMidiChain()
 
 void MainComponent::openMidiFileDialog()
 {
-    if (instrumentNode == nullptr)
+    if (instrumentNode == nullptr && extra (trkInst2).node == nullptr && extra (trkInst3).node == nullptr)
     {
         setStatus ("Load a VSTi first - the MIDI file is bounced through it.");
         return;
@@ -1210,7 +1244,15 @@ void MainComponent::createOfflineInstAndBounce()
 
 void MainComponent::syncInstStateAndBounce()
 {
-    if (instrumentNode == nullptr || currentMidiFile == juce::File() || bounceEngine.isBouncing())
+    const bool anyInst = instrumentNode != nullptr || extra (trkInst2).node != nullptr || extra (trkInst3).node != nullptr;
+    if (! anyInst || currentMidiFile == juce::File() || bounceRunning())
+        return;
+    if (instrumentsNeedRig())
+    {
+        startMidiMixBounce();       // INST 2 / 3 or a channel mask: the rig renders the instrument tracks together
+        return;
+    }
+    if (instrumentNode == nullptr)
         return;
     if (offlineInst == nullptr)
     {
@@ -1455,6 +1497,14 @@ void MainComponent::syncOfflineStateAndRender (bool quickOnly)
             quickWindow = (juce::int64) (25.0 * fileSampleRate);
     }
 
+    renderEngine.stopRender();      // the gains below are read by the render thread
+    {
+        // the cache is the whole mix path: AUDIO strip -> FX -> master strip (both are bypassed live while it plays)
+        float al, ar, ml, mr;
+        TrackStrip::gains (strips[trkAudio]->getGainDb(), strips[trkAudio]->getBalance(), ! strips[trkAudio]->isSounding(), al, ar);
+        TrackStrip::gains (masterStrip->getGainDb(), masterStrip->getBalance(), masterStrip->isMuted(), ml, mr);
+        renderEngine.setStripGains (al, ar, ml, mr);
+    }
     renderEngine.startRender (effectivePlayableFile(), audioFormats,
                               effectNode != nullptr ? offlineFx.get() : nullptr,
                               renderCache, startSample, quickWindow);
@@ -1710,7 +1760,7 @@ juce::var MainComponent::collectGpuParams() const
 void MainComponent::audioProcessorParameterChanged (juce::AudioProcessor* proc, int, float)
 {
     // May arrive on any thread: only touch atomics.
-    if (proc != nullptr && proc == instrumentProc.load())
+    if (proc != nullptr && (proc == instrumentProc.load() || proc == extraProc[0].load() || proc == extraProc[1].load()))
     {
         instStale = true;
         lastInstChangeMs = juce::Time::getMillisecondCounter();
@@ -1726,7 +1776,7 @@ void MainComponent::audioProcessorChanged (juce::AudioProcessor* proc, const Cha
 {
     if (details.parameterInfoChanged || details.programChanged)
     {
-        if (proc != nullptr && proc == instrumentProc.load())
+        if (proc != nullptr && (proc == instrumentProc.load() || proc == extraProc[0].load() || proc == extraProc[1].load()))
         {
             instStale = true;
             lastInstChangeMs = juce::Time::getMillisecondCounter();
@@ -1821,7 +1871,7 @@ void MainComponent::setMpeEnabled (bool on, bool rebounce)
     setStatus (on ? "MPE on: lower-zone setup sent (" + juce::String (mpeConfig.members) + " members, +/-"
                         + juce::String (mpeConfig.memberPB) + " st)"
                   : "MPE off (channels still pass through untouched)");
-    if (rebounce && currentMidiFile != juce::File() && midiSequence.getNumEvents() > 0 && ! bounceEngine.isBouncing())
+    if (rebounce && currentMidiFile != juce::File() && midiSequence.getNumEvents() > 0 && ! bounceRunning())
         loadMidiFile (currentMidiFile);   // re-bounce with / without the added setup
 }
 
@@ -1932,6 +1982,10 @@ void MainComponent::timerCallback()
                                      bounceEngine.speedX.load()),
                                  juce::dontSendNotification);
     }
+    else if (multiBounceRunning)
+    {
+        // the rig reports no progress: the label set when it started stays
+    }
     else if (midiChainActive())
     {
         if (instStale.load())
@@ -1941,7 +1995,8 @@ void MainComponent::timerCallback()
         // Same debounce as the FX/GPU knobs: re-bounce once the VSTi has been
         // quiet for 600 ms, then hot-swap at the playback position.
         const auto now = juce::Time::getMillisecondCounter();
-        if (instStale.load() && ! offlineInstLoading && instrumentNode != nullptr
+        const bool anyInstLoaded = instrumentNode != nullptr || extra (trkInst2).node != nullptr || extra (trkInst3).node != nullptr;
+        if (instStale.load() && ! offlineInstLoading && anyInstLoaded
             && now - lastInstChangeMs.load() > 600)
         {
             instStale = false;

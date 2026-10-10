@@ -16,6 +16,7 @@ public:
         std::function<void (int)> load, editor, remove;      // track 1..3 (INST)
         std::function<juce::String (int)> describe;          // what the track plays: a plug-in name, a file, the live input
         std::function<void()> soloChanged;                   // a solo button was pressed: the host recomputes who is silenced
+        std::function<void (int)> stripChanged;              // gain / balance / mute / MIDI channels of a track (index; 4 = master)
     };
 
     MixerPanel (TrackStrip* const (&strips)[4], TrackStrip* master, MidiChannelFilter* const (&filters)[4], Hooks h)
@@ -114,6 +115,7 @@ private:
                 midi.onReturnKey = midi.onFocusLost = [this]
                 {
                     filter->setMask (parseChannels (midi.getText()));
+                    changed();
                     midi.setText (formatChannels (filter->getMask()), juce::dontSendNotification);
                 };
                 addAndMakeVisible (midi);
@@ -124,14 +126,14 @@ private:
                 solo.setButtonText ("S");
                 solo.setClickingTogglesState (true);
                 solo.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xffe0c24a));
-                solo.onClick = [this] { strip->setSolo (solo.getToggleState()); if (owner.hooks.soloChanged) owner.hooks.soloChanged(); };
+                solo.onClick = [this] { strip->setSolo (solo.getToggleState()); if (owner.hooks.soloChanged) owner.hooks.soloChanged(); changed(); };
                 addAndMakeVisible (solo);
             }
 
             mute.setButtonText ("M");
             mute.setClickingTogglesState (true);
             mute.setColour (juce::TextButton::buttonOnColourId, juce::Colour (0xffd9534f));
-            mute.onClick = [this] { strip->setMuted (mute.getToggleState()); };
+            mute.onClick = [this] { strip->setMuted (mute.getToggleState()); changed(); };
             addAndMakeVisible (mute);
 
             balance.setSliderStyle (juce::Slider::LinearHorizontal);
@@ -139,7 +141,7 @@ private:
             balance.setRange (-1.0, 1.0, 0.01);
             balance.setDoubleClickReturnValue (true, 0.0);
             balance.setTooltip ("balance (double-click: centre)");
-            balance.onValueChange = [this] { strip->setBalance ((float) balance.getValue()); };
+            balance.onValueChange = [this] { strip->setBalance ((float) balance.getValue()); changed(); };
             addAndMakeVisible (balance);
 
             gain.setSliderStyle (juce::Slider::LinearVertical);
@@ -149,7 +151,7 @@ private:
             gain.setDoubleClickReturnValue (true, 0.0);
             gain.setTextValueSuffix (" dB");
             gain.setTooltip ("gain (double-click: 0 dB)");
-            gain.onValueChange = [this] { strip->setGainDb ((float) gain.getValue()); };
+            gain.onValueChange = [this] { strip->setGainDb ((float) gain.getValue()); changed(); };
             addAndMakeVisible (gain);
 
             refresh();
@@ -216,6 +218,11 @@ private:
         {
             g.setColour (juce::Colour (0xff2a2f38));
             g.fillRoundedRectangle (getLocalBounds().toFloat().reduced (1.0f), 5.0f);
+            if (strip->isModeSilenced())
+            {
+                g.setColour (juce::Colour (0xff15181d).withAlpha (0.55f));
+                g.fillRoundedRectangle (getLocalBounds().toFloat().reduced (1.0f), 5.0f);
+            }
             g.setColour (accent().withAlpha (0.35f));
             g.drawRoundedRectangle (getLocalBounds().toFloat().reduced (1.5f), 5.0f, 1.0f);
 
@@ -240,6 +247,8 @@ private:
         }
 
     private:
+        void changed() { if (owner.hooks.stripChanged) owner.hooks.stripChanged (index); }
+
         juce::Colour accent() const
         {
             static const juce::uint32 c[] = { 0xff5fb0e0, 0xffe0a35f, 0xffe0a35f, 0xffe0a35f, 0xff5fe08a };
