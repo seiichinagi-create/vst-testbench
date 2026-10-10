@@ -468,7 +468,6 @@ private:
         // One rebuild only, inside prepareToPlay: every add* below would otherwise queue an async rebuild
         // on the message thread that can interleave with it (graph latency read 0 in 2 of 10 renders).
         note ("building the graph");
-        const auto none = Graph::UpdateKind::none;
         // The graph owns the plugin instances. Plugins must die on the message thread (some VST3s crash
         // otherwise: the bench fell over after about ten renders), so the last reference is handed to it.
         auto graphOwner = std::make_shared<Graph>();

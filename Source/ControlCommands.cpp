@@ -173,6 +173,31 @@ juce::var MainComponent::handleControl (const juce::var& req)
     if (cmd == "ping")   { auto o = makeObj(); put (o, "pong", true); put (o, "app", "VST TestBench"); return o; }
     if (cmd == "status") return controlStatus();
 
+    // The live graph's connections as sorted "node:channel -> node:channel" lines (MIDI = "midi"): what is wired to what.
+    // For checking that a change to how the graph is built (docs/TRACKS.md, P1) leaves the routing exactly as it was.
+    if (cmd == "graph_dump")
+    {
+        auto o = makeObj();
+        auto nameOf = [this] (Graph::NodeID id)
+        {
+            auto n = graph.getNodeForId (id);
+            return n != nullptr ? n->getProcessor()->getName() : juce::String ("?");
+        };
+        auto pin = [] (const Graph::NodeAndChannel& nc)
+        {
+            return nc.isMIDI() ? juce::String ("midi") : juce::String (nc.channelIndex);
+        };
+        juce::StringArray lines;
+        for (auto& c : graph.getConnections())
+            lines.add (nameOf (c.source.nodeID) + ":" + pin (c.source) + " -> " + nameOf (c.destination.nodeID) + ":" + pin (c.destination));
+        lines.sort (false);
+        juce::Array<juce::var> arr;
+        for (auto& l : lines)
+            arr.add (l);
+        put (o, "connections", arr);
+        return o;
+    }
+
     //-- plugins ---------------------------------------------------------------
     if (cmd == "list_plugins")
     {
@@ -702,7 +727,7 @@ juce::var MainComponent::handleControl (const juce::var& req)
     {
         auto o = makeObj();
         put (o, "commands", juce::StringArray ({
-            "ping", "status", "list_plugins", "load_plugin", "remove_plugin", "set_bypass",
+            "ping", "status", "graph_dump", "list_plugins", "load_plugin", "remove_plugin", "set_bypass",
             "list_params", "set_param", "set_params", "save_state", "load_state",
             "show_editor", "screenshot", "set_source", "load_audio", "play", "stop", "seek", "loop",
             "prerender", "rig_render", "ara_probe", "load_midi", "export_midi", "mpe", "midi_send", "midi_play", "midi_play_file", "midi_stop",

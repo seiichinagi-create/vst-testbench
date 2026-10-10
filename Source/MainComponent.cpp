@@ -1,4 +1,5 @@
 #include "MainComponent.h"
+#include "MixGraph.h"
 
 namespace
 {
@@ -793,18 +794,23 @@ void MainComponent::rebuildConnections()
     for (auto c : graph.getConnections())
         graph.removeConnection (c);
 
-    const int outChans = 2;
     const int mode = currentSourceMode();
 
-    // --- pick the source node feeding the FX stage ---
+    // The same graph the offline rig builds (MixGraph, docs/TRACKS.md): tracks -> master -> out. Today one track sounds at a
+    // time (the source mode picks it) and the master is the meter / recorder tap; the other sources are not connected.
+    MixGraph mix (graph, audioOutNode, Graph::UpdateKind::sync);
+    mix.adopt (tapNode, "master", -1);
+    mix.setMaster ({ tapNode });                       // tap -> device out
+
+    // --- the track that sounds: its source, and the FX stage after it ---
     Graph::Node::Ptr src;
     int srcChanBase = 0;
-    int srcChans    = 2;
+    juce::String role = "source";
 
     if (mode == srcInstrument && instrumentNode != nullptr)
     {
         src = instrumentNode;
-        srcChans = instrumentNode->getProcessor()->getTotalNumOutputChannels();
+        role = "inst";
     }
     else if (mode == srcFile)
     {
@@ -818,42 +824,18 @@ void MainComponent::rebuildConnections()
 
     // MIDI in -> instrument (whenever one is loaded, regardless of mode)
     if (instrumentNode != nullptr)
-        graph.addConnection ({ { midiInNode->nodeID,     Graph::midiChannelIndex },
-                               { instrumentNode->nodeID, Graph::midiChannelIndex } });
+        mix.connectMidi (midiInNode, instrumentNode);
 
+    std::vector<Graph::Node::Ptr> chain { mix.adopt (src, role, 0) };
     if (effectNode != nullptr && ! preRenderActive())
     {
-        auto* proc = effectNode->getProcessor();
-        const int pin  = juce::jmax (0, proc->getTotalNumInputChannels());
-        const int pout = juce::jmax (0, proc->getTotalNumOutputChannels());
-
-        // source -> FX inputs
-        for (int ch = 0; ch < juce::jmin (2, srcChans, pin); ++ch)
-            graph.addConnection ({ { src->nodeID,        srcChanBase + ch },
-                                   { effectNode->nodeID, ch } });
-
-        // FX outputs -> device out
-        for (int ch = 0; ch < juce::jmin (outChans, pout); ++ch)
-            graph.addConnection ({ { effectNode->nodeID,  ch },
-                                   { tapNode->nodeID,      ch } });
+        chain.push_back (mix.adopt (effectNode, "insert", 0));
 
         // MIDI in -> FX (for MIDI-controlled effects)
-        graph.addConnection ({ { midiInNode->nodeID, Graph::midiChannelIndex },
-                               { effectNode->nodeID, Graph::midiChannelIndex } });
+        mix.connectMidi (midiInNode, effectNode);
     }
-    else
-    {
-        // No FX (or pre-render mode: FX already baked into the cache) ->
-        // stream the source straight to the outputs.
-        for (int ch = 0; ch < juce::jmin (outChans, srcChans); ++ch)
-            graph.addConnection ({ { src->nodeID,         srcChanBase + ch },
-                                   { tapNode->nodeID,      ch } });
-    }
-
-    // meter / recorder tap -> device output
-    for (int ch = 0; ch < outChans; ++ch)
-        graph.addConnection ({ { tapNode->nodeID,      ch },
-                               { audioOutNode->nodeID, ch } });
+    // else: no FX (or pre-render mode: FX already baked into the cache) -> the source goes straight to the master
+    mix.addTrack (chain, srcChanBase);
 }
 
 //==============================================================================
