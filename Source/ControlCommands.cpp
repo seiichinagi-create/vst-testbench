@@ -52,12 +52,69 @@ namespace
 }
 
 //==============================================================================
+// midi_channels: [1, 2, 5] (1..16), "all" or "none"
+juce::uint32 MainComponent::maskFromChannels (const juce::var& v)
+{
+    if (v.isString())
+        return v.toString().equalsIgnoreCase ("all") ? 0xFFFFu : 0u;
+    juce::uint32 m = 0;
+    if (auto* a = v.getArray())
+        for (const auto& c : *a)
+            if ((int) c >= 1 && (int) c <= 16)
+                m |= 1u << ((int) c - 1);
+    return m;
+}
+
+// "audio" / "inst1".."inst3" -> 0..3, "master" -> -1, anything else -> -2
+int MainComponent::trackIndexOf (const juce::String& s)
+{
+    if (s == "audio") return trkAudio;
+    if (s == "inst1" || s == "inst") return trkInst1;
+    if (s == "inst2") return trkInst2;
+    if (s == "inst3") return trkInst3;
+    if (s == "master") return -1;
+    return -2;
+}
+
+// One track (or the master, t == -1) as the control API reports it.
+juce::var MainComponent::trackInfo (int t) const
+{
+    auto o = makeObj();
+    const TrackStrip* strip = t < 0 ? masterStrip : strips[t];
+    put (o, "track", t < 0 ? "master" : t == trkAudio ? "audio" : "inst" + juce::String (t));
+    put (o, "gain_db", (double) strip->getGainDb());
+    put (o, "balance", (double) strip->getBalance());
+    put (o, "mute", strip->isMuted());
+    if (t == trkAudio)
+        put (o, "source", currentSourceMode() == srcFile ? "file" : "live");
+    if (t >= trkInst1)
+    {
+        const auto name = t == trkInst1 ? currentInstrumentName : extra (t).name;
+        put (o, "plugin", name);
+        put (o, "loaded", name.isNotEmpty());
+        juce::Array<juce::var> ch;
+        for (int c = 1; c <= 16; ++c)
+            if ((midiFilters[t]->getMask() & (1u << (c - 1))) != 0)
+                ch.add (c);
+        put (o, "midi_channels", ch);
+    }
+    if (t < 0)
+    {
+        put (o, "plugin", currentEffectName);   // the legacy FX is the master insert
+        put (o, "loaded", effectNode != nullptr);
+    }
+    return o;
+}
+
+//==============================================================================
 juce::AudioProcessor* MainComponent::processorForRole (const juce::String& role) const
 {
     if (role == "fx")
         return effectNode != nullptr ? effectNode->getProcessor() : nullptr;
-    if (role == "inst" || role == "instrument")
+    if (role == "inst" || role == "instrument" || role == "inst1")
         return instrumentNode != nullptr ? instrumentNode->getProcessor() : nullptr;
+    if (role == "inst2" || role == "inst3")
+        return extra (trackFromRole (role)).node != nullptr ? extra (trackFromRole (role)).node->getProcessor() : nullptr;
     return nullptr;
 }
 
@@ -198,6 +255,33 @@ juce::var MainComponent::handleControl (const juce::var& req)
         return o;
     }
 
+    //-- mixer: tracks (docs/TRACKS.md) ----------------------------------------
+    // track = audio | inst1 | inst2 | inst3 | master;  gain_db, balance (-1..1), mute, midi_channels (INST tracks)
+    if (cmd == "track_set")
+    {
+        const int t = trackIndexOf (str (req, "track").toLowerCase());
+        if (t == -2) return fail ("track must be audio, inst1, inst2, inst3 or master");
+        TrackStrip* strip = t == -1 ? masterStrip : strips[t];
+        if (req.hasProperty ("gain_db")) strip->setGainDb ((float) (double) req["gain_db"]);
+        if (req.hasProperty ("balance")) strip->setBalance ((float) (double) req["balance"]);
+        if (req.hasProperty ("mute"))    strip->setMuted (flag (req, "mute", false));
+        if (req.hasProperty ("midi_channels"))
+        {
+            if (t < trkInst1) return fail ("midi_channels applies to inst1, inst2 and inst3");
+            midiFilters[t]->setMask (maskFromChannels (req["midi_channels"]));
+        }
+        return trackInfo (t);
+    }
+    if (cmd == "track_status")
+    {
+        auto o = makeObj();
+        juce::Array<juce::var> list;
+        for (int t = trkAudio; t < numTracks; ++t) list.add (trackInfo (t));
+        list.add (trackInfo (-1));
+        put (o, "tracks", list);
+        return o;
+    }
+
     //-- plugins ---------------------------------------------------------------
     if (cmd == "list_plugins")
     {
@@ -219,9 +303,12 @@ juce::var MainComponent::handleControl (const juce::var& req)
     if (cmd == "load_plugin")
     {
         const auto role = roleOf (req);
-        if (role != "fx" && role != "inst" && role != "instrument")
-            return fail ("role must be \"fx\" or \"inst\"");
+        if (role != "fx" && trackFromRole (role) < 0)
+            return fail ("role must be \"fx\", \"inst\" (INST 1), \"inst2\" or \"inst3\"");
         const bool asInst = role != "fx";
+        const int loadTrack = asInst ? trackFromRole (role) : trkInst1;
+        if (loadTrack >= trkInst2 && req.hasProperty ("midi_channels"))
+            midiFilters[loadTrack]->setMask (maskFromChannels (req["midi_channels"]));
 
         const auto path = str (req, "path");
         const auto name = str (req, "name");
@@ -236,7 +323,7 @@ juce::var MainComponent::handleControl (const juce::var& req)
             saveKnownPlugins();
             refreshRecentList();
             if (found.isEmpty()) return fail ("no plugin found in " + f.getFileName());
-            loadPluginFromDescription (*found.getFirst(), asInst);
+            loadPluginFromDescription (*found.getFirst(), asInst, loadTrack);
         }
         else if (name.isNotEmpty())
         {
@@ -248,7 +335,7 @@ juce::var MainComponent::handleControl (const juce::var& req)
                 for (const auto& t : types)
                     if (t.isInstrument == asInst && t.name.containsIgnoreCase (name)) { hit = &t; break; }
             if (hit == nullptr) return fail ("no cached " + role + " plugin matching \"" + name + "\" (use path=...vst3)");
-            loadPluginFromDescription (*hit, asInst);
+            loadPluginFromDescription (*hit, asInst, loadTrack);
         }
         else
             return fail ("give \"path\" (a .vst3) or \"name\" (a cached plugin)");
@@ -263,8 +350,9 @@ juce::var MainComponent::handleControl (const juce::var& req)
     {
         const auto role = roleOf (req);
         if (role == "fx") removeEffect();
-        else if (role == "inst" || role == "instrument") removeInstrument();
-        else return fail ("role must be \"fx\" or \"inst\"");
+        else if (role == "inst" || role == "instrument" || role == "inst1") removeInstrument();
+        else if (role == "inst2" || role == "inst3") removeExtraInstrument (trackFromRole (role));
+        else return fail ("role must be \"fx\", \"inst\", \"inst2\" or \"inst3\"");
         return makeObj();
     }
 
@@ -401,6 +489,12 @@ juce::var MainComponent::handleControl (const juce::var& req)
         if (role == "fx")
         {
             if ((editorWindow != nullptr) != want) toggleEditorFor (effectNode, currentEffectName, editorWindow);
+        }
+        else if (role == "inst2" || role == "inst3")
+        {
+            auto& e = extra (trackFromRole (role));
+            if (e.node == nullptr) return fail ("no plugin loaded for role \"" + role + "\"");
+            if ((e.editor != nullptr) != want) toggleEditorFor (e.node, e.name, e.editor);
         }
         else
         {
@@ -727,7 +821,7 @@ juce::var MainComponent::handleControl (const juce::var& req)
     {
         auto o = makeObj();
         put (o, "commands", juce::StringArray ({
-            "ping", "status", "graph_dump", "list_plugins", "load_plugin", "remove_plugin", "set_bypass",
+            "ping", "status", "graph_dump", "track_set", "track_status", "list_plugins", "load_plugin", "remove_plugin", "set_bypass",
             "list_params", "set_param", "set_params", "save_state", "load_state",
             "show_editor", "screenshot", "set_source", "load_audio", "play", "stop", "seek", "loop",
             "prerender", "rig_render", "ara_probe", "load_midi", "export_midi", "mpe", "midi_send", "midi_play", "midi_play_file", "midi_stop",

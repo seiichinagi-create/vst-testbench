@@ -46,11 +46,19 @@ private:
     //== actions ==
     void showAudioSettings();
     void loadPluginDialog (bool asInstrument);
-    void loadPluginFromDescription (const juce::PluginDescription&, bool asInstrument);
+    void loadPluginFromDescription (const juce::PluginDescription&, bool asInstrument, int track = 1);
     void setEffectNode (std::unique_ptr<juce::AudioPluginInstance>, const juce::PluginDescription&);
     void setInstrumentNode (std::unique_ptr<juce::AudioPluginInstance>, const juce::PluginDescription&);
     void removeEffect();
     void removeInstrument();
+    // INST 2 and INST 3 (track = trkInst2 / trkInst3): live MIDI only for now (the MIDI-file bounce, MPE setup and
+    // PRE-RENDER stay with INST 1; docs/TRACKS.md P4)
+    void setExtraInstrument (int track, std::unique_ptr<juce::AudioPluginInstance>, const juce::PluginDescription&);
+    void removeExtraInstrument (int track);
+    static int trackFromRole (const juce::String& role);   // "inst" -> 1, "inst2" -> 2, "inst3" -> 3, else -1
+    static juce::uint32 maskFromChannels (const juce::var&);
+    static int trackIndexOf (const juce::String&);
+    juce::var trackInfo (int track) const;                 // -1 = master
     void rebuildConnections();
     void refreshMidiOutList();
     void refreshRecentList();
@@ -201,6 +209,10 @@ private:
     TrackStrip* strips[numTracks] = {};          // owned by the graph nodes
     TrackStrip* masterStrip = nullptr;
     MidiChannelFilter* midiFilters[numTracks] = {};
+    struct ExtraInstrument { Graph::Node::Ptr node; juce::String name; std::unique_ptr<juce::DocumentWindow> editor; };
+    ExtraInstrument extraInst[2];                 // INST 2, INST 3
+    ExtraInstrument& extra (int track) { return extraInst[track - trkInst2]; }
+    const ExtraInstrument& extra (int track) const { return extraInst[track - trkInst2]; }
     MidiScheduler midiScheduler { [this] (const juce::MidiMessage& m) { injectMidi (m); } };
     ControlServer controlServer { [this] (const juce::var& r) { return handleControl (r); } };
     int controlPort = 0;

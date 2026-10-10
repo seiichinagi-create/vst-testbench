@@ -66,6 +66,8 @@ MainComponent::MainComponent()
         masterStrip = ms.get();
         masterStripNode = graph.addNode (std::move (ms));
     }
+    midiFilters[trkInst2]->setMask (0);   // INST 2 / 3 get no MIDI until channels are assigned (INST 1: every channel)
+    midiFilters[trkInst3]->setMask (0);
 
     player.setProcessor (&graph);
     deviceManager.addAudioCallback (&player);
@@ -418,6 +420,7 @@ MainComponent::~MainComponent()
         instrumentNode->getProcessor()->removeListener (this);
     editorWindow = nullptr;
     instEditorWindow = nullptr;
+    for (auto& e : extraInst) e.editor = nullptr;
     deviceManager.removeMidiInputDeviceCallback ({}, this);
     deviceManager.removeMidiInputDeviceCallback ({}, &player);
     midiRecorder.closeAndSave();   // an open take survives app close
@@ -659,7 +662,7 @@ void MainComponent::loadPluginDialog (bool asInstrument)
         });
 }
 
-void MainComponent::loadPluginFromDescription (const juce::PluginDescription& desc, bool asInstrument)
+void MainComponent::loadPluginFromDescription (const juce::PluginDescription& desc, bool asInstrument, int track)
 {
     auto setup = deviceManager.getAudioDeviceSetup();
     const double rate  = setup.sampleRate > 0 ? setup.sampleRate : 48000.0;
@@ -669,7 +672,7 @@ void MainComponent::loadPluginFromDescription (const juce::PluginDescription& de
     ++pendingLoads;
     formatManager.createPluginInstanceAsync (
         desc, rate, block,
-        [this, desc, asInstrument] (std::unique_ptr<juce::AudioPluginInstance> instance, const juce::String& error)
+        [this, desc, asInstrument, track] (std::unique_ptr<juce::AudioPluginInstance> instance, const juce::String& error)
         {
             --pendingLoads;
             if (instance == nullptr)
@@ -677,7 +680,9 @@ void MainComponent::loadPluginFromDescription (const juce::PluginDescription& de
                 setStatus ("Load failed: " + error);
                 return;
             }
-            if (asInstrument)
+            if (asInstrument && track >= trkInst2)
+                setExtraInstrument (track, std::move (instance), desc);
+            else if (asInstrument)
                 setInstrumentNode (std::move (instance), desc);
             else
                 setEffectNode (std::move (instance), desc);
@@ -803,6 +808,44 @@ void MainComponent::removeInstrument()
     setStatus ("Instrument removed.");
 }
 
+int MainComponent::trackFromRole (const juce::String& role)
+{
+    if (role == "inst" || role == "instrument" || role == "inst1") return trkInst1;
+    if (role == "inst2") return trkInst2;
+    if (role == "inst3") return trkInst3;
+    return -1;
+}
+
+void MainComponent::setExtraInstrument (int track, std::unique_ptr<juce::AudioPluginInstance> instance,
+                                        const juce::PluginDescription& desc)
+{
+    auto& e = extra (track);
+    e.editor = nullptr;
+    if (e.node != nullptr)
+        graph.removeNode (e.node->nodeID);
+
+    configureInstance (*instance, deviceManager);
+    e.node = graph.addNode (std::move (instance));
+    e.name = desc.name;
+    rebuildConnections();
+    setStatus ("Loaded " + desc.name + " into INST " + juce::String (track)
+               + (midiFilters[track]->getMask() == 0 ? " (it gets no MIDI until channels are set: track_set midi_channels)" : ""));
+}
+
+void MainComponent::removeExtraInstrument (int track)
+{
+    auto& e = extra (track);
+    e.editor = nullptr;
+    if (e.node != nullptr)
+    {
+        graph.removeNode (e.node->nodeID);
+        e.node = nullptr;
+    }
+    e.name = {};
+    rebuildConnections();
+    setStatus ("INST " + juce::String (track) + " removed.");
+}
+
 //==============================================================================
 void MainComponent::rebuildConnections()
 {
@@ -818,11 +861,11 @@ void MainComponent::rebuildConnections()
 
     // The legacy source mode still decides which tracks sound (the others sit muted at their strip, connected):
     // live / file -> AUDIO; VSTi -> INST 1 (AUDIO again when no instrument is loaded: the old fallback to the live input).
-    const bool instSounds = mode == srcInstrument && instrumentNode != nullptr;
+    const bool anyInst = instrumentNode != nullptr || extra (trkInst2).node != nullptr || extra (trkInst3).node != nullptr;
+    const bool instSounds = mode == srcInstrument && anyInst;
     strips[trkAudio]->setMuted (instSounds);
-    strips[trkInst1]->setMuted (! instSounds);
-    for (int t = trkInst2; t < numTracks; ++t)
-        strips[t]->setMuted (true);
+    for (int t = trkInst1; t < numTracks; ++t)
+        strips[t]->setMuted (! instSounds);
 
     // --- master ---
     std::vector<Graph::Node::Ptr> masterChain;
@@ -841,13 +884,15 @@ void MainComponent::rebuildConnections()
                     mix.adopt (stripNode[trkAudio], "strip", trkAudio) },
                   fileSource ? 0 : inputPairStart);
 
-    // --- INST 1 ---
-    if (instrumentNode != nullptr)
+    // --- INST 1..3: MIDI in -> the track's channel filter -> the VSTi -> strip ---
+    for (int t = trkInst1; t < numTracks; ++t)
     {
-        mix.connectMidi (midiInNode, midiFilterNode[trkInst1]);
-        mix.connectMidi (midiFilterNode[trkInst1], instrumentNode);
-        mix.addTrack ({ mix.adopt (instrumentNode, "inst", trkInst1),
-                        mix.adopt (stripNode[trkInst1], "strip", trkInst1) });
+        const auto inst = t == trkInst1 ? instrumentNode : extra (t).node;
+        if (inst == nullptr)
+            continue;
+        mix.connectMidi (midiInNode, midiFilterNode[t]);
+        mix.connectMidi (midiFilterNode[t], inst);
+        mix.addTrack ({ mix.adopt (inst, "inst", t), mix.adopt (stripNode[t], "strip", t) });
     }
 }
 
