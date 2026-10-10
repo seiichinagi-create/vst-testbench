@@ -35,6 +35,24 @@ namespace rigjob
             spec.impulseAt = (juce::int64) num ("impulse_at", 1000.0);
             spec.stages.push_back ({ "source", std::make_unique<RigRender::ImpulseSource> (spec.impulseAt, (float) num ("impulse_amp", 0.1)) });
         }
+        else if (job["source"].toString() == "file")
+        {
+            juce::WavAudioFormat wav;
+            const juce::File f (job["source_path"].toString());
+            std::unique_ptr<juce::AudioFormatReader> reader (f.existsAsFile() ? wav.createReaderFor (f.createInputStream().release(), true) : nullptr);
+            if (reader == nullptr) { error = "cannot read source wav " + f.getFullPathName(); return false; }
+            if (std::abs (reader->sampleRate - spec.sampleRate) > 0.5)
+            {
+                error = "source wav is " + juce::String (reader->sampleRate) + " Hz, the job runs at " + juce::String (spec.sampleRate);
+                return false;
+            }
+            auto data = std::make_shared<juce::AudioBuffer<float>> (2, (int) reader->lengthInSamples);
+            reader->read (data.get(), 0, (int) reader->lengthInSamples, 0, true, true);
+            if (reader->numChannels == 1)
+                data->copyFrom (1, 0, *data, 0, 0, data->getNumSamples());
+            spec.sourceSamples = data->getNumSamples();
+            spec.stages.push_back ({ "source", std::make_unique<RigRender::FileSource> (data) });
+        }
         else
         {
             spec.sequence = sequenceFromEvents (job["events"], error);
@@ -91,6 +109,25 @@ namespace rigjob
                 if (auto* bypass = plugin->getBypassParameter())
                     bypass->setValueNotifyingHost (0.0f);
             }
+            // parameters by name (normalized 0..1), applied after the state: lets a render be built from defaults
+            // alone, to compare with the same settings arriving as a saved state
+            if (auto* params = st["params"].getDynamicObject())
+                for (const auto& kv : params->getProperties())
+                {
+                    bool done = false;
+                    for (auto* prm : plugin->getParameters())
+                        if (prm->getName (128) == kv.name.toString())
+                        {
+                            prm->setValue ((float) (double) kv.value);
+                            done = true;
+                            break;
+                        }
+                    if (! done)
+                    {
+                        error = role + ": no parameter named '" + kv.name.toString() + "'";
+                        return false;
+                    }
+                }
             spec.stages.push_back ({ role, std::move (plugin) });
         }
         return true;

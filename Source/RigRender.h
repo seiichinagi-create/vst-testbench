@@ -63,6 +63,45 @@ public:
         float amp;
     };
 
+    // Plays a pre-loaded stereo buffer from sample 0, then silence. The source for feeding one render's
+    // output into the next (a chain split in two must equal the chain rendered whole).
+    class FileSource : public juce::AudioProcessor
+    {
+    public:
+        explicit FileSource (std::shared_ptr<juce::AudioBuffer<float>> data)
+            : juce::AudioProcessor (BusesProperties().withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+              buffer (std::move (data)) {}
+
+        const juce::String getName() const override { return "FileSource"; }
+        void prepareToPlay (double, int) override { pos = 0; }
+        void releaseResources() override {}
+        void processBlock (juce::AudioBuffer<float>& b, juce::MidiBuffer&) override
+        {
+            b.clear();
+            const int total = buffer->getNumSamples();
+            const int n = juce::jmax (0, juce::jmin (b.getNumSamples(), total - pos));
+            for (int c = 0; c < juce::jmin (b.getNumChannels(), buffer->getNumChannels()); ++c)
+                b.copyFrom (c, 0, *buffer, c, pos, n);
+            pos += b.getNumSamples();
+        }
+        double getTailLengthSeconds() const override { return 0.0; }
+        bool acceptsMidi() const override { return false; }
+        bool producesMidi() const override { return false; }
+        juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+        bool hasEditor() const override { return false; }
+        int getNumPrograms() override { return 1; }
+        int getCurrentProgram() override { return 0; }
+        void setCurrentProgram (int) override {}
+        const juce::String getProgramName (int) override { return {}; }
+        void changeProgramName (int, const juce::String&) override {}
+        void getStateInformation (juce::MemoryBlock&) override {}
+        void setStateInformation (const void*, int) override {}
+
+    private:
+        std::shared_ptr<juce::AudioBuffer<float>> buffer;
+        int pos = 0;
+    };
+
     // Delays by `actual` samples and DECLARES `declared`. A device whose true behaviour is known, to check
     // that the latency measurement sees a wrong declaration (a test that cannot fail proves nothing).
     class KnownDelay : public juce::AudioProcessor
@@ -128,6 +167,7 @@ public:
     {
         std::vector<Stage> stages;            // in signal order; stages[0] is the instrument (or an ImpulseSource)
         juce::int64 impulseAt = -1;           // >= 0: stages[0] is an ImpulseSource at this sample; MIDI is not used
+        juce::int64 sourceSamples = -1;       // >= 0: stages[0] is a FileSource of this many samples; MIDI is not used
         juce::MidiMessageSequence sequence;   // seconds
         double sampleRate = 48000.0;
         int block = 512;
@@ -180,13 +220,15 @@ private:
         auto note = [this] (const juce::String& m) { if (spec.progress != nullptr) spec.progress (m); };
 
         if (spec.stages.empty() || spec.stages[0].plugin == nullptr) { fail ("no instrument"); return; }
-        const bool impulse = spec.impulseAt >= 0;
-        if (! impulse && spec.sequence.getNumEvents() == 0)          { fail ("no MIDI events"); return; }
+        const bool audioSource = spec.impulseAt >= 0 || spec.sourceSamples >= 0;   // no MIDI in either
+        if (! audioSource && spec.sequence.getNumEvents() == 0)      { fail ("no MIDI events"); return; }
 
         const double sr = spec.sampleRate;
         const int block = spec.block;
-        const juce::int64 body = impulse ? spec.impulseAt + (juce::int64) (spec.tailSeconds * sr)
-                                         : (juce::int64) ((spec.sequence.getEndTime() + spec.tailSeconds) * sr);
+        const juce::int64 tailSamples = (juce::int64) (spec.tailSeconds * sr);
+        const juce::int64 body = spec.impulseAt >= 0 ? spec.impulseAt + tailSamples
+                               : spec.sourceSamples >= 0 ? spec.sourceSamples + tailSamples
+                               : (juce::int64) ((spec.sequence.getEndTime() + spec.tailSeconds) * sr);
         if (body > 150'000'000) { fail ("too long to render"); return; }
 
         //-- build the graph: MIDI -> inst -> insert -> master -> out ---------
@@ -221,7 +263,7 @@ private:
             nodes.push_back (graph.addNode (std::move (st.plugin), {}, none));
         }
 
-        if (! impulse)
+        if (! audioSource)
             graph.addConnection ({ { midiNode->nodeID, Graph::midiChannelIndex },
                                    { nodes[0]->nodeID, Graph::midiChannelIndex } }, none);
 

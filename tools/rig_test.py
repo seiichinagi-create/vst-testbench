@@ -117,6 +117,77 @@ def latency_accuracy(rig, a, bad):
             bad.append(f"{name}: measured delay depends on level (spread {spread})")
 
 
+def abs_data(rig, name):
+    return os.path.join(rig.dir, name)
+
+
+def make_state(rig, plugin, name, **params):
+    """Configure `plugin` in the bench (the way a person would) and save its state; returns the file path."""
+    rig.tb.call("load_plugin", role="fx", name=plugin)
+    while rig.tb.call("status")["busy"]:
+        time.sleep(0.15)
+    for k, v in params.items():
+        r = rig.tb.call("set_param", role="fx", name=k, value=v)
+        if not r.get("ok", True):
+            raise RuntimeError(f"set_param {k}: {r.get('error')}")
+    path = abs_data(rig, name)
+    r = rig.tb.call("save_state", role="fx", path=path)
+    if not r.get("ok", True):
+        raise RuntimeError(f"save_state: {r.get('error')}")
+    return path
+
+
+def state_roundtrip(rig, plugin, bad):
+    params = {"Drive": 0.9, "Tone": 0.3}
+    state = make_state(rig, plugin, "rt_state.bin", **params)
+    rig.render("rt_a.wav", source="impulse", impulse_at=IMPULSE_AT, impulse_amp=0.1, insert=plugin,
+               insert_state=state, tail=0.5)
+    rig.render("rt_b.wav", source="impulse", impulse_at=IMPULSE_AT, impulse_amp=0.1, insert=plugin,
+               insert_params=params, tail=0.5)
+    rig.render("rt_c.wav", source="impulse", impulse_at=IMPULSE_AT, impulse_amp=0.1, insert=plugin, tail=0.5)
+    a, b, c = (rig.read(f"rt_{k}.wav") for k in "abc")
+    same = np.array_equal(a, b)
+    moved = not np.array_equal(a, c)
+    print(f"  state round-trip ({plugin}, {params}): saved state == same parameters by name: {same}; "
+          f"the parameters do change the sound: {moved}")
+    if not same:
+        bad.append(f"state round-trip: the restored state renders {db(np.abs(a - b).max() / np.abs(a).max()):.1f} dB re peak "
+                   f"away from the same parameters set by name")
+    if not moved:
+        bad.append("state round-trip: the parameters did not change the sound, so the comparison proves nothing")
+
+
+def split_vs_whole(rig, plugin, bad):
+    s1 = make_state(rig, plugin, "sp_1.bin", Model=0.339, Drive=0.9)       # Marshall JCM800
+    s2 = make_state(rig, plugin, "sp_2.bin", Model=0.678, Drive=0.5)       # BOSS MT-2
+    common = dict(source="impulse", impulse_at=IMPULSE_AT, impulse_amp=0.1)
+    whole = rig.render("sp_whole.wav", insert=plugin, insert_state=s1, master=plugin, master_state=s2, tail=0.5, **common)
+    first = rig.render("sp_first.wav", insert=plugin, insert_state=s1, tail=0.5, **common)
+    second = rig.render("sp_second.wav", source="file", source_path=abs_data(rig, "sp_first.wav"),
+                        insert=plugin, insert_state=s2, tail=0.0)
+    w = rig.read("sp_whole.wav").reshape(-1, 2)
+    x = rig.read("sp_second.wav").reshape(-1, 2)
+    n = min(len(w), len(x))
+    diff = db(np.abs(w[:n] - x[:n]).max() / np.abs(w[:n]).max())
+    print(f"  split vs whole ({plugin}: JCM800 then MT-2): latencies whole {whole['chain_latency']} = "
+          f"{first['chain_latency']} + {second['chain_latency']}, difference {diff:.1f} dB re peak over {n} samples")
+    if whole["chain_latency"] != first["chain_latency"] + second["chain_latency"]:
+        bad.append("split vs whole: the declared latencies do not add up")
+    if diff > -100:
+        bad.append(f"split vs whole: differ by {diff:.1f} dB re peak")
+
+    # control: the same split with the WRONG state on the second stage must not match, else this comparison
+    # could not tell a faithful split from an unfaithful one
+    rig.render("sp_wrong.wav", source="file", source_path=abs_data(rig, "sp_first.wav"),
+               insert=plugin, insert_state=s1, tail=0.0)
+    y = rig.read("sp_wrong.wav").reshape(-1, 2)
+    m = min(len(w), len(y))
+    wrong = db(np.abs(w[:m] - y[:m]).max() / np.abs(w[:m]).max())
+    print(f"    control, wrong state on the second stage: {wrong:.1f} dB re peak (must stay above -60)")
+    if wrong < -60:
+        bad.append(f"split vs whole: the control is not discriminating ({wrong:.1f} dB)")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--inst", default="PAGANIHANDS")
@@ -175,6 +246,10 @@ def main():
 
     # 4: declared vs actual latency
     latency_accuracy(rig, a, bad)
+
+    # 5, 6: state round-trip, split vs whole (they use the bench's own plugin instance to make states)
+    state_roundtrip(rig, a.insert, bad)
+    split_vs_whole(rig, a.insert, bad)
 
     print("PASS" if not bad else "FAIL: " + "; ".join(bad))
     return 1 if bad else 0

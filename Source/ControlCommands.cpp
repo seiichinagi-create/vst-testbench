@@ -733,12 +733,19 @@ juce::var MainComponent::startRigRender (const juce::var& req)
     put (job, "settle",       juce::jlimit (0, 10000, (int) num (req, "settle", 500.0)));
     put (job, "out",          resolvePath (str (req, "out", "rig.wav"), appDir()).getFullPathName());
 
-    const bool impulse = str (req, "source") == "impulse";
-    if (impulse)
+    const bool impulse = str (req, "source") == "impulse" || str (req, "source") == "file";   // an audio source: no inst needed
+    if (str (req, "source") == "impulse")
     {
         put (job, "source", "impulse");
         put (job, "impulse_at", num (req, "impulse_at", 1000.0));
         put (job, "impulse_amp", num (req, "impulse_amp", 0.1));
+    }
+    else if (str (req, "source") == "file")
+    {
+        const auto f = resolvePath (str (req, "source_path"), appDir());
+        if (! f.existsAsFile()) return fail ("source_path: no such file " + f.getFullPathName());
+        put (job, "source", "file");
+        put (job, "source_path", f.getFullPathName());
     }
     else
     {
@@ -797,6 +804,9 @@ juce::var MainComponent::startRigRender (const juce::var& req)
 
         put (stage, "kind", "plugin");
         put (stage, "desc_xml", desc.createXml()->toString());
+        const auto paramsKey = juce::String (slot.role) + "_params";
+        if (req.hasProperty (paramsKey.toRawUTF8()))
+            put (stage, "params", req[paramsKey.toRawUTF8()]);
 
         const auto stateKey = juce::String (slot.role) + "_state";
         if (str (req, stateKey.toRawUTF8()).isNotEmpty())
