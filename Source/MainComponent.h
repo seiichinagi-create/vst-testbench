@@ -69,6 +69,21 @@ private:
     // A strip, a MIDI channel mask or a plug-in of a track changed: the pre-render cache (AUDIO strip, master) and the MIDI
     // bounce (INST tracks) are stale. track: 0 AUDIO, 1..3 INST, 4 / -1 master.
     void markMixChanged (int track);
+    void markBakeDirty();              // the PRE-RENDER mix bake is out of date (the timer re-bakes once things are quiet)
+
+    //== PRE-RENDER by the rig (docs/TRACKS.md): with inserts or send buses loaded the cache is a whole-mix render by the rig worker ==
+    bool mixBakeMode = false;          // PRE-RENDER is on and the rig bakes it (else the in-process engine does: file + master FX)
+    bool mixBakeReady = false;         // a bake has landed and the cache plays
+    bool mixBakeRunning = false;
+    std::atomic<bool> mixBakeDirty { false };
+    std::atomic<juce::uint32> mixBakeLastChangeMs { 0 };
+    RenderCache bakeCache[2];          // the playing one and the one being filled (swapped when a bake lands)
+    std::unique_ptr<CacheAudioSource> bakeSource[2];
+    int bakeSlotInUse = 0, bakeGeneration = 0;
+    juce::File currentBakeFile;
+    void startMixBake();
+    void finishMixBake (bool ok, const juce::File& out, const juce::String& info);
+    bool cacheInPath() const { return preRenderActive() && (! mixBakeMode || mixBakeReady); }   // the cache is what plays
     // What the mixer shows under a strip name (insert = false) or in its insert slot (insert = true).
     // index: 0 AUDIO, 1..3 INST, 4..5 SEND 1-2, 6 MASTER (the mixer panel's numbering).
     juce::String describeTrack (int index, bool insert = false) const;
@@ -120,7 +135,9 @@ private:
     juce::MidiMessageSequence sequenceFromEvents (const juce::var& events, juce::String& error) const;
     // What a render of the mixer takes: AUDIO's file, the sounding INST tracks with the loaded MIDI file on their
     // channels, the master FX and strip (docs/TRACKS.md P4). `left` names what could not be taken, and why.
-    struct MixOptions { bool audio = true, insts = true, master = true; };
+    // sounding: take the tracks as the live graph plays them now (the source-mode silence counts), not as the user set the mix;
+    // audioWhenChain: take the AUDIO file even when it is the bounce of the MIDI file (the live graph plays that file)
+    struct MixOptions { bool audio = true, insts = true, master = true, sounding = false, audioWhenChain = false; };
     juce::var buildMixRequest (const MixOptions&, const juce::var& request, juce::StringArray& left);
     juce::var startRenderMix (const juce::var& request);
     // The MIDI chain's bounce through the rig, for more than the in-process bounce can do (INST 2 / 3, channel masks).

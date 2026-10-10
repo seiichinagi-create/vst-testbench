@@ -111,6 +111,7 @@ MainComponent::MainComponent()
         };
         hooks.describe = [this] (int i, bool insert) { return describeTrack (i, insert); };
         hooks.soloChanged = [this] { updateSolo(); };
+        hooks.sendChanged = [this] { markBakeDirty(); };
         hooks.stripChanged = [this] (int i)
         {
             if (i < numTracks)                            markMixChanged (i);
@@ -488,8 +489,8 @@ MainComponent::~MainComponent()
     editorWindow = nullptr;
     instEditorWindow = nullptr;
     for (auto& e : extraInst) { e.editor = nullptr; if (e.node != nullptr) e.node->getProcessor()->removeListener (this); }
-    for (auto& sl : insertSlot) sl.editor = nullptr;
-    for (auto& sl : busSlot) sl.editor = nullptr;
+    for (auto& sl : insertSlot) { sl.editor = nullptr; if (sl.node != nullptr) sl.node->getProcessor()->removeListener (this); }
+    for (auto& sl : busSlot)    { sl.editor = nullptr; if (sl.node != nullptr) sl.node->getProcessor()->removeListener (this); }
     deviceManager.removeMidiInputDeviceCallback ({}, this);
     deviceManager.removeMidiInputDeviceCallback ({}, &player);
     midiRecorder.closeAndSave();   // an open take survives app close
@@ -968,8 +969,26 @@ void MainComponent::applyModePreset()
         strips[t]->setModeSilenced (! instSounds);
 }
 
+void MainComponent::markBakeDirty()
+{
+    if (! mixBakeMode)
+        return;
+    mixBakeDirty = true;
+    mixBakeLastChangeMs = juce::Time::getMillisecondCounter();
+}
+
 void MainComponent::markMixChanged (int track)
 {
+    if (mixBakeMode)                                   // the rig re-bakes everything: no engine staleness to track
+    {
+        markBakeDirty();
+        if (track >= trkInst1 && track < numTracks)    // (an instrument track is still baked into the MIDI bounce)
+        {
+            instStale = true;
+            lastInstChangeMs = juce::Time::getMillisecondCounter();
+        }
+        return;
+    }
     const auto now = juce::Time::getMillisecondCounter();
     if (track <= trkAudio || track >= numTracks)       // AUDIO and the master are baked into the pre-render cache
     {
@@ -988,7 +1007,7 @@ juce::String MainComponent::describeTrack (int index, bool insert) const
     if (insert)
         return index >= 0 && index < numTracks ? insertSlot[index].name : juce::String();
     if (index == 0)
-        return currentSourceMode() == srcFile ? (filePlayer != nullptr && filePlayer->hasFile() ? "file: " + currentOriginalFile.getFileName() + (preRenderActive() ? " (baked)" : "") : juce::String ("file: (none)"))
+        return currentSourceMode() == srcFile ? (filePlayer != nullptr && filePlayer->hasFile() ? "file: " + currentOriginalFile.getFileName() + (cacheInPath() ? " (baked)" : "") : juce::String ("file: (none)"))
                                               : "live in " + juce::String (inputPairStart + 1) + "/" + juce::String (inputPairStart + 2);
     if (index >= MixerPanel::firstBus && index < MixerPanel::masterIndex)
     {
@@ -996,7 +1015,7 @@ juce::String MainComponent::describeTrack (int index, bool insert) const
         return name.isNotEmpty() ? name : juce::String ("-");
     }
     if (index == MixerPanel::masterIndex)
-        return preRenderActive() ? juce::String ("baked into the cache")
+        return cacheInPath() ? juce::String ("baked into the cache")
                                  : effectNode != nullptr ? "FX: " + currentEffectName : juce::String ("no FX");
     const auto name = index == trkInst1 ? currentInstrumentName : extra (index).name;
     return name.isNotEmpty() ? name : juce::String ("-");
@@ -1025,12 +1044,19 @@ void MainComponent::setSlotEffect (int slot, std::unique_ptr<juce::AudioPluginIn
     auto& s = fxSlot (slot);
     s.editor = nullptr;
     if (s.node != nullptr)
+    {
+        s.node->getProcessor()->removeListener (this);
         graph.removeNode (s.node->nodeID);
+    }
     configureInstance (*instance, deviceManager);
     s.node = graph.addNode (std::move (instance));
     s.name = desc.name;
+    s.node->getProcessor()->addListener (this);          // a knob re-bakes the mix while PRE-RENDER is on
     if (preRenderActive())
-        setPreRenderEnabled (false);          // the cache holds the file and the master FX only: the mix has changed under it
+    {
+        setPreRenderEnabled (false);          // the in-process cache holds the file and the master FX only: decide again who bakes
+        setPreRenderEnabled (true);
+    }
     rebuildConnections();
     setStatus ("Loaded " + desc.name + (slot >= slotBusBase ? " into SEND " + juce::String (slot - slotBusBase + 1)
                                                             : " as the insert of " + juce::String (slot - slotInsertBase == trkAudio ? "AUDIO" : "INST " + juce::String (slot - slotInsertBase))));
@@ -1042,10 +1068,16 @@ void MainComponent::removeSlotEffect (int slot)
     s.editor = nullptr;
     if (s.node != nullptr)
     {
+        s.node->getProcessor()->removeListener (this);
         graph.removeNode (s.node->nodeID);
         s.node = nullptr;
     }
     s.name = {};
+    if (preRenderActive())
+    {
+        setPreRenderEnabled (false);
+        setPreRenderEnabled (true);
+    }
     rebuildConnections();
     setStatus ("Effect slot cleared.");
 }
@@ -1113,7 +1145,7 @@ void MainComponent::rebuildConnections()
 
     // While the PRE-RENDER cache plays, it already holds the AUDIO strip, the master FX and the master strip: none of them is in the
     // live path (docs/TRACKS.md). It does not hold inserts and sends, so the cache is not used while any is loaded.
-    const bool baked = preRenderActive();
+    const bool baked = cacheInPath();
 
     // --- master ---
     std::vector<Graph::Node::Ptr> masterChain;
@@ -1525,12 +1557,6 @@ void MainComponent::setPreRenderEnabled (bool shouldEnable)
 {
     if (shouldEnable)
     {
-        if (slotsInUse())
-        {
-            setStatus ("PRE-RENDER holds the file, the AUDIO strip, the master FX and the master strip; clear the inserts and the send buses first (or render_mix).");
-            preRenderButton.setToggleState (false, juce::dontSendNotification);
-            return;
-        }
         if (currentSourceMode() != srcFile || ! filePlayer->hasFile())
         {
             setStatus ("PRE-RENDER needs the file player as source with a file loaded.");
@@ -1538,12 +1564,26 @@ void MainComponent::setPreRenderEnabled (bool shouldEnable)
             return;
         }
         preRenderButton.setToggleState (true, juce::dontSendNotification);
+        // with inserts or send buses loaded the in-process engine (file + master FX) cannot hold the mix: the rig bakes all of it
+        mixBakeMode = slotsInUse();
+        mixBakeReady = false;
+        mixBakeDirty = false;
+        if (mixBakeMode)
+        {
+            renderLabel.setText ("PRE-RENDER: baking the mix (rig) ...", juce::dontSendNotification);
+            setStatus ("PRE-RENDER: inserts / send buses are loaded, so the rig bakes the whole mix (changes re-bake it when things are quiet).");
+            startMixBake();
+            return;
+        }
         beginPreRender();
     }
     else
     {
         preRenderButton.setToggleState (false, juce::dontSendNotification);
         renderEngine.stopRender();
+        mixBakeMode = false;
+        mixBakeReady = false;
+        mixBakeDirty = false;
         filePlayer->reattachReader();
         if (effectNode != nullptr)
             effectNode->setBypassed (bypassButton.getToggleState());
@@ -1555,6 +1595,11 @@ void MainComponent::setPreRenderEnabled (bool shouldEnable)
 
 void MainComponent::beginPreRender()
 {
+    if (mixBakeMode)
+    {
+        startMixBake();       // a new file, a new bounce: bake again
+        return;
+    }
     renderEngine.stopRender();
 
     // 150M samples @48k stereo float ~= 52 min / 1.2 GB RAM - a sane ceiling.
@@ -1593,6 +1638,11 @@ void MainComponent::beginPreRender()
 
 void MainComponent::createOfflineFx()
 {
+    if (mixBakeMode)
+    {
+        markBakeDirty();      // the rig makes its own instances
+        return;
+    }
     offlineFxLoading = true;
     setStatus ("Creating offline FX instance ...");
     formatManager.createPluginInstanceAsync (
@@ -1615,6 +1665,11 @@ void MainComponent::createOfflineFx()
 
 void MainComponent::syncOfflineStateAndRender (bool quickOnly)
 {
+    if (mixBakeMode)
+    {
+        markBakeDirty();      // no cursor-first quick updates in the rig: one bake, once things are quiet
+        return;
+    }
     if (effectNode != nullptr && offlineFx != nullptr)
     {
         juce::MemoryBlock state;
@@ -1922,6 +1977,10 @@ juce::var MainComponent::collectGpuParams() const
 void MainComponent::audioProcessorParameterChanged (juce::AudioProcessor* proc, int, float)
 {
     // May arrive on any thread: only touch atomics.
+    if (mixBakeMode)
+        markBakeDirty();          // any knob of anything in the mix: the rig re-bakes it
+    if (mixBakeMode && proc != nullptr && ! (proc == instrumentProc.load() || proc == extraProc[0].load() || proc == extraProc[1].load()))
+        return;                   // (not an instrument: nothing else to mark; the engine's fxStale is not used while the rig bakes)
     if (proc != nullptr && (proc == instrumentProc.load() || proc == extraProc[0].load() || proc == extraProc[1].load()))
     {
         instStale = true;
@@ -1938,6 +1997,10 @@ void MainComponent::audioProcessorChanged (juce::AudioProcessor* proc, const Cha
 {
     if (details.parameterInfoChanged || details.programChanged)
     {
+        if (mixBakeMode)
+            markBakeDirty();
+        if (mixBakeMode && proc != nullptr && ! (proc == instrumentProc.load() || proc == extraProc[0].load() || proc == extraProc[1].load()))
+            return;
         if (proc != nullptr && (proc == instrumentProc.load() || proc == extraProc[0].load() || proc == extraProc[1].load()))
         {
             instStale = true;
@@ -2057,7 +2120,17 @@ void MainComponent::changeListenerCallback (juce::ChangeBroadcaster*)
 void MainComponent::timerCallback()
 {
     // --- PRE-RENDER housekeeping ---
-    if (preRenderActive())
+    if (mixBakeMode && preRenderActive())
+    {
+        const auto now = juce::Time::getMillisecondCounter();
+        if (mixBakeDirty.load() && ! mixBakeRunning && ! rigWorker.isRunning() && now - mixBakeLastChangeMs.load() > 800)
+            startMixBake();
+        if (mixBakeRunning)
+            renderLabel.setText (mixBakeReady ? "PRE-RENDER: re-baking the mix (rig) ..." : "PRE-RENDER: baking the mix (rig) ...", juce::dontSendNotification);
+        else if (mixBakeDirty.load())
+            renderLabel.setText ("PRE-RENDER: the mix changed - re-bake pending ...", juce::dontSendNotification);
+    }
+    else if (preRenderActive())
     {
         if (renderEngine.isRendering())
         {

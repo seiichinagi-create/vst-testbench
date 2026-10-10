@@ -2,7 +2,10 @@
 """PRE-RENDER bakes the mixer strips (docs/TRACKS.md): the cache is AUDIO strip -> FX -> master strip, so what plays from it must
 equal what the live graph plays with the same strips.
 
-  python tools/prerender_strips.py [--fx "Legacy Distortion"] [--param Drive=0.7]
+  python tools/prerender_strips.py [--fx "Legacy Distortion"] [--param Drive=0.7] [--slots]
+
+With --slots an insert on AUDIO and send bus 1 (an FX and a return strip) are loaded too: the in-process engine cannot hold them,
+so the rig bakes the whole mix (status prerender_mode "rig"); the cache must still equal the live graph.
 
 Live recording (PRE-RENDER off) against the recording of the cache (PRE-RENDER on), strips set (AUDIO -4 dB / balance 0.3,
 master -2 dB), over the body of the file (the cache ends with the file: the FX ring-out after the last sample is not in it).
@@ -32,6 +35,7 @@ def main():
     ap.add_argument("--param", default="Drive=0.7")
     ap.add_argument("--seconds", type=float, default=3.0)
     ap.add_argument("--limit", type=float, default=-100.0)
+    ap.add_argument("--slots", action="store_true")
     a = ap.parse_args()
     pname, pval = a.param.split("="); pval = float(pval)
     tb = TestBench()
@@ -53,19 +57,36 @@ def main():
     assert tb.call("load_audio", path=src).get("ok"); tb.wait_idle()
     tb.call("set_source", mode="file"); tb.wait_idle()
 
+    if a.slots:
+        assert tb.call("load_plugin", role="insert_audio", name=a.fx).get("ok"); tb.wait_idle()
+        assert tb.call("set_param", role="insert_audio", name=pname, value=0.4).get("ok")
+        assert tb.call("load_plugin", role="send1", name=a.fx).get("ok"); tb.wait_idle()
+        assert tb.call("set_param", role="send1", name=pname, value=0.2).get("ok")
+        tb.call("track_set", track="audio", send1_db=-6.0)
+        tb.call("track_set", track="send1", gain_db=-3.0)
     tb.call("track_set", track="audio", gain_db=-4.0, balance=0.3)
     tb.call("track_set", track="master", gain_db=-2.0)
     live = record(tb, os.path.join(tmp, "prs_live.wav"), a.seconds)
 
-    assert tb.call("prerender", on=True).get("ok"); tb.wait_idle()
-    time.sleep(0.5); tb.wait_idle()
+    assert tb.call("prerender", on=True).get("ok"); tb.wait_idle(timeout=180)
+    time.sleep(0.5); tb.wait_idle(timeout=180)
+    mode = tb.call("status").get("prerender_mode")
+    print("prerender_mode:", mode)
+    if a.slots and mode != "rig":
+        raise SystemExit("the rig should bake when inserts / sends are loaded")
     baked = record(tb, os.path.join(tmp, "prs_baked.wav"), a.seconds)
 
     tb.call("track_set", track="audio", gain_db=0.0, balance=0.0)
     tb.call("track_set", track="master", gain_db=0.0)
-    time.sleep(1.0); tb.wait_idle(); time.sleep(0.5); tb.wait_idle()      # the cache re-renders with the strips at their defaults
+    if a.slots:
+        tb.call("track_set", track="audio", send1_db=-100.0)
+    time.sleep(1.5); tb.wait_idle(timeout=180); time.sleep(0.5); tb.wait_idle(timeout=180)      # the cache re-renders with the strips at their defaults
     plain = record(tb, os.path.join(tmp, "prs_plain.wav"), a.seconds)
     tb.call("prerender", on=False); tb.wait_idle()
+    if a.slots:
+        for r in ("insert_audio", "send1"):
+            tb.call("remove_plugin", role=r)
+        tb.call("track_set", track="send1", gain_db=0.0)
 
     # the body of the file: the cache ends with the file, so the FX ring-out after its last sample is in the live path only
     n_body = int((a.seconds - 0.3) * rate)

@@ -155,8 +155,9 @@ juce::var MainComponent::controlStatus() const
     put (o, "status_text", statusLabel.getText());
 
     const bool busy = pendingLoads > 0 || bounceRunning() || rigWorker.isRunning() || araProbePending || offlineInstLoading || offlineFxLoading
-                      || firstBouncePending || (preRenderActive() && renderEngine.isRendering())
-                      || (preRenderActive() && fxStale.load());
+                      || firstBouncePending || (preRenderActive() && ! mixBakeMode && renderEngine.isRendering())
+                      || (preRenderActive() && ! mixBakeMode && fxStale.load())
+                      || (mixBakeMode && preRenderActive() && (mixBakeRunning || mixBakeDirty.load() || ! mixBakeReady));
     put (o, "busy", busy);
 
     {
@@ -212,6 +213,7 @@ juce::var MainComponent::controlStatus() const
     if (! araProbeResult.isVoid())
         put (o, "ara_probe", araProbeResult);
     put (o, "prerender", preRenderActive());
+    put (o, "prerender_mode", ! preRenderActive() ? "off" : mixBakeMode ? "rig" : "engine");
     put (o, "gpu_fx", gpuFxButton.getToggleState());
 
     {
@@ -285,6 +287,7 @@ juce::var MainComponent::handleControl (const juce::var& req)
         {
             if (req.hasProperty ("send1_db")) sendLevel[t][0]->setGainDb ((float) (double) req["send1_db"]);
             if (req.hasProperty ("send2_db")) sendLevel[t][1]->setGainDb ((float) (double) req["send2_db"]);
+            if (req.hasProperty ("send1_db") || req.hasProperty ("send2_db")) markBakeDirty();
         }
         else if (req.hasProperty ("send1_db") || req.hasProperty ("send2_db"))
             return fail ("send1_db / send2_db apply to audio, inst1, inst2 and inst3");
@@ -1195,16 +1198,17 @@ juce::var MainComponent::buildMixRequest (const MixOptions& opt, const juce::var
     };
 
     // --- AUDIO: the file in the player (not when it is itself the bounce of the MIDI file: the instruments are rendered directly) ---
-    if (opt.audio && strips[trkAudio]->isAudible())
+    const auto takes = [&] (int tr) { return opt.sounding ? strips[tr]->isSounding() : strips[tr]->isAudible(); };
+    if (opt.audio && takes (trkAudio))
     {
-        if (midiChainActive())                      left.add ("AUDIO (it is the bounce of the MIDI file: the instruments are rendered directly)");
+        if (midiChainActive() && ! opt.audioWhenChain) left.add ("AUDIO (it is the bounce of the MIDI file: the instruments are rendered directly)");
         else if (currentSourceMode() != srcFile)    left.add ("AUDIO (the live input is not a file)");
         else if (! filePlayer->hasFile())           left.add ("AUDIO (no file loaded)");
         else
         {
             auto t = makeObj();
             put (t, "source", "file");
-            put (t, "source_path", currentPlayableFile.getFullPathName());
+            put (t, "source_path", effectivePlayableFile().getFullPathName());
             put (t, "gain_db", (double) strips[trkAudio]->getGainDb());
             put (t, "balance", (double) strips[trkAudio]->getBalance());
             addInsertAndSends (t, trkAudio);
@@ -1216,7 +1220,7 @@ juce::var MainComponent::buildMixRequest (const MixOptions& opt, const juce::var
     for (int tr = trkInst1; opt.insts && tr < numTracks; ++tr)
     {
         const auto inst = tr == trkInst1 ? instrumentNode : extra (tr).node;
-        if (inst == nullptr || ! strips[tr]->isAudible())
+        if (inst == nullptr || ! takes (tr))
             continue;
         const auto name = "INST " + juce::String (tr);
         if (midiSequence.getNumEvents() == 0)       { left.add (name + " (no MIDI file loaded)"); continue; }
@@ -1304,6 +1308,116 @@ bool MainComponent::instrumentsNeedRig() const
         if (extra (t).node != nullptr && hasEvents (t))
             return true;
     return instrumentNode != nullptr && midiFilters[trkInst1]->getMask() != 0xFFFFu;
+}
+
+// PRE-RENDER by the rig: the whole mix as the live graph plays it now (the sounding tracks, inserts, sends and buses, the master FX
+// and strip) rendered offline in the worker process; the result becomes the cache that plays.
+void MainComponent::startMixBake()
+{
+    if (mixBakeRunning || rigWorker.isRunning())
+    {
+        markBakeDirty();                    // one job at a time: the timer tries again
+        return;
+    }
+    mixBakeDirty = false;
+
+    ++bakeGeneration;
+    const auto out = appDir().getChildFile (juce::String::formatted ("mixbake_%04d.wav", bakeGeneration));
+    auto o = makeObj();
+    put (o, "out", out.getFullPathName());
+    put (o, "tail", 2.0);
+    put (o, "compensate", true);
+    MixOptions opt;
+    opt.sounding = true;
+    opt.audioWhenChain = true;
+    opt.insts = false;                      // PRE-RENDER is file mode: the instruments are inside the file (the MIDI chain's bounce)
+    juce::StringArray left;
+    auto rq = buildMixRequest (opt, o, left);
+    if (rq["tracks"].getArray() == nullptr || rq["tracks"].getArray()->isEmpty())
+    {
+        setStatus ("PRE-RENDER: nothing sounding to bake (the AUDIO track is muted?)");
+        setPreRenderEnabled (false);
+        return;
+    }
+    const auto r = startRigRender (rq);
+    if (r.hasProperty ("error"))
+    {
+        setStatus ("PRE-RENDER: the rig did not start: " + r["error"].toString());
+        setPreRenderEnabled (false);
+        return;
+    }
+
+    mixBakeRunning = true;
+    const double t0 = juce::Time::getMillisecondCounterHiRes();
+    rigExtraDone = [safe = juce::Component::SafePointer<MainComponent> (this), out, t0] (const juce::var& result)
+    {
+        if (safe == nullptr)
+            return;
+        safe->mixBakeRunning = false;
+        const bool ok = (bool) result.getProperty ("ok", false);
+        juce::String info = result["error"].toString();
+        if (ok)
+        {
+            const double seconds = (double) result.getProperty ("samples", 0) / juce::jmax (1.0, (double) result.getProperty ("sample_rate", 48000.0));
+            info = juce::String::formatted ("rig, %.1f s in %.1f s", seconds, (juce::Time::getMillisecondCounterHiRes() - t0) / 1000.0);
+        }
+        safe->finishMixBake (ok, out, info);
+    };
+}
+
+void MainComponent::finishMixBake (bool ok, const juce::File& out, const juce::String& info)
+{
+    if (! preRenderActive() || ! mixBakeMode)       // switched off while the rig ran
+    {
+        out.deleteFile();
+        return;
+    }
+    if (! ok)
+    {
+        out.deleteFile();
+        renderLabel.setText ("PRE-RENDER: bake FAILED: " + info, juce::dontSendNotification);
+        setStatus ("PRE-RENDER bake failed: " + info);
+        return;
+    }
+    std::unique_ptr<juce::AudioFormatReader> reader (audioFormats.createReaderFor (out));
+    if (reader == nullptr || reader->lengthInSamples <= 0 || reader->lengthInSamples > 150'000'000)
+    {
+        out.deleteFile();
+        renderLabel.setText ("PRE-RENDER: could not read the bake", juce::dontSendNotification);
+        return;
+    }
+
+    // fill the cache that is not playing, then swap (the playing one is never written)
+    const int next = 1 - bakeSlotInUse;
+    auto& c = bakeCache[next];
+    const auto n = (int) reader->lengthInSamples;
+    c.data.setSize (2, n, false, true, true);
+    reader->read (&c.data, 0, n, 0, true, true);
+    if (reader->numChannels == 1)
+        c.data.copyFrom (1, 0, c.data, 0, 0, n);
+    c.length = n;
+    c.sampleRate = reader->sampleRate;
+    c.valid.store (n);
+    c.primed.store (true);
+    reader.reset();
+    if (bakeSource[next] == nullptr)
+        bakeSource[next] = std::make_unique<CacheAudioSource> (c);
+    bakeSource[next]->setLooping (loopButton.getToggleState());
+
+    const bool playing = filePlayer->transport.isPlaying();
+    filePlayer->attachExternalSource (bakeSource[next].get(), c.sampleRate);
+    if (playing)
+        filePlayer->transport.start();
+    bakeSlotInUse = next;
+
+    const bool firstBake = ! mixBakeReady;
+    mixBakeReady = true;
+    if (firstBake)
+        rebuildConnections();                        // from now on the cache is the sound: strips, inserts, sends and FX leave the live path
+    if (currentBakeFile.existsAsFile() && currentBakeFile != out)
+        currentBakeFile.deleteFile();
+    currentBakeFile = out;
+    renderLabel.setText ("PRE-RENDER: mix baked (" + info + ")", juce::dontSendNotification);
 }
 
 bool MainComponent::startMidiMixBounce()

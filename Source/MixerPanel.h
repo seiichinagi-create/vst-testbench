@@ -21,6 +21,7 @@ public:
         std::function<juce::String (int index, bool insert)> describe;   // what the track / slot shows
         std::function<void()> soloChanged;                               // a solo button was pressed: the host recomputes who is silenced
         std::function<void (int index)> stripChanged;                    // gain / balance / mute / MIDI channels (index as above; 6 = master)
+        std::function<void()> sendChanged;                               // a send level moved
     };
 
     // what the strips drive
@@ -169,6 +170,7 @@ private:
                     {
                         const double v = sendSlider[n].getValue();
                         send[n]->setGainDb (v <= -59.9 ? -100.0f : (float) v);
+                        if (owner.hooks.sendChanged) owner.hooks.sendChanged();
                     };
                     addAndMakeVisible (sl);
                 }
