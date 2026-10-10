@@ -26,8 +26,8 @@ namespace rigjob
     {
         juce::AudioProcessor* plugin = nullptr;
         std::shared_ptr<juce::AudioBuffer<float>> data;
-        double sampleRate = 48000.0;
-        juce::int64 start = 0, offset = 0, length = 0;
+        double fileSampleRate = 48000.0;
+        double start = 0.0, offset = 0.0, length = 0.0;     // seconds
     };
 
     inline bool buildStage (const juce::var& st, juce::AudioPluginFormatManager& formats, const RigRender::Spec& spec,
@@ -162,7 +162,8 @@ namespace rigjob
                 const juce::File f (tj["source_path"].toString());
                 std::unique_ptr<juce::AudioFormatReader> reader (f.existsAsFile() ? wav.createReaderFor (f.createInputStream().release(), true) : nullptr);
                 if (reader == nullptr) { error = "cannot read source wav " + f.getFullPathName(); return false; }
-                if (std::abs (reader->sampleRate - spec.sampleRate) > 0.5)
+                // a plain clip is played sample for sample, so its rate must be the render's; an ARA plug-in converts it
+                if (source == "file" && std::abs (reader->sampleRate - spec.sampleRate) > 0.5)
                 {
                     error = "source wav is " + juce::String (reader->sampleRate) + " Hz, the job runs at " + juce::String (spec.sampleRate);
                     return false;
@@ -180,10 +181,12 @@ namespace rigjob
                 if (source == "ara")
                 {
                     // the plug-in reads the file itself, through the ARA document: no source stage, the plug-in is stage 0
-                    const juce::int64 inFile = (juce::int64) data->getNumSamples() - clipOffset;
-                    const juce::int64 len = clipLength < 0 ? inFile : juce::jmin (clipLength, inFile);
-                    tr.sourceSamples = clipStart + len;
-                    pendingAra = { nullptr, data, spec.sampleRate, clipStart, clipOffset, len };
+                    const double fileRate = reader->sampleRate;
+                    const double startSec = tnum ("clip_start", 0.0), offsetSec = tnum ("clip_offset", 0.0);
+                    const double inFileSec = (double) data->getNumSamples() / fileRate - offsetSec;
+                    const double lenSec = tj.hasProperty ("clip_length") ? juce::jmin (tnum ("clip_length", 0.0), inFileSec) : inFileSec;
+                    tr.sourceSamples = (juce::int64) std::llround ((startSec + lenSec) * spec.sampleRate);
+                    pendingAra = { nullptr, data, fileRate, startSec, offsetSec, lenSec };
                     if (gain != 1.0f)
                     {
                         error = "ara: clip_gain_db is not applied by an ARA playback region";

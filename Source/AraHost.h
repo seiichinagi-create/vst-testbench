@@ -20,13 +20,14 @@
 class AraSession
 {
 public:
+    // Seconds, not samples: the file has its own sample rate, which need not be the rate the render runs at.
     struct Clip
     {
         std::shared_ptr<juce::AudioBuffer<float>> data;   // the whole file
-        double sampleRate = 48000.0;
-        juce::int64 start = 0;      // where the region sits on the timeline, in samples
-        juce::int64 offset = 0;     // where in the file it starts
-        juce::int64 length = 0;     // how long it is
+        double fileSampleRate = 48000.0;
+        double start = 0.0;         // where the region sits on the timeline
+        double offset = 0.0;        // where in the file it starts
+        double length = 0.0;        // how long it is
     };
 
     ~AraSession()
@@ -66,7 +67,7 @@ public:
             }
 
             auto& dc = doc->getDocumentController();
-            const double sr = clip.sampleRate;
+            const double sr = clip.fileSampleRate;
             {
                 const juce::ARAEditGuard guard (dc);
 
@@ -97,10 +98,10 @@ public:
 
                 auto prProps = juce::ARAHostModel::PlaybackRegion::getEmptyProperties();
                 prProps.transformationFlags = ARA::kARAPlaybackTransformationNoChanges;
-                prProps.startInModificationTime = (double) clip.offset / sr;
-                prProps.durationInModificationTime = (double) clip.length / sr;
-                prProps.startInPlaybackTime = (double) clip.start / sr;
-                prProps.durationInPlaybackTime = (double) clip.length / sr;
+                prProps.startInModificationTime = clip.offset;
+                prProps.durationInModificationTime = clip.length;
+                prProps.startInPlaybackTime = clip.start;
+                prProps.durationInPlaybackTime = clip.length;
                 prProps.regionSequenceRef = sequence->getPluginRef();
                 prProps.name = "clip";
                 region = std::make_unique<juce::ARAHostModel::PlaybackRegion> (hostRef<ARA::ARAPlaybackRegionHostRef> (5), dc, *modification, prProps);

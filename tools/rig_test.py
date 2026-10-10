@@ -43,6 +43,10 @@
               edit must be transparent: its output equals the plain clip render (same clip_start / clip_offset /
               clip_length) sample for sample, with no extra latency. Control: the same comparison against a clip one sample
               later must fail.
+15. ARA under variation   the same ARA render with the stream cut into irregular blocks (1..512 samples), and with the render
+              running at 44.1 kHz and 96 kHz on a file of that rate, must equal the plain clip render. A file whose rate is NOT
+              the render's (48 kHz source, 96 kHz render) is converted by the plug-in: not compared sample for sample; its
+              timing (where a click lands) and level are reported against the ideal.
 13. audio clips        a stereo audio clip on a track: where it sits on the timeline (clip_start), where in the file it starts
               (clip_offset), how long it is (clip_length) and its gain. Marks at known places in the file must come out at
               the computed places and levels, and nothing outside the clip may be heard. The clip is also the model of an
@@ -499,6 +503,70 @@ def audio_clip(rig, bad):
         bad.append(f"audio clip: placed marks {clip} (length {n_clip}), expected {want_clip}")
 
 
+def write_float_wav(path, x, rate):
+    data = x.astype("<f4").tobytes()
+    with open(path, "wb") as f:
+        f.write(b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVE" + b"fmt " +
+                struct.pack("<IHHIIHH", 16, 3, 2, rate, rate * 8, 8, 32) + b"data" + struct.pack("<I", len(data)) + data)
+
+
+def ara_test_signal(rate, seconds=2.0):
+    t = np.arange(int(rate * seconds)) / rate
+    x = np.zeros((len(t), 2))
+    x[:, 0] = 0.2 * np.sin(2 * np.pi * 440 * t) * (t < 1.0)
+    x[:, 1] = 0.2 * np.sin(2 * np.pi * 660 * t) * (t >= 1.0)
+    x[int(0.5 * rate), :] += 0.5
+    return x
+
+
+def ara_variation(rig, a, bad, notes):
+    if not os.path.exists(a.ara):
+        return
+    name = a.ara_name
+    # 1. irregular blocks
+    path = abs_data(rig, "ara_in.wav")
+    write_float_wav(path, ara_test_signal(SR_), SR_)
+    try:
+        rig.render("av_a.wav", source="ara", source_path=path, ara=a.ara, tail=0.5, block=512, block_pattern=ODD_BLOCKS)
+    except RuntimeError as e:
+        print(f"  ARA variation: skipped ({str(e)[:90]})")
+        return
+    rig.render("av_r.wav", source="file", source_path=path, tail=0.5, block=512)
+    same = np.array_equal(rig.read("av_a.wav"), rig.read("av_r.wav"))
+    print(f"  ARA ({name}) with irregular blocks 1..512: {'identical to the plain clip render' if same else 'DIFFERENT'}")
+    if not same:
+        bad.append(f"ARA ({name}): the output changes when the stream is cut into irregular blocks")
+
+    # 2. other sample rates, on a file of the same rate
+    for rate in (44100, 96000):
+        p2 = abs_data(rig, f"ara_in_{rate}.wav")
+        write_float_wav(p2, ara_test_signal(rate), rate)
+        rig.render("av_a.wav", source="ara", source_path=p2, ara=a.ara, tail=0.5, rate=rate)
+        rig.render("av_r.wav", source="file", source_path=p2, tail=0.5, rate=rate)
+        got, ref = rig.read("av_a.wav"), rig.read("av_r.wav")
+        same = np.array_equal(got, ref)
+        d = db(np.abs(got[:len(ref)] - ref[:len(got)]).max() / max(np.abs(ref).max(), 1e-12))
+        print(f"  ARA ({name}) at {rate} Hz on a {rate} Hz file: {'identical to the plain clip render' if same else f'DIFFERENT, {d:.1f} dB re peak'}")
+        if not same:
+            bad.append(f"ARA ({name}): not transparent at {rate} Hz ({d:.1f} dB re peak)")
+
+    # 3. a file whose rate is not the render's: the plug-in converts; report where the click lands and how loud it is
+    for rate in (96000, 44100):
+        rig.render("av_x.wav", source="ara", source_path=path, ara=a.ara, tail=0.5, rate=rate)
+        y = rig.read("av_x.wav").reshape(-1, 2)
+        click = int(0.5 * rate)
+        win = y[click - 64:click + 65]
+        peak_at = int(np.argmax(np.abs(win).max(axis=1))) - 64
+        # the click is 0.5 on both channels plus the tone; compare the right channel (silent before 1 s: only the click)
+        right = np.abs(y[click - 64:click + 65, 1])
+        print(f"    48 kHz file at a {rate} Hz render ({name}): length {len(y) / rate:.4f} s (expected 2.5000), the click peaks "
+              f"{peak_at:+d} samples from where it should (peak {right.max():.3f}; 0.5 before conversion)")
+        if abs(len(y) / rate - 2.5) > 0.01:
+            bad.append(f"ARA ({name}): a 48 kHz file at a {rate} Hz render has the wrong length ({len(y) / rate:.4f} s)")
+        if abs(peak_at) > 2:
+            notes.append(f"{name}: a 48 kHz file rendered at {rate} Hz puts the click {peak_at:+d} samples off")
+
+
 def ara_playback(rig, a, bad, notes):
     if not os.path.exists(a.ara):
         print(f"  ARA: skipped ({a.ara} is not installed)")
@@ -679,6 +747,7 @@ def main():
     block_automation(rig, bad)
     audio_clip(rig, bad)
     ara_playback(rig, a, bad, notes)
+    ara_variation(rig, a, bad, notes)
 
     # 9: instance interference (findings about plugins)
     instance_interference(rig, a.interference, notes)

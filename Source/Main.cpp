@@ -56,7 +56,7 @@ public:
                 log ("ARA: building the document");
                 auto* instance = dynamic_cast<juce::AudioPluginInstance*> (araPlans[0].plugin);
                 if (instance == nullptr) { finishWith (fail ("ara: the plug-in is not a plug-in instance")); return; }
-                AraSession::Clip clip { araPlans[0].data, araPlans[0].sampleRate, araPlans[0].start, araPlans[0].offset, araPlans[0].length };
+                AraSession::Clip clip { araPlans[0].data, araPlans[0].fileSampleRate, araPlans[0].start, araPlans[0].offset, araPlans[0].length };
                 araSession = std::make_unique<AraSession>();
                 araSession->start (*instance, clip, [this] (bool ok, juce::String message)
                 {
