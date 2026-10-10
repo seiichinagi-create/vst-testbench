@@ -11,7 +11,33 @@
                   parallel graph  ==  dry stem + wet stem        (null residual)
               Control: the sum WITHOUT delay compensation must NOT null. Otherwise the test could not
               tell a compensating host from a non-compensating one and its pass means nothing.
-Not yet: declared-vs-actual latency (impulse), instance interference, state round-trip, master tail.
+
+ 4. declared vs actual latency   a unit impulse goes through the plug-in with compensation off; the PEAK position is
+              compared with the declared latency, at four levels (the position must not depend on the level):
+                  measured < declared - 1      FAIL  over-declared: a compensating host trims real signal
+                  measured > declared + 28     FAIL  declared far too small (28 = the 2026-10-09 ruling; --late-limit)
+                  in between                   ok; the excess is printed (a plug-in's own model delay is expected)
+              A cascade is information only (the peak of two nonlinear stages moves with level). Controls first: a pure
+              delay with a known true value and a declared value of our choosing; honest and dishonest must be told apart.
+ 5. state round-trip   a plug-in configured in the bench and saved (save_state) must render exactly like a fresh instance
+              given the same parameters by name (<role>_params).
+ 6. split vs whole     insert + master in one render must equal the two stages rendered one after the other, the first
+              one's wav fed to the second (source=file). Control: the wrong state on the second stage must NOT match.
+ 7. master tail        the time a master effect keeps ringing (60 dB down) against the tail it DECLARES; a longer render
+              must not change the samples of a shorter one. Controls: a decay of known length, honest and dishonest.
+ 8. three tracks       three tracks summed into a master: the graph lines them up by declared latency. Dummy delays (7/0/3)
+              meet in one sample; a track that declares less than it delays must break that (control). With real plug-ins
+              the sum of the separate renders must equal the three-track render.
+ 9. instance interference   two instances of one instrument playing at once must sum to their separate renders. A plug-in
+              that fails is a NOTE (a finding about the plug-in); the rig is right where Matryoshka Guitar sums at -147 dB.
+10. variable block sizes   the host may hand a plug-in any block length from 1 to the prepared maximum, changing from call
+              to call. The output must not depend on how the stream was cut: an irregular block pattern must equal the
+              fixed-block render. Control: a parameter change applied at the start of the block it falls in (the quantised
+              mode) does depend on the cut, so the same comparison must fail there.
+11. transport info     tempo, time signature and position as the plug-in receives them (a probe writes them into the audio):
+              the bpm sent is the bpm seen, and the position advances by bpm/60/sr quarter notes per sample.
+12. in-block automation   a parameter change at sample N must take effect at sample N whatever the block pattern. The
+              quantised mode is the control: it moves the change to a block boundary.
 """
 import argparse, hashlib, os, struct, sys, time
 import numpy as np
@@ -311,6 +337,125 @@ def three_tracks(rig, a, bad):
         bad.append(f"three tracks: the control is not discriminating ({ctl:.1f} dB)")
 
 
+def write_dc(rig, name, value=0.5, seconds=0.5):
+    """A constant-level stereo float wav in the bench's data folder: a source whose output shows only what the stage did."""
+    n = int(SR_ * seconds)
+    data = np.full(n * 2, value, dtype="<f4").tobytes()
+    hdr = (b"RIFF" + struct.pack("<I", 36 + len(data)) + b"WAVE" + b"fmt " +
+           struct.pack("<IHHIIHH", 16, 3, 2, SR_, SR_ * 8, 8, 32) + b"data" + struct.pack("<I", len(data)))
+    path = abs_data(rig, name)
+    with open(path, "wb") as f:
+        f.write(hdr + data)
+    return path
+
+
+ODD_BLOCKS = [37, 512, 1, 128, 61, 300, 7, 450]
+
+
+def variable_blocks(rig, a, bad, notes):
+    # plug-ins: a fixed 512-sample render against one cut into irregular pieces (1..512 samples)
+    ev = [{"t": 0.0, "type": "note_on", "ch": 1, "note": 57, "vel": 100, "dur": 0.4},
+          {"t": 0.21, "type": "note_on", "ch": 1, "note": 64, "vel": 90, "dur": 0.3}]
+    cases = [("Legacy Distortion (impulse)", dict(source="impulse", impulse_at=IMPULSE_AT, impulse_amp=0.1, insert=a.insert)),
+             (f"{a.multi_inst} + {a.insert} (MIDI)", dict(inst=a.multi_inst, events=ev, insert=a.insert))]
+    for name, kw in cases:
+        rig.render("vb_fixed.wav", block=512, tail=0.5, **kw)
+        res = rig.render("vb_odd.wav", block=512, block_pattern=ODD_BLOCKS, tail=0.5, **kw)
+        x, y = rig.read("vb_fixed.wav"), rig.read("vb_odd.wav")
+        same = np.array_equal(x, y)
+        d = db(np.abs(x - y).max() / max(np.abs(x).max(), 1e-12))
+        print(f"  {name}: blocks of {res['block_min']}..{res['block_max']} samples ({res['blocks']} calls) vs fixed 512: "
+              f"{'identical' if same else f'DIFFERENT, {d:.1f} dB re peak'}")
+        if not same:
+            bad.append(f"variable blocks: {name} depends on how the stream is cut ({d:.1f} dB re peak)")
+        if res["block_min"] != 1:
+            bad.append("variable blocks: the 1-sample block of the pattern was never used")
+
+    # plug-ins that are expected to be block-size independent but are not are findings about the plug-in
+    for plug in a.interference:
+        try:
+            kw = dict(inst=plug, events=ev)
+            rig.render("vb_f.wav", block=512, tail=0.5, **kw)
+            rig.render("vb_o.wav", block=512, block_pattern=ODD_BLOCKS, tail=0.5, **kw)
+        except RuntimeError as e:
+            print(f"  {plug}: skipped ({str(e)[:50]})")
+            continue
+        x, y = rig.read("vb_f.wav"), rig.read("vb_o.wav")
+        if np.abs(x).max() < 1e-7:
+            continue
+        same = np.array_equal(x, y)
+        d = db(np.abs(x - y).max() / np.abs(x).max())
+        print(f"  {plug}: irregular blocks vs fixed 512: {'identical' if same else f'DIFFERENT, {d:.1f} dB re peak'}")
+        if not same:
+            notes.append(f"{plug}: its output depends on how the stream is cut into blocks ({d:.1f} dB re peak)")
+
+    # control: a change applied at the start of the block it falls in depends on the cut
+    dc = write_dc(rig, "vb_dc.wav")
+    auto = [dict(track=0, role="insert", param="gain", points=[[0.0123, 0.5]])]
+    rig.render("vb_q1.wav", source="file", source_path=dc, probe="gain", automation=auto, automation_quantised=True,
+               block=512, tail=0.0)
+    rig.render("vb_q2.wav", source="file", source_path=dc, probe="gain", automation=auto, automation_quantised=True,
+               block=512, block_pattern=ODD_BLOCKS, tail=0.0)
+    differs = not np.array_equal(rig.read("vb_q1.wav"), rig.read("vb_q2.wav"))
+    print(f"    control, a parameter change quantised to the block start: depends on the cut: {differs} (must be True)")
+    if not differs:
+        bad.append("variable blocks: the control did not react to the block pattern, so the comparison proves nothing")
+
+
+def transport_info(rig, bad):
+    SIG = [3, 4]
+    r = rig.render("tr_probe.wav", source="impulse", impulse_at=IMPULSE_AT, impulse_amp=0.1, probe="playhead",
+                   bpm=133.0, time_sig=SIG, tail=0.5, block_pattern=ODD_BLOCKS)
+    x = rig.read("tr_probe.wav").reshape(-1, 2)
+    bpm = x[:, 0] * 1000.0
+    ppq = x[:, 1] * 1000.0
+    per = 133.0 / 60.0 / SR_
+    slope = (ppq[-1] - ppq[0]) / (len(ppq) - 1)
+    jump = np.abs(np.diff(ppq) - per).max()          # no jump at any block boundary
+    ok_bpm = np.allclose(bpm, 133.0, atol=1e-3)
+    ok_pos = abs(slope - per) / per < 1e-3 and ppq[0] == 0.0 and jump / per < 0.05
+    print(f"  transport: bpm seen {bpm.min():.3f}..{bpm.max():.3f} (sent 133); position starts at {ppq[0]:.3f} quarter notes, "
+          f"advances {slope:.4e} per sample (expected {per:.4e}), largest step error {jump / per * 100:.2f} % of a sample's worth")
+    if not ok_bpm:
+        bad.append(f"transport: the plug-in saw bpm {bpm.min():.3f}..{bpm.max():.3f}, 133 was sent")
+    if not ok_pos:
+        bad.append("transport: the position did not advance smoothly from 0 at the expected rate across irregular blocks")
+    # control: with the host saying nothing the probe must say so (-1), or the read-back could not tell
+    # (the probe reads the play head; there is always one in this rig, so the control is the changed value)
+    r2 = rig.render("tr_probe2.wav", source="impulse", impulse_at=IMPULSE_AT, impulse_amp=0.1, probe="playhead",
+                    bpm=90.0, tail=0.1)
+    bpm2 = rig.read("tr_probe2.wav").reshape(-1, 2)[:, 0] * 1000.0
+    print(f"    control, bpm 90 sent: seen {bpm2.min():.3f}..{bpm2.max():.3f}")
+    if not np.allclose(bpm2, 90.0, atol=1e-3):
+        bad.append("transport: the probe did not follow a changed tempo")
+
+
+def block_automation(rig, bad):
+    dc = write_dc(rig, "au_dc.wav")
+    times = (0.0123, 0.0456, 0.0789)
+    auto = [dict(track=0, role="insert", param="gain", points=[[times[0], 0.5], [times[1], 1.0], [times[2], 0.25]])]
+    expect = [round(t * SR_) for t in times]
+
+    def changes(**kw):
+        rig.render("au_out.wav", source="file", source_path=dc, probe="gain", automation=auto, tail=0.0, **kw)
+        x = rig.read("au_out.wav").reshape(-1, 2)[:, 0]
+        return [int(i) + 1 for i in np.nonzero(np.abs(np.diff(x)) > 1e-9)[0]], x
+
+    for label, kw in (("block 512", dict(block=512)), ("block 4096", dict(block=4096)),
+                      ("irregular blocks", dict(block=512, block_pattern=ODD_BLOCKS))):
+        got, x = changes(**kw)
+        levels = [round(float(x[i]), 3) for i in (expect[0], expect[1], expect[2])]
+        ok = got == expect and levels == [0.25, 0.5, 0.125]
+        print(f"  automation, {label}: changes at samples {got} (expected {expect}); levels after each {levels}  {'ok' if ok else 'WRONG'}")
+        if not ok:
+            bad.append(f"automation ({label}): changes at {got}, expected {expect}")
+
+    got, _ = changes(block=512, automation_quantised=True)
+    print(f"    control, quantised to the block start (block 512): changes at {got} (must differ from {expect})")
+    if got == expect:
+        bad.append("automation: the control (block-quantised) landed on the exact samples, so the test could not tell")
+
+
 def instance_interference(rig, plugs, notes):
     """Two instances of one instrument playing different notes: the two-track render must equal the sum of the
     separate renders (and an idle second instance must not change the first). Findings go to `notes`: a plugin that
@@ -434,6 +579,11 @@ def main():
     # 7, 8: master tail, three tracks
     tail_check(rig, a, bad, notes)
     three_tracks(rig, a, bad)
+
+    # 10-12: what the host hands the plug-in on each call
+    variable_blocks(rig, a, bad, notes)
+    transport_info(rig, bad)
+    block_automation(rig, bad)
 
     # 9: instance interference (findings about plugins)
     instance_interference(rig, a.interference, notes)

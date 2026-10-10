@@ -764,6 +764,14 @@ juce::var MainComponent::startRigRender (const juce::var& req)
                                                      num (src, (prefix + "delay_actual").toRawUTF8(), 0.0)));
             return stage;
         }
+        // test doubles that report what the host does: "playhead" (transport info written into the audio) and "gain"
+        // (a host parameter that scales the audio)
+        if (role != "inst" && str (src, (juce::String (role == "master" ? "master_" : "") + "probe").toRawUTF8()).isNotEmpty())
+        {
+            put (stage, "kind", "probe");
+            put (stage, "probe", str (src, (juce::String (role == "master" ? "master_" : "") + "probe").toRawUTF8()));
+            return stage;
+        }
         if (role != "inst" && src.hasProperty (juce::String (role == "master" ? "master_" : "") + "tail_t60"))
         {
             const auto prefix = juce::String (role == "master" ? "master_" : "");
@@ -844,6 +852,12 @@ juce::var MainComponent::startRigRender (const juce::var& req)
     put (job, "dry_parallel", flag (req, "dry_parallel", false));
     put (job, "settle",       juce::jlimit (0, 10000, (int) num (req, "settle", 500.0)));
     put (job, "out",          resolvePath (str (req, "out", "rig.wav"), appDir()).getFullPathName());
+
+    put (job, "bpm", num (req, "bpm", 120.0));
+    put (job, "automation_quantised", flag (req, "automation_quantised", false));
+    if (req.hasProperty ("time_sig"))       put (job, "time_sig", req["time_sig"]);
+    if (req.hasProperty ("block_pattern"))  put (job, "block_pattern", req["block_pattern"]);
+    if (req.hasProperty ("automation"))     put (job, "automation", req["automation"]);
 
     juce::String error;
     juce::Array<juce::var> tracks;

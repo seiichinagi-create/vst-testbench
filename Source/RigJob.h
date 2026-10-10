@@ -40,6 +40,15 @@ namespace rigjob
             return true;
         }
 
+        if (kind == "probe")
+        {
+            const auto which = st["probe"].toString();
+            if (which == "playhead") { out = { role, std::make_unique<RigRender::PlayheadProbe>() }; return true; }
+            if (which == "gain")     { out = { role, std::make_unique<RigRender::GainProbe>() };     return true; }
+            error = role + ": unknown probe '" + which + "'";
+            return false;
+        }
+
         std::unique_ptr<juce::XmlElement> xml (juce::XmlDocument::parse (st["desc_xml"].toString()));
         juce::PluginDescription desc;
         if (xml == nullptr || ! desc.loadFromXml (*xml))
@@ -108,6 +117,13 @@ namespace rigjob
         spec.compensate  = job.hasProperty ("compensate") ? (bool) job["compensate"] : true;
         spec.dryParallel = job.hasProperty ("dry_parallel") ? (bool) job["dry_parallel"] : false;
         spec.settleMs    = (int) num ("settle", 500.0);
+        spec.bpm         = num ("bpm", 120.0);
+        spec.automationBlockQuantised = job.hasProperty ("automation_quantised") ? (bool) job["automation_quantised"] : false;
+        if (auto* sig = job["time_sig"].getArray())
+            if (sig->size() == 2) { spec.sigNum = (int) (*sig)[0]; spec.sigDen = (int) (*sig)[1]; }
+        if (auto* pat = job["block_pattern"].getArray())
+            for (const auto& v : *pat)
+                spec.blockPattern.push_back ((int) v);
         spec.out         = juce::File (job["out"].toString());
 
         auto* tracks = job["tracks"].getArray();
@@ -163,6 +179,33 @@ namespace rigjob
                 }
             spec.tracks.push_back (std::move (tr));
         }
+
+        // automation: [{ track: <index> | "master", role, param: <name>, points: [[seconds, value 0..1], ...] }]
+        if (auto* list = job["automation"].getArray())
+            for (const auto& a : *list)
+            {
+                std::vector<RigRender::Stage>* stages = nullptr;
+                if (a["track"].toString() == "master")
+                    stages = &spec.master;
+                else if ((int) a["track"] >= 0 && (int) a["track"] < (int) spec.tracks.size())
+                    stages = &spec.tracks[(size_t) (int) a["track"]].stages;
+                if (stages == nullptr) { error = "automation: no such track"; return false; }
+
+                juce::AudioProcessor* target = nullptr;
+                for (auto& st : *stages)
+                    if (st.role == a["role"].toString() && st.plugin != nullptr) { target = st.plugin.get(); break; }
+                if (target == nullptr) { error = "automation: no stage with role '" + a["role"].toString() + "'"; return false; }
+
+                RigRender::Spec::Automation au;
+                for (auto* prm : target->getParameters())
+                    if (prm->getName (128) == a["param"].toString()) { au.param = prm; break; }
+                if (au.param == nullptr) { error = "automation: no parameter named '" + a["param"].toString() + "'"; return false; }
+                if (auto* pts = a["points"].getArray())
+                    for (const auto& pt : *pts)
+                        au.points.push_back ({ (juce::int64) std::llround ((double) (*pt.getArray())[0] * spec.sampleRate),
+                                               (float) (double) (*pt.getArray())[1] });
+                spec.automation.push_back (std::move (au));
+            }
 
         if (auto* master = job["master"].getArray())
             for (const auto& st : *master)

@@ -254,6 +254,106 @@ public:
         float a = 0.0f, y[2] = { 0.0f, 0.0f };
     };
 
+    // What the host tells a plug-in about the transport: tempo, time signature, position. One per render; the render
+    // thread moves `pos` before every block.
+    class RigPlayHead : public juce::AudioPlayHead
+    {
+    public:
+        double bpm = 120.0, sampleRate = 48000.0;
+        int sigNum = 4, sigDen = 4;
+        juce::int64 pos = 0;
+
+        juce::Optional<PositionInfo> getPosition() const override
+        {
+            PositionInfo i;
+            i.setBpm (bpm);
+            i.setTimeSignature (juce::AudioPlayHead::TimeSignature { sigNum, sigDen });
+            i.setTimeInSamples (pos);
+            i.setTimeInSeconds ((double) pos / sampleRate);
+            i.setPpqPosition ((double) pos / sampleRate * bpm / 60.0);
+            i.setIsPlaying (true);
+            i.setIsRecording (false);
+            i.setIsLooping (false);
+            return i;
+        }
+    };
+
+    // Writes what the host says about the transport into the audio, so a test can read it back:
+    // left = bpm / 1000, right = ppq position / 1000 (advancing per sample), both -1 when the host says nothing.
+    class PlayheadProbe : public juce::AudioProcessor
+    {
+    public:
+        PlayheadProbe()
+            : juce::AudioProcessor (BusesProperties().withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
+                                                     .withOutput ("Output", juce::AudioChannelSet::stereo(), true)) {}
+        const juce::String getName() const override { return "PlayheadProbe"; }
+        void prepareToPlay (double rate, int) override { sr = rate; }
+        void releaseResources() override {}
+        void processBlock (juce::AudioBuffer<float>& b, juce::MidiBuffer&) override
+        {
+            b.clear();
+            double bpm = -1000.0, ppq0 = -1000.0;
+            if (auto* ph = getPlayHead())
+                if (auto pi = ph->getPosition())
+                {
+                    if (auto t = pi->getBpm()) bpm = *t;
+                    if (auto q = pi->getPpqPosition()) ppq0 = *q;
+                }
+            const double perSample = bpm > 0 ? bpm / 60.0 / sr : 0.0;
+            for (int i = 0; i < b.getNumSamples(); ++i)
+            {
+                b.setSample (0, i, (float) (bpm / 1000.0));
+                if (b.getNumChannels() > 1)
+                    b.setSample (1, i, (float) ((ppq0 + perSample * i) / 1000.0));
+            }
+        }
+        double getTailLengthSeconds() const override { return 0.0; }
+        bool acceptsMidi() const override { return false; }
+        bool producesMidi() const override { return false; }
+        juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+        bool hasEditor() const override { return false; }
+        int getNumPrograms() override { return 1; }
+        int getCurrentProgram() override { return 0; }
+        void setCurrentProgram (int) override {}
+        const juce::String getProgramName (int) override { return "Default"; }
+        void changeProgramName (int, const juce::String&) override {}
+        void getStateInformation (juce::MemoryBlock&) override {}
+        void setStateInformation (const void*, int) override {}
+    private:
+        double sr = 48000.0;
+    };
+
+    // Input times a gain that is a host parameter (named "gain", 0..1, default 0). With a constant input, the output
+    // shows at which sample a parameter change took effect.
+    class GainProbe : public juce::AudioProcessor
+    {
+    public:
+        GainProbe()
+            : juce::AudioProcessor (BusesProperties().withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
+                                                     .withOutput ("Output", juce::AudioChannelSet::stereo(), true))
+        {
+            addParameter (gain = new juce::AudioParameterFloat ("gain", "gain", 0.0f, 1.0f, 0.0f));
+        }
+        const juce::String getName() const override { return "GainProbe"; }
+        void prepareToPlay (double, int) override {}
+        void releaseResources() override {}
+        void processBlock (juce::AudioBuffer<float>& b, juce::MidiBuffer&) override { b.applyGain (gain->get()); }
+        double getTailLengthSeconds() const override { return 0.0; }
+        bool acceptsMidi() const override { return false; }
+        bool producesMidi() const override { return false; }
+        juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+        bool hasEditor() const override { return false; }
+        int getNumPrograms() override { return 1; }
+        int getCurrentProgram() override { return 0; }
+        void setCurrentProgram (int) override {}
+        const juce::String getProgramName (int) override { return "Default"; }
+        void changeProgramName (int, const juce::String&) override {}
+        void getStateInformation (juce::MemoryBlock&) override {}
+        void setStateInformation (const void*, int) override {}
+    private:
+        juce::AudioParameterFloat* gain = nullptr;
+    };
+
     struct Stage
     {
         juce::String role;   // "source" / "inst" / "insert" / "master"
@@ -275,7 +375,15 @@ public:
         std::vector<Track> tracks;
         std::vector<Stage> master;
         double sampleRate = 48000.0;
-        int block = 512;
+        int block = 512;                      // the largest block; also what the plug-ins are prepared for
+        std::vector<int> blockPattern;        // block lengths used in turn (each clamped to 1..block); empty = always `block`
+        double bpm = 120.0;                   // the transport the plug-ins are told about
+        int sigNum = 4, sigDen = 4;
+        // Parameter changes at sample positions on the timeline (before latency compensation).
+        struct AutomationPoint { juce::int64 sample; float value; };
+        struct Automation { juce::AudioProcessorParameter* param = nullptr; std::vector<AutomationPoint> points; };
+        std::vector<Automation> automation;
+        bool automationBlockQuantised = false; // true: a change takes effect at the start of the block it falls in (what a simple host does)
         double tailSeconds = 2.0;
         bool compensate = true;
         bool dryParallel = false;             // also send track 0's source straight to the output: a second, shorter path for the graph's PDC to align
@@ -498,18 +606,63 @@ private:
         double peak = 0.0;
         bool ok = true;
 
+        RigPlayHead playHead;
+        playHead.bpm = spec.bpm; playHead.sigNum = spec.sigNum; playHead.sigDen = spec.sigDen; playHead.sampleRate = sr;
+        graph.setPlayHead (&playHead);
+
+        struct Event { juce::int64 sample; juce::AudioProcessorParameter* param; float value; };
+        std::vector<Event> events;
+        for (auto& a : spec.automation)
+            for (auto& pt : a.points)
+                events.push_back ({ pt.sample, a.param, pt.value });
+        std::stable_sort (events.begin(), events.end(), [] (const Event& x, const Event& y) { return x.sample < y.sample; });
+        size_t evIdx = 0, patIdx = 0;
+        long blocks = 0;
+        int blockMin = block, blockMax = 0;
+
         while (pos < total && ! threadShouldExit())
         {
-            const int n = (int) juce::jmin ((juce::int64) block, total - pos);
+            juce::int64 n = block;
+            if (! spec.blockPattern.empty())
+                n = juce::jlimit (1, block, spec.blockPattern[patIdx++ % spec.blockPattern.size()]);
+            n = juce::jmin (n, total - pos);
+
+            // Sample-accurate automation: apply the changes that are due, THEN end the block where the next one falls,
+            // so a change always lands exactly on a block start. (Deciding the cut before applying left a block with a
+            // later change inside it whenever the block was longer than the gap: found with a 4096-sample block.)
+            // The quantised mode is the control: it applies a change at the start of the block it falls in.
+            if (spec.automationBlockQuantised)
+            {
+                while (evIdx < events.size() && events[evIdx].sample < pos + n)
+                {
+                    events[evIdx].param->setValue (events[evIdx].value);
+                    ++evIdx;
+                }
+            }
+            else
+            {
+                while (evIdx < events.size() && events[evIdx].sample <= pos)
+                {
+                    events[evIdx].param->setValue (events[evIdx].value);
+                    ++evIdx;
+                }
+                if (evIdx < events.size() && events[evIdx].sample < pos + n)
+                    n = events[evIdx].sample - pos;
+            }
+
+            ++blocks;
+            blockMin = juce::jmin (blockMin, (int) n);
+            blockMax = juce::jmax (blockMax, (int) n);
+            playHead.pos = pos;
 
             midi.clear();
             buf.clear();
-            juce::AudioBuffer<float> view (buf.getArrayOfWritePointers(), 2, 0, n);
+            juce::AudioBuffer<float> view (buf.getArrayOfWritePointers(), 2, 0, (int) n);
             graph.processBlock (view, midi);
 
             // drop the compensated head
             const int skip = (int) juce::jlimit ((juce::int64) 0, (juce::int64) n, discard - pos);
-            const int keep = n - skip;
+            const int keep = (int) n - skip;
             if (keep > 0)
             {
                 const float* chans[2] = { buf.getReadPointer (0) + skip, buf.getReadPointer (1) + skip };
@@ -541,6 +694,10 @@ private:
         put (r, "compensated", spec.compensate);
         put (r, "dry_parallel", spec.dryParallel);
         put (r, "peak_db", peak > 1.0e-6 ? 20.0 * std::log10 (peak) : -120.0);
+        put (r, "blocks", (juce::int64) blocks);
+        put (r, "block_min", blockMin);
+        put (r, "block_max", blockMax);
+        put (r, "bpm", spec.bpm);
         finish (r);
     }
 
