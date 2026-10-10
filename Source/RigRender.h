@@ -24,15 +24,110 @@
 class RigRender : private juce::Thread
 {
 public:
+    // One unit impulse (a single non-zero sample) at a known position, stereo, no input, no MIDI.
+    // The source for measuring what a plugin really delays, as opposed to what it declares.
+    class ImpulseSource : public juce::AudioProcessor
+    {
+    public:
+        ImpulseSource (juce::int64 atSample, float amplitude)
+            : juce::AudioProcessor (BusesProperties().withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+              at (atSample), amp (amplitude) {}
+
+        const juce::String getName() const override { return "Impulse"; }
+        void prepareToPlay (double, int) override { pos = 0; }
+        void releaseResources() override {}
+        void processBlock (juce::AudioBuffer<float>& b, juce::MidiBuffer&) override
+        {
+            b.clear();
+            const auto n = (juce::int64) b.getNumSamples();
+            if (at >= pos && at < pos + n)
+                for (int c = 0; c < b.getNumChannels(); ++c)
+                    b.setSample (c, (int) (at - pos), amp);
+            pos += n;
+        }
+        double getTailLengthSeconds() const override { return 0.0; }
+        bool acceptsMidi() const override { return false; }
+        bool producesMidi() const override { return false; }
+        juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+        bool hasEditor() const override { return false; }
+        int getNumPrograms() override { return 1; }
+        int getCurrentProgram() override { return 0; }
+        void setCurrentProgram (int) override {}
+        const juce::String getProgramName (int) override { return {}; }
+        void changeProgramName (int, const juce::String&) override {}
+        void getStateInformation (juce::MemoryBlock&) override {}
+        void setStateInformation (const void*, int) override {}
+
+    private:
+        juce::int64 at, pos = 0;
+        float amp;
+    };
+
+    // Delays by `actual` samples and DECLARES `declared`. A device whose true behaviour is known, to check
+    // that the latency measurement sees a wrong declaration (a test that cannot fail proves nothing).
+    class KnownDelay : public juce::AudioProcessor
+    {
+    public:
+        KnownDelay (int actualSamples, int declaredSamples)
+            : juce::AudioProcessor (BusesProperties().withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
+                                                     .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+              actual (juce::jmax (0, actualSamples)), declared (declaredSamples) {}
+
+        const juce::String getName() const override { return "KnownDelay"; }
+        void prepareToPlay (double, int) override
+        {
+            ring.assign ((size_t) (2 * actual), 0.0f);
+            head = 0;
+            setLatencySamples (declared);
+        }
+        void releaseResources() override {}
+        void processBlock (juce::AudioBuffer<float>& b, juce::MidiBuffer&) override
+        {
+            if (actual == 0)
+                return;
+            for (int c = 0; c < juce::jmin (2, b.getNumChannels()); ++c)
+            {
+                float* d = b.getWritePointer (c);
+                float* r = ring.data() + (size_t) c * (size_t) actual;
+                int h = head;
+                for (int i = 0; i < b.getNumSamples(); ++i)
+                {
+                    const float out = r[h];
+                    r[h] = d[i];
+                    d[i] = out;
+                    h = (h + 1) % actual;
+                }
+            }
+            head = (head + b.getNumSamples()) % actual;
+        }
+        double getTailLengthSeconds() const override { return 0.0; }
+        bool acceptsMidi() const override { return false; }
+        bool producesMidi() const override { return false; }
+        juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+        bool hasEditor() const override { return false; }
+        int getNumPrograms() override { return 1; }
+        int getCurrentProgram() override { return 0; }
+        void setCurrentProgram (int) override {}
+        const juce::String getProgramName (int) override { return {}; }
+        void changeProgramName (int, const juce::String&) override {}
+        void getStateInformation (juce::MemoryBlock&) override {}
+        void setStateInformation (const void*, int) override {}
+
+    private:
+        int actual, declared, head = 0;
+        std::vector<float> ring;
+    };
+
     struct Stage
     {
-        juce::String role;   // "inst" / "insert" / "master"
-        std::unique_ptr<juce::AudioPluginInstance> plugin;
+        juce::String role;   // "inst" / "source" / "insert" / "master"
+        std::unique_ptr<juce::AudioProcessor> plugin;
     };
 
     struct Spec
     {
-        std::vector<Stage> stages;            // in signal order; stages[0] is the instrument
+        std::vector<Stage> stages;            // in signal order; stages[0] is the instrument (or an ImpulseSource)
+        juce::int64 impulseAt = -1;           // >= 0: stages[0] is an ImpulseSource at this sample; MIDI is not used
         juce::MidiMessageSequence sequence;   // seconds
         double sampleRate = 48000.0;
         int block = 512;
@@ -83,18 +178,28 @@ private:
         using Graph = juce::AudioProcessorGraph;
 
         if (spec.stages.empty() || spec.stages[0].plugin == nullptr) { fail ("no instrument"); return; }
-        if (spec.sequence.getNumEvents() == 0)                       { fail ("no MIDI events"); return; }
+        const bool impulse = spec.impulseAt >= 0;
+        if (! impulse && spec.sequence.getNumEvents() == 0)          { fail ("no MIDI events"); return; }
 
         const double sr = spec.sampleRate;
         const int block = spec.block;
-        const juce::int64 body = (juce::int64) ((spec.sequence.getEndTime() + spec.tailSeconds) * sr);
+        const juce::int64 body = impulse ? spec.impulseAt + (juce::int64) (spec.tailSeconds * sr)
+                                         : (juce::int64) ((spec.sequence.getEndTime() + spec.tailSeconds) * sr);
         if (body > 150'000'000) { fail ("too long to render"); return; }
 
         //-- build the graph: MIDI -> inst -> insert -> master -> out ---------
         // One rebuild only, inside prepareToPlay: every add* below would otherwise queue an async rebuild
         // on the message thread that can interleave with it (graph latency read 0 in 2 of 10 renders).
         const auto none = Graph::UpdateKind::none;
-        Graph graph;
+        // The graph owns the plugin instances. Plugins must die on the message thread (some VST3s crash
+        // otherwise: the bench fell over after about ten renders), so the last reference is handed to it.
+        auto graphOwner = std::make_shared<Graph>();
+        Graph& graph = *graphOwner;
+        struct DieOnMessageThread
+        {
+            std::shared_ptr<Graph> g;
+            ~DieOnMessageThread() { juce::MessageManager::callAsync ([g = std::move (g)] {}); }
+        } deferredDestruction { graphOwner };
         graph.setPlayConfigDetails (0, 2, sr, block);
         graph.setNonRealtime (true);
 
@@ -113,8 +218,9 @@ private:
             nodes.push_back (graph.addNode (std::move (st.plugin), {}, none));
         }
 
-        graph.addConnection ({ { midiNode->nodeID, Graph::midiChannelIndex },
-                               { nodes[0]->nodeID, Graph::midiChannelIndex } }, none);
+        if (! impulse)
+            graph.addConnection ({ { midiNode->nodeID, Graph::midiChannelIndex },
+                                   { nodes[0]->nodeID, Graph::midiChannelIndex } }, none);
 
         for (size_t i = 0; i < nodes.size(); ++i)
         {

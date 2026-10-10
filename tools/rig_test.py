@@ -19,6 +19,9 @@ sys.path.insert(0, os.path.dirname(__file__))
 from tb import TestBench
 
 EVENTS = [{"t": 0.0, "type": "note_on", "ch": 1, "note": 57, "vel": 100, "dur": 1.0}]
+IMPULSE_AT = 1000     # samples
+EARLY_TOL = 1         # peak is an integer; the true peak may sit between two samples
+LATE_LIMIT = 28
 NULL_DB = -100.0      # residual limit against the peak (float sums should be exact; this leaves room)
 CONTROL_DB = -60.0    # the no-compensation model must be at least this far from null
 
@@ -33,7 +36,11 @@ class Rig:
         self.dir = os.path.join(os.environ["APPDATA"], "VstTestBench")
 
     def render(self, out, **kw):
-        r = self.tb.call("rig_render", events=EVENTS, tail=1.0, out=out, **kw)
+        args = dict(tail=1.0, out=out)
+        if kw.get("source") != "impulse":
+            args["events"] = EVENTS
+        args.update(kw)
+        r = self.tb.call("rig_render", **args)
         if not r.get("ok"):
             raise RuntimeError("start: %s" % r.get("error"))
         while self.tb.call("status")["busy"]:
@@ -53,13 +60,74 @@ class Rig:
         return hashlib.md5(open(os.path.join(self.dir, out), "rb").read()).hexdigest()
 
 
+def classify(declared, measured, late_limit):
+    if measured is None:
+        return "NO-RESPONSE", 0
+    excess = measured - declared
+    if excess < -EARLY_TOL:
+        return "OVER-DECLARED", excess
+    if excess > late_limit:
+        return "LATE", excess
+    return "ok", excess
+
+
+def measure(rig, amp, **slots):
+    """(declared, measured peak position) for a unit impulse through the given slots, compensation off."""
+    res = rig.render("lat_imp.wav", source="impulse", impulse_at=IMPULSE_AT, impulse_amp=amp,
+                     compensate=False, tail=0.1, **slots)
+    x = rig.read("lat_imp.wav").reshape(-1, 2)
+    e = (x ** 2).sum(axis=1)
+    if e.max() < 1e-14:            # nothing came out (a gate, a threshold): there is no peak to locate
+        return res["chain_latency"], None
+    return res["chain_latency"], int(np.argmax(e)) - IMPULSE_AT
+
+
+def latency_accuracy(rig, a, bad):
+    # controls: through the same path, with a device whose true delay is known
+    ctl = [("honest   (actual 7, declared 7)", 7, 7, "ok"),
+           ("dishonest (actual 7, declared 12)", 7, 12, "OVER-DECLARED"),
+           ("under-declared (actual 7, declared 3)", 7, 3, "ok")]
+    for name, actual, declared, want in ctl:
+        d, m = measure(rig, 0.1, delay_actual=actual, delay_declared=declared)
+        verdict, _ = classify(d, m, a.late_limit)
+        good = (m == actual) and (d == declared) and (verdict == want)
+        print(f"  control {name}: declared {d} measured {m} -> {verdict}  {'ok' if good else 'WRONG'}")
+        if not good:
+            bad.append(f"latency control '{name}': declared {d} measured {m} verdict {verdict}, wanted {want}")
+
+    levels = [float(v) for v in a.levels.split(",")]
+    targets = [(n, dict(insert=n), True) for n in a.fx]
+    if a.master:
+        # information only: the peak of a cascade of nonlinear stages is not a delay (it moves with level)
+        targets.append((f"{a.insert} + {a.master} (info only)", dict(insert=a.insert, master=a.master), False))
+    for name, slots, judged in targets:
+        rows = [measure(rig, lv, **slots) for lv in levels]
+        declared = rows[0][0]
+        ms = [m for _, m in rows]
+        seen = [m for m in ms if m is not None]
+        verdict, excess = classify(declared, seen[len(seen) // 2] if seen else None, a.late_limit)
+        spread = max(seen) - min(seen) if seen else 0
+        line = f"  {name}: declared {declared}, measured peak {ms} at {[f'{20*np.log10(l):.0f} dB' for l in levels]}"
+        print(f"{line} -> {verdict}, excess {excess:+d}" + (f", LEVEL-DEPENDENT (spread {spread})" if spread > EARLY_TOL else ""))
+        if not judged:
+            continue
+        if verdict != "ok":
+            bad.append(f"{name}: {verdict} (declared {declared}, measured {ms})")
+        if spread > EARLY_TOL:
+            bad.append(f"{name}: measured delay depends on level (spread {spread})")
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--inst", default="PAGANIHANDS")
     ap.add_argument("--insert", default="Legacy Distortion")
     ap.add_argument("--master", default="Legacy Distortion")
     ap.add_argument("--repeat", type=int, default=5)
+    ap.add_argument("--fx", action="append", help="plugin(s) for the declared-vs-actual latency test (default: --insert)")
+    ap.add_argument("--levels", default="0.001,0.01,0.1,0.5", help="impulse amplitudes (linear)")
+    ap.add_argument("--late-limit", type=int, default=LATE_LIMIT)
     a = ap.parse_args()
+    a.fx = a.fx or [a.insert]
     chain = dict(inst=a.inst, insert=a.insert, master=a.master)
     rig = Rig()
     bad = []
@@ -104,6 +172,9 @@ def main():
             bad.append(f"pdc null: residual {null:.1f} dB")
         if L > 0 and nocomp < CONTROL_DB:
             bad.append(f"pdc control is not discriminating ({nocomp:.1f} dB)")
+
+    # 4: declared vs actual latency
+    latency_accuracy(rig, a, bad)
 
     print("PASS" if not bad else "FAIL: " + "; ".join(bad))
     return 1 if bad else 0

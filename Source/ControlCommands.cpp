@@ -774,7 +774,7 @@ juce::var MainComponent::handleControl (const juce::var& req)
 }
 
 //==============================================================================
-// rig_render: inst=<name|path> [insert=<name|path>] [master=<name|path>]
+// rig_render: inst=<name|path> | source=impulse [impulse_at=<sample>] [impulse_amp=<linear>] [insert=<name|path>] [master=<name|path>]
 //             events=[...] out=<wav> [rate] [block] [tail] [compensate]
 //             [dry_parallel] [settle=<ms, default 500>] [inst_state|insert_state|master_state=<file from save_state>]
 // Fresh plugin instances, fresh graph, no audio device: the result depends only on the inputs.
@@ -794,17 +794,34 @@ juce::var MainComponent::startRigRender (const juce::var& req)
     spec.settleMs    = juce::jlimit (0, 10000, (int) num (req, "settle", 500.0));
     spec.out         = resolvePath (str (req, "out", "rig.wav"), appDir());
 
-    juce::String error;
-    spec.sequence = sequenceFromEvents (req["events"], error);
-    if (error.isNotEmpty()) return fail (error);
+    const bool impulse = str (req, "source") == "impulse";
+    if (impulse)
+    {
+        spec.impulseAt = (juce::int64) num (req, "impulse_at", 1000.0);
+        spec.stages.push_back ({ "source", std::make_unique<RigRender::ImpulseSource> (spec.impulseAt, (float) num (req, "impulse_amp", 0.1)) });
+    }
+    else
+    {
+        juce::String error;
+        spec.sequence = sequenceFromEvents (req["events"], error);
+        if (error.isNotEmpty()) return fail (error);
+    }
 
     auto* fmt = vst3Format();
     if (fmt == nullptr) return fail ("VST3 format not available");
 
     struct Slot { const char* role; bool wantInst; bool required; };
-    for (const Slot slot : { Slot { "inst", true, true }, Slot { "insert", false, false }, Slot { "master", false, false } })
+    for (const Slot slot : { Slot { "inst", true, ! impulse }, Slot { "insert", false, false }, Slot { "master", false, false } })
     {
-        const auto what = str (req, slot.role);
+        // test double: a delay with a known true value and a declared value of our choosing, in the insert slot
+        if (juce::String (slot.role) == "insert" && req.hasProperty ("delay_actual"))
+        {
+            const int actual = (int) num (req, "delay_actual", 0.0);
+            spec.stages.push_back ({ "insert", std::make_unique<RigRender::KnownDelay> (actual, (int) num (req, "delay_declared", actual)) });
+            continue;
+        }
+
+        const auto what = impulse && juce::String (slot.role) == "inst" ? juce::String() : str (req, slot.role);
         if (what.isEmpty())
         {
             if (slot.required) return fail ("give \"inst\" (a cached name or a .vst3 path)");
