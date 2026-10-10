@@ -319,8 +319,17 @@ def instance_interference(rig, plugs, notes):
     ev2 = [{"t": 0.3, "type": "note_on", "ch": 1, "note": 64, "vel": 90, "dur": 0.6}]
     idle = [{"t": 0.0, "type": "cc", "ch": 1, "cc": 1, "value": 0}]
 
+    def end_of(evs):
+        return max(e["t"] + e.get("dur", 0.0) for e in evs)
+
+    # The rig renders until the last note ends plus `tail`. Renders of different event sets would then differ in
+    # length and the shorter one's ring-out would count as silence in the sum (a false -32 dB "interference" for
+    # instruments with a long release). Every render therefore gets the same total length.
+    total = max(end_of(ev1), end_of(ev2), end_of(idle)) + 1.0
+
     def run(tracks, tag):
-        rig.render(f"if_{tag}.wav", tracks=tracks, tail=1.0)
+        last = max(end_of(t["events"]) for t in tracks)
+        rig.render(f"if_{tag}.wav", tracks=tracks, tail=total - last)
         return rig.read(f"if_{tag}.wav")
 
     for plug in plugs:
