@@ -1658,7 +1658,7 @@ void MainComponent::sendMpeSetupLive()
         injectMidi (m);
 }
 
-void MainComponent::setMpeEnabled (bool on)
+void MainComponent::setMpeEnabled (bool on, bool rebounce)
 {
     mpeConfig.enabled = on;
     mpeButton.setToggleState (on, juce::dontSendNotification);
@@ -1668,7 +1668,7 @@ void MainComponent::setMpeEnabled (bool on)
     setStatus (on ? "MPE on: lower-zone setup sent (" + juce::String (mpeConfig.members) + " members, +/-"
                         + juce::String (mpeConfig.memberPB) + " st)"
                   : "MPE off (channels still pass through untouched)");
-    if (currentMidiFile != juce::File() && midiSequence.getNumEvents() > 0 && ! bounceEngine.isBouncing())
+    if (rebounce && currentMidiFile != juce::File() && midiSequence.getNumEvents() > 0 && ! bounceEngine.isBouncing())
         loadMidiFile (currentMidiFile);   // re-bounce with / without the added setup
 }
 

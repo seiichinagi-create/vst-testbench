@@ -86,7 +86,7 @@ private:
     //== MPE (live injection + MIDI-file bounce) ==
     void injectMidi (const juce::MidiMessage&);     // any thread: graph + take recorder + thru
     void sendMpeSetupLive();                        // zone / bend-range setup to the live VSTi (and thru)
-    void setMpeEnabled (bool);
+    void setMpeEnabled (bool, bool rebounce = true);
     juce::String describeMidiSequence (const juce::MidiMessageSequence&) const;
 
     //== AI control (ControlServer; handler runs on the message thread) ==

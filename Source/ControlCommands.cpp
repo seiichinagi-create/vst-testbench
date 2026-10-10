@@ -528,8 +528,9 @@ juce::var MainComponent::handleControl (const juce::var& req)
         const juce::File f (str (req, "path"));
         if (! f.existsAsFile()) return fail ("no such file: " + str (req, "path"));
         if (instrumentNode == nullptr) return fail ("load an instrument first (load_plugin role=inst)");
-        if (req.hasProperty ("mpe"))
-            setMpeEnabled (flag (req, "mpe", false));
+        // The file is about to be (re)loaded anyway: do not start a second bounce for the old file.
+        if (req.hasProperty ("mpe") && flag (req, "mpe", false) != mpeConfig.enabled)
+            setMpeEnabled (flag (req, "mpe", false), false);
         loadMidiFile (f);
         auto o = makeObj();
         put (o, "started", true);
