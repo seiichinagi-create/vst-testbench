@@ -1,4 +1,5 @@
 #include "MainComponent.h"
+#include "EventSequence.h"
 
 //==============================================================================
 // AI control surface: every command the control server accepts. See
@@ -65,73 +66,7 @@ juce::AudioProcessor* MainComponent::processorForRole (const juce::String& role)
 // types: note_on note_off pitch_bend pressure poly_pressure cc program all_off
 juce::MidiMessageSequence MainComponent::sequenceFromEvents (const juce::var& events, juce::String& error) const
 {
-    juce::MidiMessageSequence seq;
-    auto* arr = events.getArray();
-    if (arr == nullptr)
-    {
-        error = "\"events\" must be an array";
-        return seq;
-    }
-
-    for (const auto& e : *arr)
-    {
-        const auto type = e.getProperty ("type", {}).toString().toLowerCase();
-        const double t  = e.hasProperty ("t") ? (double) e["t"] : 0.0;
-        const int ch    = juce::jlimit (1, 16, (int) e.getProperty ("ch", 1));
-        const int note  = juce::jlimit (0, 127, (int) e.getProperty ("note", 60));
-        const int vel   = juce::jlimit (0, 127, (int) e.getProperty ("vel", 100));
-
-        auto add = [&seq, t] (juce::MidiMessage m, double at)
-        {
-            m.setTimeStamp (at);
-            seq.addEvent (m);
-        };
-
-        if (type == "note_on")
-        {
-            add (juce::MidiMessage::noteOn (ch, note, (juce::uint8) vel), t);
-            if (e.hasProperty ("dur"))
-                add (juce::MidiMessage::noteOff (ch, note, (juce::uint8) 0), t + juce::jmax (0.0, (double) e["dur"]));
-        }
-        else if (type == "note_off")
-            add (juce::MidiMessage::noteOff (ch, note, (juce::uint8) 0), t);
-        else if (type == "pitch_bend")
-        {
-            // "bend": -1..1 (full range), or "value": raw 0..16383 (8192 = centre)
-            const int raw = e.hasProperty ("bend")
-                ? juce::jlimit (0, 16383, 8192 + juce::roundToInt ((double) e["bend"] * 8191.0))
-                : juce::jlimit (0, 16383, (int) e.getProperty ("value", 8192));
-            add (juce::MidiMessage::pitchWheel (ch, raw), t);
-        }
-        else if (type == "pressure")
-            add (juce::MidiMessage::channelPressureChange (ch, juce::jlimit (0, 127, (int) e.getProperty ("value", 0))), t);
-        else if (type == "poly_pressure")
-            add (juce::MidiMessage::aftertouchChange (ch, note, juce::jlimit (0, 127, (int) e.getProperty ("value", 0))), t);
-        else if (type == "cc" || type == "slide")
-        {
-            const int cc = type == "slide" ? 74 : juce::jlimit (0, 127, (int) e.getProperty ("cc", 0));
-            add (juce::MidiMessage::controllerEvent (ch, cc, juce::jlimit (0, 127, (int) e.getProperty ("value", 0))), t);
-        }
-        else if (type == "program")
-            add (juce::MidiMessage::programChange (ch, juce::jlimit (0, 127, (int) e.getProperty ("value", 0))), t);
-        else if (type == "all_off")
-        {
-            for (int c = 1; c <= 16; ++c)
-            {
-                add (juce::MidiMessage::allNotesOff (c), t);
-                add (juce::MidiMessage::allSoundOff (c), t);
-            }
-        }
-        else
-        {
-            error = "unknown event type \"" + type + "\"";
-            return {};
-        }
-    }
-
-    seq.sort();
-    mpe::noteOnsLast (seq);
-    return seq;
+    return ::sequenceFromEvents (events, error);
 }
 
 //==============================================================================
@@ -143,7 +78,7 @@ juce::var MainComponent::controlStatus() const
     put (o, "source", mode == srcLive ? "live" : mode == srcInstrument ? "inst" : "file");
     put (o, "status_text", statusLabel.getText());
 
-    const bool busy = pendingLoads > 0 || bounceEngine.isBouncing() || rigRender.isRunning() || offlineInstLoading || offlineFxLoading
+    const bool busy = pendingLoads > 0 || bounceEngine.isBouncing() || rigWorker.isRunning() || offlineInstLoading || offlineFxLoading
                       || firstBouncePending || (preRenderActive() && renderEngine.isRendering())
                       || (preRenderActive() && fxStale.load());
     put (o, "busy", busy);
@@ -774,50 +709,63 @@ juce::var MainComponent::handleControl (const juce::var& req)
 }
 
 //==============================================================================
-// rig_render: inst=<name|path> | source=impulse [impulse_at=<sample>] [impulse_amp=<linear>] [insert=<name|path>] [master=<name|path>]
+// rig_render: inst=<name|path> | source=impulse [impulse_at=<sample>] [impulse_amp=<linear>]
+//             [insert=<name|path> | delay_actual=<n> delay_declared=<m>] [master=<name|path>]
 //             events=[...] out=<wav> [rate] [block] [tail] [compensate]
-//             [dry_parallel] [settle=<ms, default 500>] [inst_state|insert_state|master_state=<file from save_state>]
-// Fresh plugin instances, fresh graph, no audio device: the result depends only on the inputs.
+//             [dry_parallel] [settle=<ms, default 500>] [timeout=<s, default 600>]
+//             [inst_state|insert_state|master_state=<file from save_state>]
+// The bench only resolves names to plugin descriptions and writes a job file; a separate worker process
+// (this exe with --rig-worker, see RigWorkerClient.h / Main.cpp) loads, renders and tears down. A crash or
+// hang there is reported in status.rig and never reaches the bench.
 // Asynchronous like the MIDI bounce: poll status until busy is false, then read status.rig.
 //==============================================================================
 juce::var MainComponent::startRigRender (const juce::var& req)
 {
-    if (rigRender.isRunning())
+    if (rigWorker.isRunning())
         return fail ("a rig render is already running");
 
-    RigRender::Spec spec;
-    spec.sampleRate  = num (req, "rate", 48000.0);
-    spec.block       = juce::jlimit (32, 8192, (int) num (req, "block", 512));
-    spec.tailSeconds = juce::jmax (0.0, num (req, "tail", 2.0));
-    spec.compensate  = flag (req, "compensate", true);
-    spec.dryParallel = flag (req, "dry_parallel", false);
-    spec.settleMs    = juce::jlimit (0, 10000, (int) num (req, "settle", 500.0));
-    spec.out         = resolvePath (str (req, "out", "rig.wav"), appDir());
+    auto job = makeObj();
+    put (job, "rate",         num (req, "rate", 48000.0));
+    put (job, "block",        juce::jlimit (32, 8192, (int) num (req, "block", 512)));
+    put (job, "tail",         juce::jmax (0.0, num (req, "tail", 2.0)));
+    put (job, "compensate",   flag (req, "compensate", true));
+    put (job, "dry_parallel", flag (req, "dry_parallel", false));
+    put (job, "settle",       juce::jlimit (0, 10000, (int) num (req, "settle", 500.0)));
+    put (job, "out",          resolvePath (str (req, "out", "rig.wav"), appDir()).getFullPathName());
 
     const bool impulse = str (req, "source") == "impulse";
     if (impulse)
     {
-        spec.impulseAt = (juce::int64) num (req, "impulse_at", 1000.0);
-        spec.stages.push_back ({ "source", std::make_unique<RigRender::ImpulseSource> (spec.impulseAt, (float) num (req, "impulse_amp", 0.1)) });
+        put (job, "source", "impulse");
+        put (job, "impulse_at", num (req, "impulse_at", 1000.0));
+        put (job, "impulse_amp", num (req, "impulse_amp", 0.1));
     }
     else
     {
         juce::String error;
-        spec.sequence = sequenceFromEvents (req["events"], error);
+        sequenceFromEvents (req["events"], error);   // validate here; the worker converts again
         if (error.isNotEmpty()) return fail (error);
+        put (job, "source", "midi");
+        put (job, "events", req["events"]);
     }
 
     auto* fmt = vst3Format();
     if (fmt == nullptr) return fail ("VST3 format not available");
 
+    juce::Array<juce::var> stages;
     struct Slot { const char* role; bool wantInst; bool required; };
     for (const Slot slot : { Slot { "inst", true, ! impulse }, Slot { "insert", false, false }, Slot { "master", false, false } })
     {
+        auto stage = makeObj();
+        put (stage, "role", slot.role);
+
         // test double: a delay with a known true value and a declared value of our choosing, in the insert slot
         if (juce::String (slot.role) == "insert" && req.hasProperty ("delay_actual"))
         {
-            const int actual = (int) num (req, "delay_actual", 0.0);
-            spec.stages.push_back ({ "insert", std::make_unique<RigRender::KnownDelay> (actual, (int) num (req, "delay_declared", actual)) });
+            put (stage, "kind", "delay");
+            put (stage, "delay_actual", (int) num (req, "delay_actual", 0.0));
+            put (stage, "delay_declared", (int) num (req, "delay_declared", num (req, "delay_actual", 0.0)));
+            stages.add (stage);
             continue;
         }
 
@@ -847,35 +795,31 @@ juce::var MainComponent::startRigRender (const juce::var& req)
         }
         if (! found) return fail (juce::String (slot.role) + ": no plugin matching \"" + what + "\"");
 
-        juce::String err;
-        auto plugin = formatManager.createPluginInstance (desc, spec.sampleRate, spec.block, err);
-        if (plugin == nullptr) return fail (juce::String (slot.role) + ": load failed: " + err);
+        put (stage, "kind", "plugin");
+        put (stage, "desc_xml", desc.createXml()->toString());
 
         const auto stateKey = juce::String (slot.role) + "_state";
         if (str (req, stateKey.toRawUTF8()).isNotEmpty())
         {
-            juce::MemoryBlock state;
-            if (! resolvePath (str (req, stateKey.toRawUTF8()), appDir()).loadFileAsData (state))
-                return fail ("cannot read " + stateKey);
-            plugin->setStateInformation (state.getData(), (int) state.getSize());
-            // same JUCE-VST3 wrapper trap as the offline clones: a bypass PARAMETER may travel in the state
-            if (auto* bypass = plugin->getBypassParameter())
-                bypass->setValueNotifyingHost (0.0f);
+            const auto f = resolvePath (str (req, stateKey.toRawUTF8()), appDir());
+            if (! f.existsAsFile()) return fail ("cannot read " + stateKey);
+            put (stage, "state", f.getFullPathName());
         }
-
-        spec.stages.push_back ({ slot.role, std::move (plugin) });
+        stages.add (stage);
     }
+    put (job, "stages", stages);
 
     rigResult = juce::var();
-    rigRender.onDone = [safe = juce::Component::SafePointer<MainComponent> (this)] (juce::var r)
+    rigWorker.onDone = [safe = juce::Component::SafePointer<MainComponent> (this)] (juce::var r)
     {
         if (safe != nullptr)
             safe->rigResult = std::move (r);
     };
-    rigRender.start (std::move (spec));
+    juce::String error;
+    if (! rigWorker.start (job, num (req, "timeout", 600.0), appDir(), error)) return fail (error);
 
     auto o = makeObj();
     put (o, "started", true);
-    put (o, "note", "asynchronous: poll status until busy is false, then read status.rig");
+    put (o, "note", "asynchronous, in a worker process: poll status until busy is false, then read status.rig");
     return o;
 }

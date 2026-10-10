@@ -9,7 +9,7 @@
 #include "MidiTakeRecorder.h"
 #include "MpeSupport.h"
 #include "OutputTap.h"
-#include "RigRender.h"
+#include "RigWorkerClient.h"
 #include "ControlServer.h"
 
 //==============================================================================
@@ -181,7 +181,7 @@ private:
     //== MPE / AI control state ==
     mpe::Config mpeConfig;
     juce::String mpeNote;                       // what the loaded MIDI file looked like
-    RigRender rigRender;                        // headless fixed-topology render (rig_render)
+    RigWorkerClient rigWorker;                  // rig_render runs in a separate worker process
     juce::var rigResult;                        // last rig_render result, shown in status
     int pendingLoads = 0;                       // async plugin loads in flight (message thread)
     Graph::Node::Ptr tapNode;

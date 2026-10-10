@@ -136,6 +136,7 @@ public:
         bool dryParallel = false;             // also send the instrument straight to the output: a second, shorter path for the graph's PDC to align
         int settleMs = 0;                     // wait after prepareToPlay so async plugin work (capture loads) can land
         juce::File out;
+        std::function<void (const juce::String&)> progress;   // phase notes, from the render thread
     };
 
     RigRender() : juce::Thread ("rig-render") {}
@@ -176,6 +177,7 @@ private:
     void run() override
     {
         using Graph = juce::AudioProcessorGraph;
+        auto note = [this] (const juce::String& m) { if (spec.progress != nullptr) spec.progress (m); };
 
         if (spec.stages.empty() || spec.stages[0].plugin == nullptr) { fail ("no instrument"); return; }
         const bool impulse = spec.impulseAt >= 0;
@@ -190,6 +192,7 @@ private:
         //-- build the graph: MIDI -> inst -> insert -> master -> out ---------
         // One rebuild only, inside prepareToPlay: every add* below would otherwise queue an async rebuild
         // on the message thread that can interleave with it (graph latency read 0 in 2 of 10 renders).
+        note ("building the graph");
         const auto none = Graph::UpdateKind::none;
         // The graph owns the plugin instances. Plugins must die on the message thread (some VST3s crash
         // otherwise: the bench fell over after about ten renders), so the last reference is handed to it.
@@ -253,6 +256,7 @@ private:
         {
             if (attempts > 0)
                 graph.releaseResources();
+            note ("prepareToPlay, attempt " + juce::String (attempts + 1));
             graph.prepareToPlay (sr, block);
             if (spec.settleMs > 0)
                 wait (spec.settleMs);   // the message thread is free meanwhile: async updates run now, not mid-render
@@ -285,6 +289,7 @@ private:
             chainLatency += p->getLatencySamples();
         }
 
+        note ("rendering");
         //-- write the wav -----------------------------------------------------
         spec.out.deleteFile();
         std::unique_ptr<juce::OutputStream> stream (spec.out.createOutputStream());
