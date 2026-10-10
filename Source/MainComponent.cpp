@@ -41,6 +41,11 @@ MainComponent::MainComponent()
     midiInNode   = graph.addNode (std::make_unique<Graph::AudioGraphIOProcessor> (Graph::AudioGraphIOProcessor::midiInputNode));
 
     {
+        auto tap = std::make_unique<OutputTap>();
+        outputTap = tap.get();
+        tapNode = graph.addNode (std::move (tap));
+    }
+    {
         auto fp = std::make_unique<FilePlayerProcessor>();
         filePlayer = fp.get();
         filePlayerNode = graph.addNode (std::move (fp));
@@ -58,7 +63,7 @@ MainComponent::MainComponent()
     addBtn (loadButton); addBtn (editorButton);
     addBtn (clearButton);         addBtn (bypassButton); addBtn (midiThruButton);
     addBtn (loadInstButton);      addBtn (instEditorButton); addBtn (clearInstButton);
-    addBtn (openMidiButton);
+    addBtn (openMidiButton);      addBtn (mpeButton);
     addBtn (openFileButton);      addBtn (playButton); addBtn (stopButton); addBtn (loopButton);
 
     audioSettingsButton.onClick = [this] { showAudioSettings(); };
@@ -269,6 +274,16 @@ MainComponent::MainComponent()
         }
     };
 
+    // MPE: channels always pass through untouched; this switch additionally
+    // sends a lower-zone setup (live) and prepends it to files that lack one.
+    mpeButton.setTooltip ("MPE instrument mode. Sends the MPE lower-zone setup (15 members, +/-48 st per-note bend, "
+                          "+/-2 st master) to the loaded VSTi, and adds it to MIDI files that carry none before "
+                          "the bounce. Channels, per-note bend, pressure and slide are never touched.");
+    mpeButton.setToggleState (mpeFile().existsAsFile() && mpeFile().loadFileAsString().trim() == "1",
+                              juce::dontSendNotification);
+    mpeConfig.enabled = mpeButton.getToggleState();
+    mpeButton.onClick = [this] { setMpeEnabled (mpeButton.getToggleState()); };
+
     midiStatusLabel.setJustificationType (juce::Justification::centredLeft);
     midiStatusLabel.setColour (juce::Label::textColourId, juce::Colours::skyblue);
     midiStatusLabel.setText ("MIDI: none (bounces thru the VSTi to the file player)",
@@ -354,6 +369,16 @@ MainComponent::MainComponent()
     // mode), realign the device with the initial source mode.
     applyBackendForMode (currentSourceMode());
 
+    // --- AI control: line-JSON on localhost (docs/CONTROL.md, tools/tb.py) ---
+    controlPort = controlPortFile().existsAsFile() ? controlPortFile().loadFileAsString().trim().getIntValue() : 0;
+    if (controlPort <= 0 || controlPort > 65535)
+        controlPort = 47213;
+    if (! controlServer.start (controlPort))
+    {
+        controlPort = 0;
+        setStatus ("AI control port is busy - control server not started.");
+    }
+
     startTimerHz (10);
     setSize (760, 880);   // flow-diagram layout: SOURCE / PROCESS / FX+OUT boxes
 }
@@ -361,6 +386,10 @@ MainComponent::MainComponent()
 MainComponent::~MainComponent()
 { setLookAndFeel (nullptr);
     stopTimer();
+    controlServer.stop();
+    midiScheduler.stop();
+    if (outputTap != nullptr)
+        outputTap->stopRecording();
     gpuWorker.shutdown();
     renderEngine.stopRender();
     bounceEngine.stopBounce();
@@ -401,6 +430,8 @@ juce::File MainComponent::autoBackendFile() const { return appDir().getChildFile
 juce::File MainComponent::inputPairFile()   const { return appDir().getChildFile ("live_input_pair.txt"); }
 juce::File MainComponent::midiOutFile()     const { return appDir().getChildFile ("midi_out.txt"); }
 juce::File MainComponent::midiThruFile()    const { return appDir().getChildFile ("midi_thru.txt"); }
+juce::File MainComponent::mpeFile()         const { return appDir().getChildFile ("mpe_mode.txt"); }
+juce::File MainComponent::controlPortFile() const { return appDir().getChildFile ("control_port.txt"); }
 
 // The saved setup can name a device that is no longer there; JUCE then opens
 // nothing (or the same absent ASIO driver) and the bench runs silent with no
@@ -616,10 +647,12 @@ void MainComponent::loadPluginFromDescription (const juce::PluginDescription& de
     const int    block = setup.bufferSize  > 0 ? setup.bufferSize  : 512;
 
     setStatus ("Loading " + desc.name + " ...");
+    ++pendingLoads;
     formatManager.createPluginInstanceAsync (
         desc, rate, block,
         [this, desc, asInstrument] (std::unique_ptr<juce::AudioPluginInstance> instance, const juce::String& error)
         {
+            --pendingLoads;
             if (instance == nullptr)
             {
                 setStatus ("Load failed: " + error);
@@ -702,6 +735,8 @@ void MainComponent::setInstrumentNode (std::unique_ptr<juce::AudioPluginInstance
                        + juce::String (instrumentNode->getProcessor()->getTotalNumOutputChannels()) + " out)",
                        juce::dontSendNotification);
     setStatus ("Loaded instrument " + desc.name + " (source switched to VSTi)");
+    if (mpeConfig.enabled)
+        sendMpeSetupLive();
 
     // A different instrument means the bounced wav no longer matches the chain.
     if (midiChainActive())
@@ -797,7 +832,7 @@ void MainComponent::rebuildConnections()
         // FX outputs -> device out
         for (int ch = 0; ch < juce::jmin (outChans, pout); ++ch)
             graph.addConnection ({ { effectNode->nodeID,  ch },
-                                   { audioOutNode->nodeID, ch } });
+                                   { tapNode->nodeID,      ch } });
 
         // MIDI in -> FX (for MIDI-controlled effects)
         graph.addConnection ({ { midiInNode->nodeID, Graph::midiChannelIndex },
@@ -809,8 +844,13 @@ void MainComponent::rebuildConnections()
         // stream the source straight to the outputs.
         for (int ch = 0; ch < juce::jmin (outChans, srcChans); ++ch)
             graph.addConnection ({ { src->nodeID,         srcChanBase + ch },
-                                   { audioOutNode->nodeID, ch } });
+                                   { tapNode->nodeID,      ch } });
     }
+
+    // meter / recorder tap -> device output
+    for (int ch = 0; ch < outChans; ++ch)
+        graph.addConnection ({ { tapNode->nodeID,      ch },
+                               { audioOutNode->nodeID, ch } });
 }
 
 //==============================================================================
@@ -993,12 +1033,22 @@ void MainComponent::loadMidiFile (const juce::File& file)
         return;
     }
 
+    // MPE: keep every channel as written, make sure the zone is configured
+    // before the first note, and deliver a note's expression ahead of its note-on.
+    mpeNote = describeMidiSequence (merged);
+    if (mpeConfig.enabled && ! mpe::hasZoneSetup (merged))
+    {
+        mpe::prependZoneSetup (merged, mpeConfig);
+        mpeNote += " (zone setup added)";
+    }
+    mpe::noteOnsLast (merged);
+
     bounceEngine.stopBounce();
     midiSequence       = std::move (merged);
     currentMidiFile    = file;
     firstBouncePending = true;
     instStale          = false;
-    midiReadyText = "MIDI: " + file.getFileName();
+    midiReadyText = "MIDI: " + file.getFileName() + (mpeNote.isNotEmpty() ? "  [" + mpeNote + "]" : juce::String());
     midiStatusLabel.setText ("MIDI: bouncing " + file.getFileName() + " thru "
                              + currentInstrumentName + " ...", juce::dontSendNotification);
     syncInstStateAndBounce();
@@ -1075,7 +1125,8 @@ void MainComponent::handleBounceDone (bool ok, juce::File out, juce::String info
         return;
     }
 
-    midiReadyText = "MIDI: " + currentMidiFile.getFileName() + " - bounce ready (" + info + ")";
+    midiReadyText = "MIDI: " + currentMidiFile.getFileName() + " - bounce ready (" + info + ")"
+                    + (mpeNote.isNotEmpty() ? "  [" + mpeNote + "]" : juce::String());
     auto isBounceFile = [] (const juce::File& f) { return f.getFileName().startsWith ("midi_bounce_"); };
 
     if (firstBouncePending)
@@ -1574,6 +1625,54 @@ void MainComponent::toggleEditorFor (Graph::Node::Ptr node, const juce::String& 
 }
 
 //==============================================================================
+// MPE
+juce::String MainComponent::describeMidiSequence (const juce::MidiMessageSequence& seq) const
+{
+    const auto chans = mpe::noteChannels (seq);
+    juce::String s;
+    if (mpe::hasZoneSetup (seq))
+        s = "MPE zone setup in file, ";
+    else if (chans.size() >= 2)
+        s = "no MPE zone setup, ";
+    s += juce::String ((int) chans.size()) + " note channel" + (chans.size() == 1 ? "" : "s");
+    return s;
+}
+
+void MainComponent::injectMidi (const juce::MidiMessage& m)
+{
+    auto msg = m;
+    msg.setTimeStamp (juce::Time::getMillisecondCounterHiRes() * 0.001);
+    player.getMidiMessageCollector().addMessageToQueue (msg);   // same entry as a hardware keyboard
+    midiRecorder.handleMessage (msg);
+    if (midiThru.load())
+    {
+        const juce::ScopedLock sl (midiOutLock);
+        if (midiOut != nullptr)
+            midiOut->sendMessageNow (msg);
+    }
+}
+
+void MainComponent::sendMpeSetupLive()
+{
+    for (const auto& m : mpe::zoneSetup (mpeConfig))
+        injectMidi (m);
+}
+
+void MainComponent::setMpeEnabled (bool on)
+{
+    mpeConfig.enabled = on;
+    mpeButton.setToggleState (on, juce::dontSendNotification);
+    mpeFile().replaceWithText (on ? "1" : "0");
+    if (on)
+        sendMpeSetupLive();
+    setStatus (on ? "MPE on: lower-zone setup sent (" + juce::String (mpeConfig.members) + " members, +/-"
+                        + juce::String (mpeConfig.memberPB) + " st)"
+                  : "MPE off (channels still pass through untouched)");
+    if (currentMidiFile != juce::File() && midiSequence.getNumEvents() > 0 && ! bounceEngine.isBouncing())
+        loadMidiFile (currentMidiFile);   // re-bounce with / without the added setup
+}
+
+//==============================================================================
 void MainComponent::handleIncomingMidiMessage (juce::MidiInput*, const juce::MidiMessage& m)
 {
     midiRecorder.handleMessage (m);   // dashcam capture, independent of the thru switch
@@ -1741,6 +1840,14 @@ void MainComponent::paint (juce::Graphics& g)
     g.setColour (juce::Colours::white);
     g.setFont (juce::FontOptions (18.0f, juce::Font::bold));
     g.drawText ("VST TestBench", 16, 10, getWidth() - 300, 26, juce::Justification::left);
+    if (controlPort > 0)
+    {
+        g.setColour (juce::Colours::grey);
+        g.setFont (juce::FontOptions (11.0f));
+        g.drawText ("AI control: 127.0.0.1:" + juce::String (controlPort), 150, 10, 220, 26,
+                    juce::Justification::centredLeft);
+        g.setColour (juce::Colours::white);
+    }
 
     const juce::Colour cSrc (0xff5fb0e0), cProc (0xffe0a35f), cFx (0xff9a5fe0),
                        cOut (0xff5fe08a);
@@ -1824,6 +1931,7 @@ void MainComponent::resized()
             auto r = rowIn (in, 28);
             openMidiButton.setBounds (r.removeFromLeft (130));
             r.removeFromLeft (6); midiRecButton.setBounds (r.removeFromLeft (90));
+            r.removeFromLeft (6); mpeButton.setBounds (r.removeFromLeft (56));
             r.removeFromLeft (8); midiStatusLabel.setBounds (r);
         }
         {   // file player transport

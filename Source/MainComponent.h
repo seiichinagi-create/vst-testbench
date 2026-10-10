@@ -7,6 +7,9 @@
 #include "GpuFxWorker.h"
 #include "MidiBounceEngine.h"
 #include "MidiTakeRecorder.h"
+#include "MpeSupport.h"
+#include "OutputTap.h"
+#include "ControlServer.h"
 
 //==============================================================================
 // Lightweight VST3 test-bench host.
@@ -79,6 +82,18 @@ private:
     void handleBounceDone (bool ok, juce::File out, juce::String info);
     void abandonMidiChain();
     bool midiChainActive() const;
+
+    //== MPE (live injection + MIDI-file bounce) ==
+    void injectMidi (const juce::MidiMessage&);     // any thread: graph + take recorder + thru
+    void sendMpeSetupLive();                        // zone / bend-range setup to the live VSTi (and thru)
+    void setMpeEnabled (bool);
+    juce::String describeMidiSequence (const juce::MidiMessageSequence&) const;
+
+    //== AI control (ControlServer; handler runs on the message thread) ==
+    juce::var handleControl (const juce::var& request);
+    juce::var controlStatus() const;
+    juce::AudioProcessor* processorForRole (const juce::String& role) const;
+    juce::MidiMessageSequence sequenceFromEvents (const juce::var& events, juce::String& error) const;
 
     //== GPU FX (gpufx worker renders the playable file) ==
     void setGpuFxEnabled (bool);
@@ -159,6 +174,18 @@ private:
     std::atomic<juce::AudioProcessor*> instrumentProc { nullptr };  // listener-thread-safe identity
     juce::String midiReadyText { "MIDI: none" };
 
+    //== MPE / AI control state ==
+    mpe::Config mpeConfig;
+    juce::String mpeNote;                       // what the loaded MIDI file looked like
+    int pendingLoads = 0;                       // async plugin loads in flight (message thread)
+    Graph::Node::Ptr tapNode;
+    OutputTap* outputTap = nullptr;             // owned by the graph node
+    MidiScheduler midiScheduler { [this] (const juce::MidiMessage& m) { injectMidi (m); } };
+    ControlServer controlServer { [this] (const juce::var& r) { return handleControl (r); } };
+    int controlPort = 0;
+    juce::File mpeFile() const;
+    juce::File controlPortFile() const;
+
     //== GPU FX state ==
     GpuFxWorker gpuWorker;
     juce::File  currentGpuFile;       // last completed gpufx output (generation file)
@@ -216,6 +243,7 @@ private:
     // MIDI bounce (Phase C) + take recorder
     juce::TextButton   openMidiButton { "Open MIDI file..." };
     juce::ToggleButton midiRecButton  { "MIDI REC" };
+    juce::ToggleButton mpeButton      { "MPE" };
     juce::Label        midiStatusLabel;
 
     // File player

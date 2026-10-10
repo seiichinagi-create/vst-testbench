@@ -15,6 +15,7 @@ VSTプラグインの動作確認・ミックス確認を高速化するため�
 | バックエンド自動切替 | ファイル再生=WASAPI / Live・VSTi=ASIO をソースモードに連動して自動選択する |
 | GPU FX | gpufx常駐ワーカー(TCP)によるファイルのGPU処理。describeスキーマからパラメータUIを動的生成する |
 | MIDIバウンス | ドラレコ式MIDI自動保存(無入力10秒で自動保存)→ VSTiオフラインバウンス → GPU/VST/キャッシュ経路へ合流 |
+| MPE対応 / AI操作 | MIDI再生・MIDIファイルバウンスともチャンネルを保持しMPEゾーン設定を補う(MPEボタン)。127.0.0.1のJSON制御サーバーで、プラグイン読込・パラメータ・MIDI再生・録音・解析をAIが操作できる。詳細は [docs/CONTROL.md](docs/CONTROL.md) |
 
 思想と進化の記録は [docs/PRERENDER.md](docs/PRERENDER.md) を、ビルドおよび使用方法は [BUILD.md](BUILD.md) を参照のこと。
 

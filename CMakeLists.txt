@@ -16,6 +16,7 @@ juce_generate_juce_header(VstTestBench)
 target_sources(VstTestBench PRIVATE
     Source/Main.cpp
     Source/MainComponent.cpp
+    Source/ControlCommands.cpp
 )
 
 if(MSVC)

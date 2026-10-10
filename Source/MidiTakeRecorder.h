@@ -3,6 +3,7 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <atomic>
 #include <cstring>
+#include <vector>
 
 //==============================================================================
 // Dashcam-style MIDI capture: no arm/stop workflow, noodling is never lost.
@@ -41,7 +42,10 @@ public:
         if (! takeOpen)
         {
             if (! m.isNoteOn())
+            {
+                rememberBeforeTake (m, now);
                 return;                        // a take starts with a note
+            }
             takeOpen     = true;
             takeStartMs  = now;
             takeWallTime = juce::Time::getCurrentTime();
@@ -49,6 +53,22 @@ public:
             noteOns   = 0;
             heldCount = 0;
             std::memset (held, 0, sizeof (held));
+
+            // MPE: the zone / pitch-bend-range setup and the first note's
+            // bend / pressure / slide arrive BEFORE the note-on. Keep them.
+            for (auto s : setupMemory)
+            {
+                s.setTimeStamp (0.0);
+                seq.addEvent (s);
+            }
+            for (const auto& pr : preRoll)
+                if (now - pr.atMs <= preRollMs)
+                {
+                    auto s = pr.msg;
+                    s.setTimeStamp (0.0);
+                    seq.addEvent (s);
+                }
+            preRoll.clear();
         }
 
         auto stamped = m;
@@ -92,6 +112,29 @@ public:
     }
 
 private:
+    // Not in a take: remember RPN set-up (zone config, bend ranges) for good and
+    // per-note expression for a short pre-roll window.
+    void rememberBeforeTake (const juce::MidiMessage& m, double now)
+    {
+        if (m.isController())
+        {
+            const int cc = m.getControllerNumber();
+            if (cc == 6 || cc == 38 || cc == 98 || cc == 99 || cc == 100 || cc == 101)
+            {
+                setupMemory.add (m);
+                if (setupMemory.size() > maxSetupMessages)
+                    setupMemory.removeRange (0, setupMemory.size() - maxSetupMessages);
+                return;
+            }
+        }
+        if (m.isPitchWheel() || m.isChannelPressure() || m.isAftertouch() || m.isController())
+        {
+            preRoll.push_back ({ m, now });
+            if (preRoll.size() > 64)
+                preRoll.erase (preRoll.begin());
+        }
+    }
+
     juce::File closeLocked()
     {
         takeOpen = false;
@@ -134,6 +177,12 @@ private:
     juce::Time takeWallTime;
     int        noteOns = 0, heldCount = 0;
     bool       held[16][128] = {};
+
+    struct PreRollEvent { juce::MidiMessage msg; double atMs; };
+    static constexpr double preRollMs = 150.0;
+    static constexpr int    maxSetupMessages = 256;
+    juce::Array<juce::MidiMessage> setupMemory;
+    std::vector<PreRollEvent>      preRoll;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MidiTakeRecorder)
 };
