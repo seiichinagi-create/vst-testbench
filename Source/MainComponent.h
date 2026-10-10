@@ -225,6 +225,9 @@ private:
     ControlServer controlServer { [this] (const juce::var& r) { return handleControl (r); } };
     int controlPort = 0;
     juce::File mpeFile() const;
+    juce::File tracksFile() const;         // tracks.json: strip gain / balance and the INST MIDI channels (not mute / solo)
+    void saveTracks() const;
+    void loadTracks();
     juce::File controlPortFile() const;
 
     //== GPU FX state ==

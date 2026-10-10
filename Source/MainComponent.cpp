@@ -68,6 +68,7 @@ MainComponent::MainComponent()
     }
     midiFilters[trkInst2]->setMask (0);   // INST 2 / 3 get no MIDI until channels are assigned (INST 1: every channel)
     midiFilters[trkInst3]->setMask (0);
+    loadTracks();
     {
         MixerPanel::Hooks hooks;
         hooks.load   = [this] (int t) { loadPluginDialog (true, t); };
@@ -422,6 +423,7 @@ MainComponent::MainComponent()
 
 MainComponent::~MainComponent()
 { setLookAndFeel (nullptr);
+    saveTracks();
     mixerPanel = nullptr;
     stopTimer();
     controlServer.stop();
@@ -470,6 +472,7 @@ juce::File MainComponent::inputPairFile()   const { return appDir().getChildFile
 juce::File MainComponent::midiOutFile()     const { return appDir().getChildFile ("midi_out.txt"); }
 juce::File MainComponent::midiThruFile()    const { return appDir().getChildFile ("midi_thru.txt"); }
 juce::File MainComponent::mpeFile()         const { return appDir().getChildFile ("mpe_mode.txt"); }
+juce::File MainComponent::tracksFile()      const { return appDir().getChildFile ("tracks.json"); }
 juce::File MainComponent::controlPortFile() const { return appDir().getChildFile ("control_port.txt"); }
 
 // The saved setup can name a device that is no longer there; JUCE then opens
@@ -825,6 +828,49 @@ void MainComponent::removeInstrument()
     applyModePreset();
     instLabel.setText ("No instrument loaded", juce::dontSendNotification);
     setStatus ("Instrument removed.");
+}
+
+void MainComponent::saveTracks() const
+{
+    auto root = new juce::DynamicObject();
+    juce::Array<juce::var> list;
+    for (int t = 0; t <= numTracks; ++t)          // numTracks = the master
+    {
+        const TrackStrip* st = t == numTracks ? masterStrip : strips[t];
+        auto o = new juce::DynamicObject();
+        o->setProperty ("track", t == numTracks ? "master" : t == trkAudio ? "audio" : "inst" + juce::String (t));
+        o->setProperty ("gain_db", (double) st->getGainDb());
+        o->setProperty ("balance", (double) st->getBalance());
+        if (t >= trkInst1 && t < numTracks)
+            o->setProperty ("midi_mask", (int) midiFilters[t]->getMask());
+        list.add (juce::var (o));
+    }
+    root->setProperty ("tracks", list);
+    tracksFile().replaceWithText (juce::JSON::toString (juce::var (root)));
+}
+
+void MainComponent::loadTracks()
+{
+    const auto f = tracksFile();
+    if (! f.existsAsFile())
+        return;
+    const auto v = juce::JSON::parse (f);
+    auto* list = v["tracks"].getArray();
+    if (list == nullptr)
+        return;
+    for (const auto& e : *list)
+    {
+        const auto name = e["track"].toString();
+        const int t = name == "master" ? numTracks : name == "audio" ? trkAudio : name == "inst1" ? trkInst1
+                    : name == "inst2" ? trkInst2 : name == "inst3" ? trkInst3 : -1;
+        if (t < 0)
+            continue;
+        TrackStrip* st = t == numTracks ? masterStrip : strips[t];
+        st->setGainDb ((float) (double) e.getProperty ("gain_db", 0.0));
+        st->setBalance ((float) (double) e.getProperty ("balance", 0.0));
+        if (t >= trkInst1 && t < numTracks && e.hasProperty ("midi_mask"))
+            midiFilters[t]->setMask ((juce::uint32) (int) e["midi_mask"]);
+    }
 }
 
 void MainComponent::updateSolo()

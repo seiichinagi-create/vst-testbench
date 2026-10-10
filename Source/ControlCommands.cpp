@@ -278,6 +278,7 @@ juce::var MainComponent::handleControl (const juce::var& req)
             midiFilters[t]->setMask (maskFromChannels (req["midi_channels"]));
         }
         if (mixerPanel != nullptr) mixerPanel->refresh();
+        saveTracks();
         return trackInfo (t);
     }
     if (cmd == "track_status")
