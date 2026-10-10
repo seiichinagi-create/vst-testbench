@@ -120,8 +120,16 @@ def main():
     tb.wait_idle()
     tb.call("set_source", mode="file")
     tb.wait_idle()
-    rate = int(tb.call("status")["audio"]["sample_rate"])
-    block = int(tb.call("status")["audio"]["buffer"])
+    # right after a backend switch the status has no `audio` for a moment: wait for the device
+    for _ in range(50):
+        audio = tb.call("status").get("audio")
+        if audio:
+            break
+        time.sleep(0.2)
+    else:
+        raise SystemExit("the bench reports no audio device")
+    rate = int(audio["sample_rate"])
+    block = int(audio["buffer"])
     print(f"device: {rate} Hz, buffer {block}")
 
     src = os.path.join(tmp, "live_vs_rig_src.wav")
