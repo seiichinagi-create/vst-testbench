@@ -87,7 +87,6 @@ private:
     void injectMidi (const juce::MidiMessage&);     // any thread: graph + take recorder + thru
     void sendMpeSetupLive();                        // zone / bend-range setup to the live VSTi (and thru)
     void setMpeEnabled (bool, bool rebounce = true);
-    void setTopBend (bool, bool rebounce = true);
     // merged file sequence -> what the instrument gets (TOP-BEND split, zone setup, note-on ordering)
     juce::MidiMessageSequence prepareMidiForInstrument (juce::MidiMessageSequence, juce::String& note) const;
     juce::String describeMidiSequence (const juce::MidiMessageSequence&) const;
@@ -179,7 +178,6 @@ private:
 
     //== MPE / AI control state ==
     mpe::Config mpeConfig;
-    bool topBend = false;                       // one-channel file: bend only the highest sounding note (own MPE channel)
     juce::String mpeNote;                       // what the loaded MIDI file looked like
     int pendingLoads = 0;                       // async plugin loads in flight (message thread)
     Graph::Node::Ptr tapNode;
@@ -188,7 +186,6 @@ private:
     ControlServer controlServer { [this] (const juce::var& r) { return handleControl (r); } };
     int controlPort = 0;
     juce::File mpeFile() const;
-    juce::File topBendFile() const;
     juce::File controlPortFile() const;
 
     //== GPU FX state ==
@@ -249,7 +246,6 @@ private:
     juce::TextButton   openMidiButton { "Open MIDI file..." };
     juce::ToggleButton midiRecButton  { "MIDI REC" };
     juce::ToggleButton mpeButton      { "MPE" };
-    juce::ToggleButton topBendButton  { "TOP-BEND" };
     juce::Label        midiStatusLabel;
 
     // File player

@@ -61,6 +61,14 @@ namespace mpe
         return chans;
     }
 
+    inline bool hasPitchBend (const juce::MidiMessageSequence& seq)
+    {
+        for (int i = 0; i < seq.getNumEvents(); ++i)
+            if (seq.getEventPointer (i)->message.isPitchWheel())
+                return true;
+        return false;
+    }
+
     inline bool looksMpe (const juce::MidiMessageSequence& seq)
     {
         return noteChannels (seq).size() >= 2 && hasZoneSetup (seq);

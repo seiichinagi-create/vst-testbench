@@ -63,7 +63,7 @@ MainComponent::MainComponent()
     addBtn (loadButton); addBtn (editorButton);
     addBtn (clearButton);         addBtn (bypassButton); addBtn (midiThruButton);
     addBtn (loadInstButton);      addBtn (instEditorButton); addBtn (clearInstButton);
-    addBtn (openMidiButton);      addBtn (mpeButton);   addBtn (topBendButton);
+    addBtn (openMidiButton);      addBtn (mpeButton);
     addBtn (openFileButton);      addBtn (playButton); addBtn (stopButton); addBtn (loopButton);
 
     audioSettingsButton.onClick = [this] { showAudioSettings(); };
@@ -278,20 +278,14 @@ MainComponent::MainComponent()
     // sends a lower-zone setup (live) and prepends it to files that lack one.
     mpeButton.setTooltip ("MPE instrument mode. Sends the MPE lower-zone setup (15 members, +/-48 st per-note bend, "
                           "+/-2 st master) to the loaded VSTi, and adds it to MIDI files that carry none before "
-                          "the bounce. Channels, per-note bend, pressure and slide are never touched.");
+                          "the bounce. Channels, per-note bend, pressure and slide are never touched - except in "
+                          "one case: a ONE-channel file with pitch bend gets each note on its own channel and the "
+                          "bend goes to the highest sounding note only (a higher note-on takes over as top and the "
+                          "old top's bend returns to centre). File bounce / file play only, not live keys.");
     mpeButton.setToggleState (mpeFile().existsAsFile() && mpeFile().loadFileAsString().trim() == "1",
                               juce::dontSendNotification);
     mpeConfig.enabled = mpeButton.getToggleState();
     mpeButton.onClick = [this] { setMpeEnabled (mpeButton.getToggleState()); };
-
-    topBendButton.setTooltip ("One-channel MIDI file with pitch bend meant for the highest sounding note only: "
-                              "each note gets its own MPE channel and the bend goes to the current top note. "
-                              "A higher note-on takes over as top and the old top bend returns to centre "
-                              "(the bend does not move). Applies to MIDI-file bounce / file play, not to live keys. "
-                              "Files that are already MPE are left alone.");
-    topBend = topBendFile().existsAsFile() && topBendFile().loadFileAsString().trim() == "1";
-    topBendButton.setToggleState (topBend, juce::dontSendNotification);
-    topBendButton.onClick = [this] { setTopBend (topBendButton.getToggleState()); };
 
     midiStatusLabel.setJustificationType (juce::Justification::centredLeft);
     midiStatusLabel.setColour (juce::Label::textColourId, juce::Colours::skyblue);
@@ -439,7 +433,6 @@ juce::File MainComponent::autoBackendFile() const { return appDir().getChildFile
 juce::File MainComponent::inputPairFile()   const { return appDir().getChildFile ("live_input_pair.txt"); }
 juce::File MainComponent::midiOutFile()     const { return appDir().getChildFile ("midi_out.txt"); }
 juce::File MainComponent::midiThruFile()    const { return appDir().getChildFile ("midi_thru.txt"); }
-juce::File MainComponent::topBendFile()     const { return appDir().getChildFile ("top_bend_mode.txt"); }
 juce::File MainComponent::mpeFile()         const { return appDir().getChildFile ("mpe_mode.txt"); }
 juce::File MainComponent::controlPortFile() const { return appDir().getChildFile ("control_port.txt"); }
 
@@ -1660,18 +1653,16 @@ juce::MidiMessageSequence MainComponent::prepareMidiForInstrument (juce::MidiMes
 {
     note = describeMidiSequence (seq);
     bool needSetup = mpeConfig.enabled;
-    if (topBend)
+    // MPE on + one note channel + pitch bend + no zone setup: the bend was written for one
+    // channel, so it can only mean "the top note". Give every note its own channel.
+    if (mpeConfig.enabled && mpe::noteChannels (seq).size() == 1 && mpe::hasPitchBend (seq)
+        && ! mpe::hasZoneSetup (seq))
     {
-        if (mpe::looksMpe (seq))
-            note += " (TOP-BEND skipped: already MPE)";
-        else
-        {
-            auto r = mpe::topBendSplit (seq, mpeConfig);
-            seq = std::move (r.seq);
-            note += " -> TOP-BEND: " + juce::String (r.notes) + " notes split, " + juce::String (r.bends)
-                    + " bends routed" + (r.steals > 0 ? ", " + juce::String (r.steals) + " stolen" : juce::String());
-            needSetup = true;
-        }
+        auto r = mpe::topBendSplit (seq, mpeConfig);
+        seq = std::move (r.seq);
+        note += " -> bend on the top note only: " + juce::String (r.notes) + " notes split, "
+                + juce::String (r.bends) + " bends routed"
+                + (r.steals > 0 ? ", " + juce::String (r.steals) + " stolen" : juce::String());
     }
     if (needSetup && ! mpe::hasZoneSetup (seq))
     {
@@ -1680,16 +1671,6 @@ juce::MidiMessageSequence MainComponent::prepareMidiForInstrument (juce::MidiMes
     }
     mpe::noteOnsLast (seq);
     return seq;
-}
-
-void MainComponent::setTopBend (bool on, bool rebounce)
-{
-    topBend = on;
-    topBendButton.setToggleState (on, juce::dontSendNotification);
-    topBendFile().replaceWithText (on ? "1" : "0");
-    setStatus (on ? "TOP-BEND on: bend goes to the highest sounding note only" : "TOP-BEND off");
-    if (rebounce && currentMidiFile != juce::File() && midiSequence.getNumEvents() > 0 && ! bounceEngine.isBouncing())
-        loadMidiFile (currentMidiFile);
 }
 
 void MainComponent::sendMpeSetupLive()
@@ -1972,7 +1953,6 @@ void MainComponent::resized()
             openMidiButton.setBounds (r.removeFromLeft (130));
             r.removeFromLeft (6); midiRecButton.setBounds (r.removeFromLeft (90));
             r.removeFromLeft (6); mpeButton.setBounds (r.removeFromLeft (56));
-            r.removeFromLeft (4); topBendButton.setBounds (r.removeFromLeft (90));
             r.removeFromLeft (8); midiStatusLabel.setBounds (r);
         }
         {   // file player transport
