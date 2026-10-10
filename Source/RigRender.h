@@ -2,6 +2,7 @@
 
 #include <juce_audio_utils/juce_audio_utils.h>
 #include <atomic>
+#include <algorithm>
 #include <functional>
 
 //==============================================================================
@@ -157,23 +158,127 @@ public:
         std::vector<float> ring;
     };
 
+    // Feeds a MIDI sequence (seconds) to whatever its MIDI output is connected to. One per MIDI track, so that
+    // several instruments each get their own part (the graph's single MIDI input would send all of them the same).
+    class MidiFeeder : public juce::AudioProcessor
+    {
+    public:
+        MidiFeeder (juce::MidiMessageSequence s, double rate)
+            : juce::AudioProcessor (BusesProperties()), seq (std::move (s)), sr (rate) {}
+
+        const juce::String getName() const override { return "MidiFeeder"; }
+        void prepareToPlay (double, int) override { pos = 0; index = 0; }
+        void releaseResources() override {}
+        void processBlock (juce::AudioBuffer<float>& b, juce::MidiBuffer& midi) override
+        {
+            midi.clear();
+            const int n = b.getNumSamples();
+            const double blockEnd = (double) (pos + n) / sr;
+            while (index < seq.getNumEvents())
+            {
+                const auto* ev = seq.getEventPointer (index);
+                const double t = ev->message.getTimeStamp();
+                if (t >= blockEnd)
+                    break;
+                midi.addEvent (ev->message, juce::jlimit (0, juce::jmax (0, n - 1), (int) ((juce::int64) (t * sr) - pos)));
+                ++index;
+            }
+            pos += n;
+        }
+        double getTailLengthSeconds() const override { return 0.0; }
+        bool acceptsMidi() const override { return false; }
+        bool producesMidi() const override { return true; }
+        juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+        bool hasEditor() const override { return false; }
+        int getNumPrograms() override { return 1; }
+        int getCurrentProgram() override { return 0; }
+        void setCurrentProgram (int) override {}
+        const juce::String getProgramName (int) override { return {}; }
+        void changeProgramName (int, const juce::String&) override {}
+        void getStateInformation (juce::MemoryBlock&) override {}
+        void setStateInformation (const void*, int) override {}
+
+    private:
+        juce::MidiMessageSequence seq;
+        double sr;
+        juce::int64 pos = 0;
+        int index = 0;
+    };
+
+    // Exponentially decaying tail of a KNOWN length: y[n] = x[n] + a*y[n-1], -60 dB after `t60` seconds, and a
+    // tail length it DECLARES (which may be a lie). The control for the tail check.
+    class KnownTail : public juce::AudioProcessor
+    {
+    public:
+        KnownTail (double t60Seconds, double declaredSeconds)
+            : juce::AudioProcessor (BusesProperties().withInput  ("Input",  juce::AudioChannelSet::stereo(), true)
+                                                     .withOutput ("Output", juce::AudioChannelSet::stereo(), true)),
+              t60 (t60Seconds), declared (declaredSeconds) {}
+
+        const juce::String getName() const override { return "KnownTail"; }
+        void prepareToPlay (double rate, int) override
+        {
+            a = (float) std::pow (10.0, -3.0 / (t60 * rate));
+            y[0] = y[1] = 0.0f;
+        }
+        void releaseResources() override {}
+        void processBlock (juce::AudioBuffer<float>& b, juce::MidiBuffer&) override
+        {
+            for (int c = 0; c < juce::jmin (2, b.getNumChannels()); ++c)
+            {
+                float* d = b.getWritePointer (c);
+                float s = y[c];
+                for (int i = 0; i < b.getNumSamples(); ++i)
+                {
+                    s = d[i] + a * s;
+                    d[i] = s;
+                }
+                y[c] = s;
+            }
+        }
+        double getTailLengthSeconds() const override { return declared; }
+        bool acceptsMidi() const override { return false; }
+        bool producesMidi() const override { return false; }
+        juce::AudioProcessorEditor* createEditor() override { return nullptr; }
+        bool hasEditor() const override { return false; }
+        int getNumPrograms() override { return 1; }
+        int getCurrentProgram() override { return 0; }
+        void setCurrentProgram (int) override {}
+        const juce::String getProgramName (int) override { return {}; }
+        void changeProgramName (int, const juce::String&) override {}
+        void getStateInformation (juce::MemoryBlock&) override {}
+        void setStateInformation (const void*, int) override {}
+
+    private:
+        double t60, declared;
+        float a = 0.0f, y[2] = { 0.0f, 0.0f };
+    };
+
     struct Stage
     {
-        juce::String role;   // "inst" / "source" / "insert" / "master"
+        juce::String role;   // "source" / "inst" / "insert" / "master"
         std::unique_ptr<juce::AudioProcessor> plugin;
     };
 
+    // One track: a source (a VSTi fed by its own MIDI, an impulse, or a file) and its insert chain.
+    struct Track
+    {
+        std::vector<Stage> stages;            // signal order; stages[0] is the source
+        juce::int64 impulseAt = -1;           // >= 0: stages[0] is an ImpulseSource at this sample; no MIDI
+        juce::int64 sourceSamples = -1;       // >= 0: stages[0] is a FileSource of this many samples; no MIDI
+        juce::MidiMessageSequence sequence;   // seconds, for a VSTi source
+    };
+
+    // tracks -> (summed) -> master -> out. The graph delays every track by what the longest one needs.
     struct Spec
     {
-        std::vector<Stage> stages;            // in signal order; stages[0] is the instrument (or an ImpulseSource)
-        juce::int64 impulseAt = -1;           // >= 0: stages[0] is an ImpulseSource at this sample; MIDI is not used
-        juce::int64 sourceSamples = -1;       // >= 0: stages[0] is a FileSource of this many samples; MIDI is not used
-        juce::MidiMessageSequence sequence;   // seconds
+        std::vector<Track> tracks;
+        std::vector<Stage> master;
         double sampleRate = 48000.0;
         int block = 512;
         double tailSeconds = 2.0;
         bool compensate = true;
-        bool dryParallel = false;             // also send the instrument straight to the output: a second, shorter path for the graph's PDC to align
+        bool dryParallel = false;             // also send track 0's source straight to the output: a second, shorter path for the graph's PDC to align
         int settleMs = 0;                     // wait after prepareToPlay so async plugin work (capture loads) can land
         juce::File out;
         std::function<void (const juce::String&)> progress;   // phase notes, from the render thread
@@ -219,19 +324,24 @@ private:
         using Graph = juce::AudioProcessorGraph;
         auto note = [this] (const juce::String& m) { if (spec.progress != nullptr) spec.progress (m); };
 
-        if (spec.stages.empty() || spec.stages[0].plugin == nullptr) { fail ("no instrument"); return; }
-        const bool audioSource = spec.impulseAt >= 0 || spec.sourceSamples >= 0;   // no MIDI in either
-        if (! audioSource && spec.sequence.getNumEvents() == 0)      { fail ("no MIDI events"); return; }
+        if (spec.tracks.empty()) { fail ("no tracks"); return; }
+        for (auto& t : spec.tracks)
+        {
+            if (t.stages.empty() || t.stages[0].plugin == nullptr) { fail ("a track has no source"); return; }
+            if (t.impulseAt < 0 && t.sourceSamples < 0 && t.sequence.getNumEvents() == 0) { fail ("a MIDI track has no events"); return; }
+        }
 
         const double sr = spec.sampleRate;
         const int block = spec.block;
-        const juce::int64 tailSamples = (juce::int64) (spec.tailSeconds * sr);
-        const juce::int64 body = spec.impulseAt >= 0 ? spec.impulseAt + tailSamples
-                               : spec.sourceSamples >= 0 ? spec.sourceSamples + tailSamples
-                               : (juce::int64) ((spec.sequence.getEndTime() + spec.tailSeconds) * sr);
+        juce::int64 longest = 0;
+        for (auto& t : spec.tracks)
+            longest = juce::jmax (longest, t.impulseAt >= 0 ? t.impulseAt
+                                         : t.sourceSamples >= 0 ? t.sourceSamples
+                                         : (juce::int64) (t.sequence.getEndTime() * sr));
+        const juce::int64 body = longest + (juce::int64) (spec.tailSeconds * sr);
         if (body > 150'000'000) { fail ("too long to render"); return; }
 
-        //-- build the graph: MIDI -> inst -> insert -> master -> out ---------
+        //-- build the graph: [MIDI ->] source -> inserts   (per track)  ->  master -> out -----------
         // One rebuild only, inside prepareToPlay: every add* below would otherwise queue an async rebuild
         // on the message thread that can interleave with it (graph latency read 0 in 2 of 10 renders).
         note ("building the graph");
@@ -248,51 +358,85 @@ private:
         graph.setPlayConfigDetails (0, 2, sr, block);
         graph.setNonRealtime (true);
 
-        auto outNode  = graph.addNode (std::make_unique<Graph::AudioGraphIOProcessor> (Graph::AudioGraphIOProcessor::audioOutputNode), {}, none);
-        auto midiNode = graph.addNode (std::make_unique<Graph::AudioGraphIOProcessor> (Graph::AudioGraphIOProcessor::midiInputNode), {}, none);
+        auto outNode = graph.addNode (std::make_unique<Graph::AudioGraphIOProcessor> (Graph::AudioGraphIOProcessor::audioOutputNode), {}, none);
 
-        std::vector<Graph::Node::Ptr> nodes;
-        std::vector<juce::String> roles;
-        for (auto& st : spec.stages)
+        struct Placed { Graph::Node::Ptr node; juce::String role; int track; };   // track -1 = master
+        std::vector<Placed> placed;
+        auto place = [&] (Stage& st, int track)
         {
-            roles.push_back (st.role);
             st.plugin->enableAllBuses();
             st.plugin->setNonRealtime (true);
             st.plugin->setPlayConfigDetails (st.plugin->getTotalNumInputChannels(),
                                              st.plugin->getTotalNumOutputChannels(), sr, block);
-            nodes.push_back (graph.addNode (std::move (st.plugin), {}, none));
-        }
-
-        if (! audioSource)
-            graph.addConnection ({ { midiNode->nodeID, Graph::midiChannelIndex },
-                                   { nodes[0]->nodeID, Graph::midiChannelIndex } }, none);
-
-        for (size_t i = 0; i < nodes.size(); ++i)
+            auto node = graph.addNode (std::move (st.plugin), {}, none);
+            placed.push_back ({ node, st.role, track });
+            return node;
+        };
+        // audio from `from` into `to` (to == null: the output node)
+        auto connect = [&] (Graph::Node::Ptr from, Graph::Node::Ptr to)
         {
-            const int outs = nodes[i]->getProcessor()->getTotalNumOutputChannels();
-            const auto dest = i + 1 < nodes.size() ? nodes[i + 1] : outNode;
-            const int ins = i + 1 < nodes.size() ? dest->getProcessor()->getTotalNumInputChannels() : 2;
+            const int outs = from->getProcessor()->getTotalNumOutputChannels();
+            const auto dest = to != nullptr ? to : outNode;
+            const int ins = to != nullptr ? to->getProcessor()->getTotalNumInputChannels() : 2;
             for (int ch = 0; ch < juce::jmin (2, outs, ins); ++ch)
-                graph.addConnection ({ { nodes[i]->nodeID, ch }, { dest->nodeID, ch } }, none);
-            // mono source into a stereo destination: feed both sides
-            if (outs == 1 && ins >= 2)
-                graph.addConnection ({ { nodes[i]->nodeID, 0 }, { dest->nodeID, 1 } }, none);
+                graph.addConnection ({ { from->nodeID, ch }, { dest->nodeID, ch } }, none);
+            if (outs == 1 && ins >= 2)       // mono into stereo: feed both sides
+                graph.addConnection ({ { from->nodeID, 0 }, { dest->nodeID, 1 } }, none);
+        };
+
+        std::vector<Graph::Node::Ptr> masterNodes;
+        for (auto& st : spec.master)
+            masterNodes.push_back (place (st, -1));
+        const Graph::Node::Ptr masterIn = masterNodes.empty() ? Graph::Node::Ptr() : masterNodes.front();
+        for (size_t i = 0; i + 1 < masterNodes.size(); ++i)
+            connect (masterNodes[i], masterNodes[i + 1]);
+        if (! masterNodes.empty())
+            connect (masterNodes.back(), nullptr);
+
+        std::vector<int> trackLatency (spec.tracks.size(), 0);
+        Graph::Node::Ptr firstSource;
+        bool firstTrackHasMore = false;
+        for (size_t ti = 0; ti < spec.tracks.size(); ++ti)
+        {
+            auto& tr = spec.tracks[ti];
+            std::vector<Graph::Node::Ptr> chain;
+            for (auto& st : tr.stages)
+                chain.push_back (place (st, (int) ti));
+
+            const bool midiTrack = tr.impulseAt < 0 && tr.sourceSamples < 0;
+            if (midiTrack)
+            {
+                auto feeder = graph.addNode (std::make_unique<MidiFeeder> (tr.sequence, sr), {}, none);
+                graph.addConnection ({ { feeder->nodeID, Graph::midiChannelIndex },
+                                       { chain[0]->nodeID, Graph::midiChannelIndex } }, none);
+            }
+            for (size_t i = 0; i + 1 < chain.size(); ++i)
+                connect (chain[i], chain[i + 1]);
+            connect (chain.back(), masterIn);        // summed with the other tracks at the master's input (or the output)
+
+            if (ti == 0) { firstSource = chain[0]; firstTrackHasMore = chain.size() > 1 || ! masterNodes.empty(); }
         }
 
-        if (spec.dryParallel && nodes.size() > 1)
-        {
-            const int outs = nodes[0]->getProcessor()->getTotalNumOutputChannels();
-            for (int ch = 0; ch < juce::jmin (2, outs); ++ch)
-                graph.addConnection ({ { nodes[0]->nodeID, ch }, { outNode->nodeID, ch } }, none);
-            if (outs == 1)
-                graph.addConnection ({ { nodes[0]->nodeID, 0 }, { outNode->nodeID, 1 } }, none);
-        }
+        if (spec.dryParallel && firstSource != nullptr && firstTrackHasMore)
+            connect (firstSource, nullptr);
 
         // The graph builds its delay compensation inside prepareToPlay from the latencies the plugins declare
         // THEN. A plugin that declares late (Legacy Distortion, after an async capture load) can leave the graph
         // with 0 while the plugins say 4: the dry path then goes uncompensated and the render is wrong without
-        // any error. So: settle, compare the graph's total with the sum of the declared latencies, and if they
-        // differ drop the sequence (releaseResources) and prepare again. Never render on a mismatch.
+        // any error. So: settle, compare the graph's total with what the declared latencies add up to (the
+        // longest track plus the master), and if they differ drop the sequence (releaseResources) and prepare
+        // again. Never render on a mismatch.
+        auto declaredTotal = [&] ()
+        {
+            std::fill (trackLatency.begin(), trackLatency.end(), 0);
+            int masterLat = 0;
+            for (auto& p : placed)
+            {
+                const int l = p.node->getProcessor()->getLatencySamples();
+                if (p.track < 0) masterLat += l; else trackLatency[(size_t) p.track] += l;
+            }
+            return *std::max_element (trackLatency.begin(), trackLatency.end()) + masterLat;
+        };
         int graphLatency = 0, declaredSum = 0, attempts = 0;
         for (; attempts < 5; ++attempts)
         {
@@ -303,33 +447,35 @@ private:
             if (spec.settleMs > 0)
                 wait (spec.settleMs);   // the message thread is free meanwhile: async updates run now, not mid-render
             graphLatency = graph.getLatencySamples();
-            declaredSum = 0;
-            for (auto& n : nodes)
-                declaredSum += n->getProcessor()->getLatencySamples();
+            declaredSum = declaredTotal();
             if (graphLatency == declaredSum)
                 break;
         }
         if (graphLatency != declaredSum)
         {
             graph.releaseResources();
-            fail ("graph latency " + juce::String (graphLatency) + " never matched the declared sum "
+            fail ("graph latency " + juce::String (graphLatency) + " never matched the declared total "
                   + juce::String (declaredSum) + " after " + juce::String (attempts) + " tries");
             return;
         }
 
-        //-- declared latency, read now that everything is prepared -----------
+        //-- declared latency and tail, read now that everything is prepared ----
         auto stagesInfo = juce::Array<juce::var>();
-        int chainLatency = 0;
-        for (size_t i = 0; i < nodes.size(); ++i)
+        for (auto& p : placed)
         {
-            auto* p = nodes[i]->getProcessor();
+            auto* proc = p.node->getProcessor();
             auto s = obj();
-            put (s, "role", roles[i]);
-            put (s, "name", p->getName());
-            put (s, "latency", p->getLatencySamples());
+            put (s, "role", p.role);
+            put (s, "track", p.track);
+            put (s, "name", proc->getName());
+            put (s, "latency", proc->getLatencySamples());
+            put (s, "tail", proc->getTailLengthSeconds());
             stagesInfo.add (s);
-            chainLatency += p->getLatencySamples();
         }
+        juce::Array<juce::var> trackLatencies;
+        for (int l : trackLatency)
+            trackLatencies.add (l);
+        const int chainLatency = declaredSum;
 
         note ("rendering");
         //-- write the wav -----------------------------------------------------
@@ -347,8 +493,7 @@ private:
         const juce::int64 total = body + chainLatency;     // the head that gets dropped comes on top
         const juce::int64 discard = spec.compensate ? chainLatency : 0;
         juce::AudioBuffer<float> buf (2, block);
-        juce::MidiBuffer midi;
-        int evIndex = 0;
+        juce::MidiBuffer midi;                              // the feeders make the MIDI inside the graph
         juce::int64 pos = 0, written = 0;
         double peak = 0.0;
         bool ok = true;
@@ -358,16 +503,6 @@ private:
             const int n = (int) juce::jmin ((juce::int64) block, total - pos);
 
             midi.clear();
-            const double blockEnd = (double) (pos + n) / sr;
-            while (evIndex < spec.sequence.getNumEvents())
-            {
-                const auto* ev = spec.sequence.getEventPointer (evIndex);
-                const double t = ev->message.getTimeStamp();
-                if (t >= blockEnd) break;
-                midi.addEvent (ev->message, juce::jlimit (0, n - 1, (int) ((juce::int64) (t * sr) - pos)));
-                ++evIndex;
-            }
-
             buf.clear();
             juce::AudioBuffer<float> view (buf.getArrayOfWritePointers(), 2, 0, n);
             graph.processBlock (view, midi);
@@ -399,6 +534,7 @@ private:
         put (r, "sample_rate", sr);
         put (r, "samples", (juce::int64) written);
         put (r, "stages", stagesInfo);
+        put (r, "track_latencies", trackLatencies);
         put (r, "chain_latency", chainLatency);
         put (r, "graph_latency", graphLatency);
         put (r, "prepare_attempts", attempts + 1);

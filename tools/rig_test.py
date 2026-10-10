@@ -188,6 +188,171 @@ def split_vs_whole(rig, plugin, bad):
         bad.append(f"split vs whole: the control is not discriminating ({wrong:.1f} dB)")
 
 
+def decay_seconds(x, at=IMPULSE_AT, db_drop=60.0):
+    """Seconds after the impulse until the response (10 ms RMS windows) last stays above peak - db_drop."""
+    m = x.reshape(-1, 2).mean(axis=1)
+    win = int(0.01 * SR_)
+    n = len(m) // win
+    env = 10 * np.log10((m[:n * win].reshape(n, win) ** 2).mean(axis=1) + 1e-30)
+    above = np.nonzero(env > env.max() - db_drop)[0]
+    return (above.max() + 1) * win / SR_ - at / SR_ if above.size else 0.0
+
+
+SR_ = 48000
+TAIL_LEEWAY = 0.1      # seconds: a measured decay this much longer than the declared tail is a cut-off tail
+
+
+def tail_check(rig, a, bad, notes):
+    # controls: a decay of known length (60 dB in 0.8 s) that declares its tail honestly or not
+    for name, declared, want in (("honest   (decays in 0.8 s, declares 0.8 s)", 0.8, "ok"),
+                                 ("dishonest (decays in 0.8 s, declares 0.1 s)", 0.1, "TAIL-CUT")):
+        rig.render("tail_c.wav", source="impulse", impulse_at=IMPULSE_AT, impulse_amp=0.1,
+                   master_tail_t60=0.8, master_tail_declared=declared, tail=3.0)
+        res = rig.tb.call("status")["rig"]
+        t = decay_seconds(rig.read("tail_c.wav"))
+        dec = next(s_["tail"] for s_ in res["stages"] if s_["role"] == "master")
+        verdict = "TAIL-CUT" if t > dec + TAIL_LEEWAY else "ok"
+        good = verdict == want and abs(t - 0.8) < 0.05
+        print(f"  control {name}: measured decay {t:.2f} s, declared {dec:.2f} s -> {verdict}  {'ok' if good else 'WRONG'}")
+        if not good:
+            bad.append(f"tail control '{name}': measured {t:.2f} s, declared {dec:.2f} s, verdict {verdict}, wanted {want}")
+
+    # the render length must not change what came before: 1 s of tail vs 4 s of tail
+    rig.render("tail_s.wav", source="impulse", impulse_at=IMPULSE_AT, impulse_amp=0.1, master_tail_t60=0.8, tail=1.0)
+    short = rig.read("tail_s.wav")
+    rig.render("tail_l.wav", source="impulse", impulse_at=IMPULSE_AT, impulse_amp=0.1, master_tail_t60=0.8, tail=4.0)
+    long_ = rig.read("tail_l.wav")
+    same = np.array_equal(short, long_[:len(short)])
+    print(f"  a longer render leaves the earlier samples unchanged: {same}")
+    if not same:
+        bad.append("tail: the samples of a short render changed when the render was made longer")
+
+    for fx in a.master_fx:
+        try:
+            rig.render("tail_fx.wav", source="impulse", impulse_at=IMPULSE_AT, impulse_amp=0.1, master=fx, tail=8.0)
+        except RuntimeError as e:
+            print(f"  {fx}: skipped ({str(e)[:60]})")
+            continue
+        res = rig.tb.call("status")["rig"]
+        x = rig.read("tail_fx.wav")
+        if np.abs(x).max() < 1e-7:
+            print(f"  {fx}: no response to the impulse")
+            continue
+        t = decay_seconds(x)
+        dec = next(s_["tail"] for s_ in res["stages"] if s_["role"] == "master")
+        if dec is None:           # JSON has no infinity: the plugin declares an unbounded tail, so a host never cuts it
+            print(f"  {fx}: response falls 60 dB in {t:.2f} s, declared tail: unbounded (never cut) -> ok")
+            continue
+        cut = t > dec + TAIL_LEEWAY
+        print(f"  {fx}: response falls 60 dB in {t:.2f} s, declared tail {dec:.2f} s -> {'TAIL-CUT' if cut else 'ok'}")
+        if cut:
+            notes.append(f"{fx}: rings for {t:.2f} s but declares a tail of {dec:.2f} s (a host that stops at the declared tail cuts it)")
+
+
+def three_tracks(rig, a, bad):
+    AT, AMP = IMPULSE_AT, 0.1
+
+    def track(delay_actual, delay_declared, at=AT):
+        return dict(source="impulse", impulse_at=at, impulse_amp=AMP, delay_actual=delay_actual, delay_declared=delay_declared)
+
+    # honest delays 7 / 0 / 3 and a master that delays 2: the three impulses must meet in one sample
+    honest = [track(7, 7), track(0, 0), track(3, 3)]
+    r = rig.render("tt_a.wav", tracks=honest, master_delay_actual=2, master_delay_declared=2, tail=0.2)
+    x = rig.read("tt_a.wav").reshape(-1, 2)[:, 0]
+    peak_at, peak = int(np.argmax(np.abs(x))), float(np.abs(x).max())
+    rest = float(np.abs(np.delete(x, peak_at)).max())
+    print(f"  3 tracks, honest delays 7/0/3 + master 2: track latencies {r['track_latencies']}, total {r['chain_latency']}; "
+          f"one peak {peak:.4f} at {peak_at} (expected {3 * AMP:.4f} at {AT}), everything else {db(rest):.0f} dB")
+    if peak_at != AT or abs(peak - 3 * AMP) > 1e-5 or rest > 1e-6:
+        bad.append(f"three tracks: the impulses did not meet (peak {peak:.4f} at {peak_at}, rest {rest:.2e})")
+    if r["track_latencies"] != [7, 0, 3]:
+        bad.append(f"three tracks: track latencies {r['track_latencies']}, expected [7, 0, 3]")
+
+    # control: the first track delays 7 but declares 0 -> the graph cannot line it up
+    liar = [track(7, 0), track(0, 0), track(3, 3)]
+    rig.render("tt_b.wav", tracks=liar, master_delay_actual=2, master_delay_declared=2, tail=0.2)
+    y = rig.read("tt_b.wav").reshape(-1, 2)[:, 0]
+    met = float(np.abs(y).max())
+    print(f"    control, track 1 delays 7 but declares 0: strongest sample {met:.4f} (must stay below {3 * AMP:.4f})")
+    if met > 3 * AMP - 1e-3:
+        bad.append("three tracks: the control (a lying track) still lined up; the test could not tell")
+
+    # real plugins: an instrument through Legacy Distortion, a second instance of it alone, and an impulse; the sum of the
+    # separately rendered tracks must equal the three-track render
+    ev1 = [{"t": 0.0, "type": "note_on", "ch": 1, "note": 57, "vel": 100, "dur": 0.6}]
+    ev2 = [{"t": 0.3, "type": "note_on", "ch": 1, "note": 64, "vel": 90, "dur": 0.6}]
+    t1 = dict(inst=a.multi_inst, events=ev1, insert=a.insert)
+    t2 = dict(inst=a.multi_inst, events=ev2)
+    t3 = dict(source="impulse", impulse_at=AT, impulse_amp=0.2)
+    rig.render("tt_all.wav", tracks=[t1, t2, t3], tail=1.0)
+    for i, t in enumerate((t1, t2, t3)):
+        rig.render(f"tt_{i}.wav", tracks=[t], tail=1.0)
+    allx = rig.read("tt_all.wav")
+    n = len(allx)
+
+    def padded(name):                      # each track alone is rendered to its own (shorter) length
+        x = rig.read(name)[:n]
+        return np.concatenate([x, np.zeros(n - len(x))])
+
+    parts = sum(padded(f"tt_{i}.wav") for i in range(3))
+    peak = np.abs(allx).max()
+    diff = db(np.abs(allx[:n] - parts[:n]).max() / peak)
+    # control: the same sum with track 1 shifted by its latency (a host that did not compensate)
+    L = 4
+    shifted = parts.copy()
+    one = padded("tt_0.wav")
+    shifted[:n - 2 * L] = shifted[:n - 2 * L] - one[:n - 2 * L] + one[2 * L:n]
+    ctl = db(np.abs(allx[:n] - shifted[:n]).max() / peak)
+    print(f"  3 tracks with plugins: sum of separate renders vs the three-track render: {diff:.1f} dB re peak; "
+          f"control, track 1 shifted by its latency: {ctl:.1f} dB (must stay above -60)")
+    if diff > -100:
+        bad.append(f"three tracks: the sum of the separate renders differs by {diff:.1f} dB re peak")
+    if ctl < -60:
+        bad.append(f"three tracks: the control is not discriminating ({ctl:.1f} dB)")
+
+
+def instance_interference(rig, plugs, notes):
+    """Two instances of one instrument playing different notes: the two-track render must equal the sum of the
+    separate renders (and an idle second instance must not change the first). Findings go to `notes`: a plugin that
+    fails is a finding about the plugin, since instruments that do sum (Matryoshka Guitar) show the rig is right."""
+    ev1 = [{"t": 0.0, "type": "note_on", "ch": 1, "note": 57, "vel": 100, "dur": 0.6}]
+    ev2 = [{"t": 0.3, "type": "note_on", "ch": 1, "note": 64, "vel": 90, "dur": 0.6}]
+    idle = [{"t": 0.0, "type": "cc", "ch": 1, "cc": 1, "value": 0}]
+
+    def run(tracks, tag):
+        rig.render(f"if_{tag}.wav", tracks=tracks, tail=1.0)
+        return rig.read(f"if_{tag}.wav")
+
+    for plug in plugs:
+        try:
+            t1, t2, ti = dict(inst=plug, events=ev1), dict(inst=plug, events=ev2), dict(inst=plug, events=idle)
+            both, a, b = run([t1, t2], "both"), run([t1], "a"), run([t2], "b")
+            with_idle = run([t1, ti], "idle")
+            again = run([t1, t2], "both2")
+        except RuntimeError as e:
+            print(f"  {plug}: skipped ({str(e)[:60]})")
+            continue
+        n = len(both)
+        s_ = np.zeros(n)
+        for x in (a, b):
+            s_[:min(n, len(x))] += x[:n]
+        pk = np.abs(both).max()
+        if pk < 1e-7:
+            print(f"  {plug}: silent")
+            continue
+        add = db(np.abs(both - s_).max() / pk)
+        m = min(len(a), len(with_idle))
+        idle_d = db(np.abs(a[:m] - with_idle[:m]).max() / np.abs(a).max())
+        repeat = np.array_equal(both, again)
+        verdict = "sums" if add < -100 else "DOES NOT SUM"
+        print(f"  {plug}: two instances vs the sum of separate renders {add:.1f} dB re peak ({verdict}); "
+              f"idle second instance changes the first by {idle_d:.1f} dB; the pair repeats exactly: {repeat}")
+        if add >= -100 or not repeat:
+            notes.append(f"{plug}: " + ("two playing instances do not sum to the separate renders (" + f"{add:.1f} dB re peak)" if add >= -100 else "")
+                         + ("; " if add >= -100 and not repeat else "")
+                         + ("the same two-instance render is not repeatable" if not repeat else ""))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--inst", default="PAGANIHANDS")
@@ -197,8 +362,14 @@ def main():
     ap.add_argument("--fx", action="append", help="plugin(s) for the declared-vs-actual latency test (default: --insert)")
     ap.add_argument("--levels", default="0.001,0.01,0.1,0.5", help="impulse amplitudes (linear)")
     ap.add_argument("--late-limit", type=int, default=LATE_LIMIT)
+    ap.add_argument("--multi-inst", default="Matryoshka Guitar", help="instrument for the three-track test (one that sums correctly)")
+    ap.add_argument("--interference", action="append", default=None, help="instruments to check for instance interference")
+    ap.add_argument("--master-fx", action="append", default=None, help="master effects whose tail is measured (default: Spring Reverb, Tape Echoes)")
     a = ap.parse_args()
     a.fx = a.fx or [a.insert]
+    a.master_fx = a.master_fx if a.master_fx is not None else ["Spring Reverb", "Tape Echoes"]
+    a.interference = a.interference if a.interference is not None else ["Matryoshka Guitar", "Retrophie SN", "PAGANIHANDS", "Flesh808", "Bass Cafeteria"]
+    notes = []
     chain = dict(inst=a.inst, insert=a.insert, master=a.master)
     rig = Rig()
     bad = []
@@ -251,6 +422,15 @@ def main():
     state_roundtrip(rig, a.insert, bad)
     split_vs_whole(rig, a.insert, bad)
 
+    # 7, 8: master tail, three tracks
+    tail_check(rig, a, bad, notes)
+    three_tracks(rig, a, bad)
+
+    # 9: instance interference (findings about plugins)
+    instance_interference(rig, a.interference, notes)
+
+    for n_ in notes:
+        print("  NOTE (a finding about a plugin, not a failure of the rig):", n_)
     print("PASS" if not bad else "FAIL: " + "; ".join(bad))
     return 1 if bad else 0
 

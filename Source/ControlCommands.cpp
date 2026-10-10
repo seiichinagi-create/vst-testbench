@@ -709,11 +709,13 @@ juce::var MainComponent::handleControl (const juce::var& req)
 }
 
 //==============================================================================
-// rig_render: inst=<name|path> | source=impulse [impulse_at=<sample>] [impulse_amp=<linear>]
-//             [insert=<name|path> | delay_actual=<n> delay_declared=<m>] [master=<name|path>]
-//             events=[...] out=<wav> [rate] [block] [tail] [compensate]
-//             [dry_parallel] [settle=<ms, default 500>] [timeout=<s, default 600>]
-//             [inst_state|insert_state|master_state=<file from save_state>]
+// rig_render. One track at the top level:
+//     inst=<name|path> | source=impulse [impulse_at] [impulse_amp] | source=file source_path=<wav>
+//     [insert=<name|path> | delay_actual=<n> [delay_declared=<m>] | tail_t60=<s> [tail_declared=<s>]]
+//     events=[...]  [inst_state|insert_state=<file>]  [inst_params|insert_params={name: 0..1}]
+//   or several: tracks=[ {the same keys}, ... ]  (summed; the graph aligns them by their declared latencies)
+// then   [master=<name|path> | master_tail_t60 ...] [master_state] [master_params]
+//        out=<wav> [rate] [block] [tail] [compensate] [dry_parallel] [settle=<ms, default 500>] [timeout=<s, 600>]
 // The bench only resolves names to plugin descriptions and writes a job file; a separate worker process
 // (this exe with --rig-worker, see RigWorkerClient.h / Main.cpp) loads, renders and tears down. A crash or
 // hang there is reported in status.rig and never reaches the bench.
@@ -724,6 +726,116 @@ juce::var MainComponent::startRigRender (const juce::var& req)
     if (rigWorker.isRunning())
         return fail ("a rig render is already running");
 
+    auto* fmt = vst3Format();
+    if (fmt == nullptr) return fail ("VST3 format not available");
+
+    // resolves a plugin name or .vst3 path to its description
+    auto findPlugin = [&] (const juce::String& what, bool wantInst, juce::PluginDescription& desc) -> bool
+    {
+        if (what.endsWithIgnoreCase (".vst3") || juce::File::isAbsolutePath (what))
+        {
+            juce::OwnedArray<juce::PluginDescription> types;
+            knownPlugins.scanAndAddFile (juce::File (what).getFullPathName(), true, types, *fmt);
+            if (types.isEmpty()) return false;
+            desc = *types.getFirst();
+            return true;
+        }
+        auto types = knownPlugins.getTypes();
+        for (const auto& t : types)
+            if (t.isInstrument == wantInst && t.name.equalsIgnoreCase (what)) { desc = t; return true; }
+        for (const auto& t : types)
+            if (t.isInstrument == wantInst && t.name.containsIgnoreCase (what)) { desc = t; return true; }
+        return false;
+    };
+
+    // One slot (`role`) of a request object `src`: returns a stage object, or a void var if the slot is empty.
+    // Test doubles (delay / tail) take the place of a plugin in the insert and master slots.
+    auto stageFor = [&] (const juce::var& src, const juce::String& role, bool wantInst, juce::String& error) -> juce::var
+    {
+        auto stage = makeObj();
+        put (stage, "role", role);
+
+        if (role != "inst" && src.hasProperty (juce::String (role == "master" ? "master_" : "") + "delay_actual"))
+        {
+            const auto prefix = juce::String (role == "master" ? "master_" : "");
+            put (stage, "kind", "delay");
+            put (stage, "delay_actual", (int) num (src, (prefix + "delay_actual").toRawUTF8(), 0.0));
+            put (stage, "delay_declared", (int) num (src, (prefix + "delay_declared").toRawUTF8(),
+                                                     num (src, (prefix + "delay_actual").toRawUTF8(), 0.0)));
+            return stage;
+        }
+        if (role != "inst" && src.hasProperty (juce::String (role == "master" ? "master_" : "") + "tail_t60"))
+        {
+            const auto prefix = juce::String (role == "master" ? "master_" : "");
+            put (stage, "kind", "tail");
+            put (stage, "tail_t60", num (src, (prefix + "tail_t60").toRawUTF8(), 1.0));
+            put (stage, "tail_declared", num (src, (prefix + "tail_declared").toRawUTF8(),
+                                              num (src, (prefix + "tail_t60").toRawUTF8(), 1.0)));
+            return stage;
+        }
+
+        const auto what = str (src, role.toRawUTF8());
+        if (what.isEmpty())
+            return {};
+        juce::PluginDescription desc;
+        if (! findPlugin (what, wantInst, desc))
+        {
+            error = role + ": no plugin matching \"" + what + "\"";
+            return {};
+        }
+        put (stage, "kind", "plugin");
+        put (stage, "desc_xml", desc.createXml()->toString());
+        const auto stateKey = role + "_state";
+        if (str (src, stateKey.toRawUTF8()).isNotEmpty())
+        {
+            const auto f = resolvePath (str (src, stateKey.toRawUTF8()), appDir());
+            if (! f.existsAsFile()) { error = "cannot read " + stateKey; return {}; }
+            put (stage, "state", f.getFullPathName());
+        }
+        const auto paramsKey = role + "_params";
+        if (src.hasProperty (paramsKey.toRawUTF8()))
+            put (stage, "params", src[paramsKey.toRawUTF8()]);
+        return stage;
+    };
+
+    // one track from a request object (the top level, or one entry of "tracks")
+    auto trackFor = [&] (const juce::var& t, juce::String& error) -> juce::var
+    {
+        auto track = makeObj();
+        const auto source = str (t, "source", "midi");
+        put (track, "source", source);
+        juce::Array<juce::var> stages;
+
+        if (source == "impulse")
+        {
+            put (track, "impulse_at", num (t, "impulse_at", 1000.0));
+            put (track, "impulse_amp", num (t, "impulse_amp", 0.1));
+        }
+        else if (source == "file")
+        {
+            const auto f = resolvePath (str (t, "source_path"), appDir());
+            if (! f.existsAsFile()) { error = "source_path: no such file " + f.getFullPathName(); return {}; }
+            put (track, "source_path", f.getFullPathName());
+        }
+        else
+        {
+            sequenceFromEvents (t["events"], error);   // validate here; the worker converts again
+            if (error.isNotEmpty()) return {};
+            put (track, "events", t["events"]);
+            auto inst = stageFor (t, "inst", true, error);
+            if (error.isNotEmpty()) return {};
+            if (inst.isVoid()) { error = "give \"inst\" (a cached name or a .vst3 path)"; return {}; }
+            stages.add (inst);
+        }
+
+        auto insert = stageFor (t, "insert", false, error);
+        if (error.isNotEmpty()) return {};
+        if (! insert.isVoid())
+            stages.add (insert);
+        put (track, "stages", stages);
+        return track;
+    };
+
     auto job = makeObj();
     put (job, "rate",         num (req, "rate", 48000.0));
     put (job, "block",        juce::jlimit (32, 8192, (int) num (req, "block", 512)));
@@ -733,91 +845,32 @@ juce::var MainComponent::startRigRender (const juce::var& req)
     put (job, "settle",       juce::jlimit (0, 10000, (int) num (req, "settle", 500.0)));
     put (job, "out",          resolvePath (str (req, "out", "rig.wav"), appDir()).getFullPathName());
 
-    const bool impulse = str (req, "source") == "impulse" || str (req, "source") == "file";   // an audio source: no inst needed
-    if (str (req, "source") == "impulse")
+    juce::String error;
+    juce::Array<juce::var> tracks;
+    if (auto* list = req["tracks"].getArray())
     {
-        put (job, "source", "impulse");
-        put (job, "impulse_at", num (req, "impulse_at", 1000.0));
-        put (job, "impulse_amp", num (req, "impulse_amp", 0.1));
-    }
-    else if (str (req, "source") == "file")
-    {
-        const auto f = resolvePath (str (req, "source_path"), appDir());
-        if (! f.existsAsFile()) return fail ("source_path: no such file " + f.getFullPathName());
-        put (job, "source", "file");
-        put (job, "source_path", f.getFullPathName());
+        for (const auto& t : *list)
+        {
+            auto track = trackFor (t, error);
+            if (error.isNotEmpty()) return fail ("tracks[" + juce::String (tracks.size()) + "]: " + error);
+            tracks.add (track);
+        }
+        if (tracks.isEmpty()) return fail ("\"tracks\" is empty");
     }
     else
     {
-        juce::String error;
-        sequenceFromEvents (req["events"], error);   // validate here; the worker converts again
+        auto track = trackFor (req, error);
         if (error.isNotEmpty()) return fail (error);
-        put (job, "source", "midi");
-        put (job, "events", req["events"]);
+        tracks.add (track);
     }
+    put (job, "tracks", tracks);
 
-    auto* fmt = vst3Format();
-    if (fmt == nullptr) return fail ("VST3 format not available");
-
-    juce::Array<juce::var> stages;
-    struct Slot { const char* role; bool wantInst; bool required; };
-    for (const Slot slot : { Slot { "inst", true, ! impulse }, Slot { "insert", false, false }, Slot { "master", false, false } })
-    {
-        auto stage = makeObj();
-        put (stage, "role", slot.role);
-
-        // test double: a delay with a known true value and a declared value of our choosing, in the insert slot
-        if (juce::String (slot.role) == "insert" && req.hasProperty ("delay_actual"))
-        {
-            put (stage, "kind", "delay");
-            put (stage, "delay_actual", (int) num (req, "delay_actual", 0.0));
-            put (stage, "delay_declared", (int) num (req, "delay_declared", num (req, "delay_actual", 0.0)));
-            stages.add (stage);
-            continue;
-        }
-
-        const auto what = impulse && juce::String (slot.role) == "inst" ? juce::String() : str (req, slot.role);
-        if (what.isEmpty())
-        {
-            if (slot.required) return fail ("give \"inst\" (a cached name or a .vst3 path)");
-            continue;
-        }
-
-        juce::PluginDescription desc;
-        bool found = false;
-        if (what.endsWithIgnoreCase (".vst3") || juce::File::isAbsolutePath (what))
-        {
-            juce::OwnedArray<juce::PluginDescription> types;
-            knownPlugins.scanAndAddFile (juce::File (what).getFullPathName(), true, types, *fmt);
-            if (! types.isEmpty()) { desc = *types.getFirst(); found = true; }
-        }
-        else
-        {
-            auto types = knownPlugins.getTypes();
-            for (const auto& t : types)
-                if (t.isInstrument == slot.wantInst && t.name.equalsIgnoreCase (what)) { desc = t; found = true; break; }
-            if (! found)
-                for (const auto& t : types)
-                    if (t.isInstrument == slot.wantInst && t.name.containsIgnoreCase (what)) { desc = t; found = true; break; }
-        }
-        if (! found) return fail (juce::String (slot.role) + ": no plugin matching \"" + what + "\"");
-
-        put (stage, "kind", "plugin");
-        put (stage, "desc_xml", desc.createXml()->toString());
-        const auto paramsKey = juce::String (slot.role) + "_params";
-        if (req.hasProperty (paramsKey.toRawUTF8()))
-            put (stage, "params", req[paramsKey.toRawUTF8()]);
-
-        const auto stateKey = juce::String (slot.role) + "_state";
-        if (str (req, stateKey.toRawUTF8()).isNotEmpty())
-        {
-            const auto f = resolvePath (str (req, stateKey.toRawUTF8()), appDir());
-            if (! f.existsAsFile()) return fail ("cannot read " + stateKey);
-            put (stage, "state", f.getFullPathName());
-        }
-        stages.add (stage);
-    }
-    put (job, "stages", stages);
+    juce::Array<juce::var> master;
+    auto m = stageFor (req, "master", false, error);
+    if (error.isNotEmpty()) return fail (error);
+    if (! m.isVoid())
+        master.add (m);
+    put (job, "master", master);
 
     rigResult = juce::var();
     rigWorker.onDone = [safe = juce::Component::SafePointer<MainComponent> (this)] (juce::var r)
@@ -825,7 +878,6 @@ juce::var MainComponent::startRigRender (const juce::var& req)
         if (safe != nullptr)
             safe->rigResult = std::move (r);
     };
-    juce::String error;
     if (! rigWorker.start (job, num (req, "timeout", 600.0), appDir(), error)) return fail (error);
 
     auto o = makeObj();
