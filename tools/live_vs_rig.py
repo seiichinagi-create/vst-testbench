@@ -3,7 +3,10 @@
 recorded by the live graph, once rendered by `rig_render`. Both are built by MixGraph, so the audio must be the same
 up to a shift in time (the live recording starts wherever the device was); the residual after aligning is the test.
 
-  python tools/live_vs_rig.py [--fx "Legacy Distortion"] [--param Drive=0.7] [--seconds 3]
+  python tools/live_vs_rig.py [--fx "Legacy Distortion"] [--param Drive=0.7] [--seconds 3] [--strips]
+
+With --strips the AUDIO strip (gain -4 dB, balance 0.3) and the MASTER strip (-2 dB) are set, and the rig side is not
+built by hand: it is `render_mix`, the bench rendering its own mixer offline.
 
 Control (must FAIL): the same comparison against a render whose FX parameter differs; otherwise the test could not
 tell a wrong graph from a right one and its pass would mean nothing.
@@ -105,6 +108,7 @@ def main():
     ap.add_argument("--param", default="Drive=0.7")
     ap.add_argument("--seconds", type=float, default=3.0)
     ap.add_argument("--limit", type=float, default=-100.0)
+    ap.add_argument("--strips", action="store_true")
     args = ap.parse_args()
     pname, pval = args.param.split("=")
     pval = float(pval)
@@ -122,6 +126,10 @@ def main():
 
     src = os.path.join(tmp, "live_vs_rig_src.wav")
     write_wav(src, test_signal(rate, args.seconds), rate)
+
+    if args.strips:
+        tb.call("track_set", track="audio", gain_db=-4.0, balance=0.3)
+        tb.call("track_set", track="master", gain_db=-2.0)
 
     # --- live ---
     assert tb.call("load_plugin", role="fx", name=args.fx).get("ok")
@@ -151,15 +159,26 @@ def main():
 
     ok_path = os.path.join(tmp, "live_vs_rig_rig.wav")
     bad_path = os.path.join(tmp, "live_vs_rig_wrong.wav")
-    rig(ok_path, pval)
-    rig(bad_path, max(0.0, pval - 0.25))
+    if args.strips:
+        def mix(out):
+            r = tb.call("render_mix", out=out, compensate=False, tail=1.0)
+            assert r.get("ok"), r
+            tb.wait_idle()
+        mix(ok_path)
+        tb.call("track_set", track="audio", gain_db=-1.0)      # control: a strip that differs from the live one
+        mix(bad_path)
+        tb.call("track_set", track="audio", gain_db=0.0, balance=0.0)
+        tb.call("track_set", track="master", gain_db=0.0)
+    else:
+        rig(ok_path, pval)
+        rig(bad_path, max(0.0, pval - 0.25))
     rigx, _ = read_wav(ok_path)
     badx, _ = read_wav(bad_path)
 
     lag, res = align_residual_db(live, rigx)
     lag_b, res_b = align_residual_db(live, badx)
     print(f"live vs rig:          lag {lag} samples, residual {res:.1f} dB re signal (limit {args.limit})")
-    print(f"control, FX {pname} off by 0.25: residual {res_b:.1f} dB (must stay above -60)")
+    print(f"control, {'AUDIO strip off by 3 dB' if args.strips else pname + ' off by 0.25'}: residual {res_b:.1f} dB (must stay above -60)")
     good = res <= args.limit and res_b > -60.0
     print("PASS" if good else "FAIL")
     return 0 if good else 1

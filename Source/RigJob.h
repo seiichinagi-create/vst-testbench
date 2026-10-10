@@ -3,6 +3,7 @@
 #include <juce_audio_utils/juce_audio_utils.h>
 #include "RigRender.h"
 #include "EventSequence.h"
+#include "MixStrips.h"
 
 //==============================================================================
 // Job description shared by the bench (which writes it) and the rig worker process (which runs it).
@@ -41,6 +42,16 @@ namespace rigjob
         {
             const int actual = (int) st["delay_actual"];
             out = { role, std::make_unique<RigRender::KnownDelay> (actual, st.hasProperty ("delay_declared") ? (int) st["delay_declared"] : actual) };
+            return true;
+        }
+        if (kind == "strip")
+        {
+            // the same channel strip the live bench has: gain (dB), balance (-1..1), mute
+            auto strip = std::make_unique<TrackStrip>();
+            strip->setGainDb ((float) (double) st.getProperty ("gain_db", 0.0));
+            strip->setBalance ((float) (double) st.getProperty ("balance", 0.0));
+            strip->setMuted ((bool) st.getProperty ("mute", false));
+            out = { role, std::move (strip) };
             return true;
         }
         if (kind == "tail")

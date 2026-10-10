@@ -113,6 +113,7 @@ private:
     juce::var controlStatus() const;
     juce::AudioProcessor* processorForRole (const juce::String& role) const;
     juce::MidiMessageSequence sequenceFromEvents (const juce::var& events, juce::String& error) const;
+    juce::var startRenderMix (const juce::var& request);   // render_mix: the mixer as it is now, offline through the rig
     juce::var startRigRender (const juce::var& request);   // rig_render: fixed inst -> insert -> master, offline
     juce::var startAraProbe (const juce::var& request);     // ara_probe: does this plug-in offer an ARA factory? (async)
 

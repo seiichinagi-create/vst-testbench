@@ -26,6 +26,7 @@ public:
     float getGainDb() const         { return gainDb.load(); }
     float getBalance() const        { return balance.load(); }
     bool  isMuted() const           { return muted.load(); }
+    bool  isAudible() const         { return ! muted.load() && ! soloSilenced.load(); }
     // Solo: the mixer sets `soloSilenced` on every track that is not soloed while any track is (MainComponent::updateSolo).
     void  setSolo (bool b)          { solo.store (b); }
     bool  isSolo() const            { return solo.load(); }

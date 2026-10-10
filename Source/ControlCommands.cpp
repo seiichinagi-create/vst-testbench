@@ -632,6 +632,7 @@ juce::var MainComponent::handleControl (const juce::var& req)
     }
 
     //-- fixed test rig: MIDI -> VSTi -> insert -> master, offline --------------
+    if (cmd == "render_mix")   return startRenderMix (req);
     if (cmd == "rig_render")
         return startRigRender (req);
 
@@ -829,7 +830,7 @@ juce::var MainComponent::handleControl (const juce::var& req)
     {
         auto o = makeObj();
         put (o, "commands", juce::StringArray ({
-            "ping", "status", "graph_dump", "track_set", "track_status", "list_plugins", "load_plugin", "remove_plugin", "set_bypass",
+            "ping", "status", "graph_dump", "track_set", "track_status", "render_mix", "list_plugins", "load_plugin", "remove_plugin", "set_bypass",
             "list_params", "set_param", "set_params", "save_state", "load_state",
             "show_editor", "screenshot", "set_source", "load_audio", "play", "stop", "seek", "loop",
             "prerender", "rig_render", "ara_probe", "load_midi", "export_midi", "mpe", "midi_send", "midi_play", "midi_play_file", "midi_stop",
@@ -941,6 +942,22 @@ juce::var MainComponent::startRigRender (const juce::var& req)
         return stage;
     };
 
+    // A channel strip stage (the live bench's TrackStrip) when the request object sets gain_db / balance / mute
+    // (with `prefix` "master_" for the master's), else void: no stage, as before.
+    auto stripFor = [&] (const juce::var& src, const juce::String& prefix) -> juce::var
+    {
+        const auto g = prefix + "gain_db", b = prefix + "balance", m = prefix + "mute";
+        if (! (src.hasProperty (g.toRawUTF8()) || src.hasProperty (b.toRawUTF8()) || src.hasProperty (m.toRawUTF8())))
+            return {};
+        auto stage = makeObj();
+        put (stage, "role", "strip");
+        put (stage, "kind", "strip");
+        put (stage, "gain_db", num (src, g.toRawUTF8(), 0.0));
+        put (stage, "balance", num (src, b.toRawUTF8(), 0.0));
+        put (stage, "mute", flag (src, m.toRawUTF8(), false));
+        return stage;
+    };
+
     // one track from a request object (the top level, or one entry of "tracks")
     auto trackFor = [&] (const juce::var& t, juce::String& error) -> juce::var
     {
@@ -987,6 +1004,8 @@ juce::var MainComponent::startRigRender (const juce::var& req)
         if (error.isNotEmpty()) return {};
         if (! insert.isVoid())
             stages.add (insert);
+        if (auto strip = stripFor (t, {}); ! strip.isVoid())
+            stages.add (strip);
         put (track, "stages", stages);
         return track;
     };
@@ -1031,6 +1050,8 @@ juce::var MainComponent::startRigRender (const juce::var& req)
     if (error.isNotEmpty()) return fail (error);
     if (! m.isVoid())
         master.add (m);
+    if (auto strip = stripFor (req, "master_"); ! strip.isVoid())
+        master.add (strip);
     put (job, "master", master);
 
     rigResult = juce::var();
@@ -1045,6 +1066,126 @@ juce::var MainComponent::startRigRender (const juce::var& req)
     put (o, "started", true);
     put (o, "note", "asynchronous, in a worker process: poll status until busy is false, then read status.rig");
     return o;
+}
+
+//==============================================================================
+// render_mix: the mixer as it is now, rendered offline by the rig (docs/TRACKS.md, P4). Which tracks sound, their gain and
+// balance, the MASTER FX and its strip are read from the live bench; the AUDIO track contributes its file, an INST
+// track contributes the loaded MIDI file's events on the channels it listens to. Not rendered: the live input (it is not a
+// file) and an instrument track when no MIDI file is loaded. out=<wav>, tail (s), compensate, rate, block.
+//==============================================================================
+namespace
+{
+    // a MIDI sequence (seconds) as the events the rig takes; channels outside `mask` are left out
+    juce::var eventsFromSequence (const juce::MidiMessageSequence& seq, juce::uint32 mask)
+    {
+        juce::Array<juce::var> list;
+        for (int i = 0; i < seq.getNumEvents(); ++i)
+        {
+            const auto& m = seq.getEventPointer (i)->message;
+            const int ch = m.getChannel();
+            if (ch == 0 || (mask & (1u << (ch - 1))) == 0)
+                continue;
+            auto e = makeObj();
+            put (e, "t", m.getTimeStamp());
+            put (e, "ch", ch);
+            if (m.isNoteOn (false) && m.getVelocity() > 0)  { put (e, "type", "note_on");  put (e, "note", m.getNoteNumber()); put (e, "vel", (int) m.getVelocity()); }
+            else if (m.isNoteOff (true))                    { put (e, "type", "note_off"); put (e, "note", m.getNoteNumber()); }
+            else if (m.isPitchWheel())                      { put (e, "type", "pitch_bend"); put (e, "value", m.getPitchWheelValue()); }
+            else if (m.isChannelPressure())                 { put (e, "type", "pressure"); put (e, "value", m.getChannelPressureValue()); }
+            else if (m.isAftertouch())                      { put (e, "type", "poly_pressure"); put (e, "note", m.getNoteNumber()); put (e, "value", m.getAfterTouchValue()); }
+            else if (m.isController())                      { put (e, "type", "cc"); put (e, "cc", m.getControllerNumber()); put (e, "value", m.getControllerValue()); }
+            else if (m.isProgramChange())                   { put (e, "type", "program"); put (e, "value", m.getProgramChangeNumber()); }
+            else continue;
+            list.add (e);
+        }
+        return list;
+    }
+}
+
+juce::var MainComponent::startRenderMix (const juce::var& req)
+{
+    auto rq = makeObj();
+    juce::Array<juce::var> tracks;
+    juce::StringArray left;       // what was not rendered, and why
+    const auto dir = appDir();
+
+    auto saveState = [&dir] (juce::AudioProcessor& p, const juce::String& name)
+    {
+        juce::MemoryBlock mb;
+        p.getStateInformation (mb);
+        const auto f = dir.getChildFile ("rendermix_" + name + ".state");
+        f.replaceWithData (mb.getData(), mb.getSize());
+        return f.getFullPathName();
+    };
+
+    // --- AUDIO: the file in the player ---
+    if (strips[trkAudio]->isAudible())
+    {
+        if (currentSourceMode() != srcFile)         left.add ("AUDIO (the live input is not a file)");
+        else if (! filePlayer->hasFile())           left.add ("AUDIO (no file loaded)");
+        else
+        {
+            auto t = makeObj();
+            put (t, "source", "file");
+            put (t, "source_path", currentPlayableFile.getFullPathName());
+            put (t, "gain_db", (double) strips[trkAudio]->getGainDb());
+            put (t, "balance", (double) strips[trkAudio]->getBalance());
+            tracks.add (t);
+        }
+    }
+
+    // --- INST 1..3: the loaded MIDI file through the instrument, on the channels the track listens to ---
+    for (int tr = trkInst1; tr < numTracks; ++tr)
+    {
+        const auto inst = tr == trkInst1 ? instrumentNode : extra (tr).node;
+        if (inst == nullptr || ! strips[tr]->isAudible())
+            continue;
+        const auto name = "INST " + juce::String (tr);
+        if (midiSequence.getNumEvents() == 0)       { left.add (name + " (no MIDI file loaded)"); continue; }
+        juce::String note;
+        const auto seq = prepareMidiForInstrument (midiSequence, note);
+        const auto events = eventsFromSequence (seq, midiFilters[tr]->getMask());
+        if (events.getArray() == nullptr || events.getArray()->isEmpty())
+            { left.add (name + " (no MIDI on its channels)"); continue; }
+
+        auto t = makeObj();
+        put (t, "source", "midi");
+        put (t, "events", events);
+        put (t, "inst", tr == trkInst1 ? currentInstrumentName : extra (tr).name);
+        put (t, "inst_state", saveState (*inst->getProcessor(), "inst" + juce::String (tr)));
+        put (t, "gain_db", (double) strips[tr]->getGainDb());
+        put (t, "balance", (double) strips[tr]->getBalance());
+        tracks.add (t);
+    }
+
+    if (tracks.isEmpty())
+        return fail ("nothing to render: no sounding track with a file (AUDIO) or a loaded MIDI file (INST)"
+                     + (left.isEmpty() ? juce::String() : " - left out: " + left.joinIntoString ("; ")));
+    put (rq, "tracks", tracks);
+
+    // --- MASTER: the FX insert (unless bypassed) and the master strip ---
+    if (effectNode != nullptr && ! bypassButton.getToggleState())
+    {
+        put (rq, "master", currentEffectName);
+        put (rq, "master_state", saveState (*effectNode->getProcessor(), "master"));
+    }
+    put (rq, "master_gain_db", (double) masterStrip->getGainDb());
+    put (rq, "master_balance", (double) masterStrip->getBalance());
+
+    const auto setup = deviceManager.getAudioDeviceSetup();
+    put (rq, "rate", req.hasProperty ("rate") ? req["rate"] : juce::var (setup.sampleRate > 0 ? setup.sampleRate : 48000.0));
+    put (rq, "block", req.hasProperty ("block") ? req["block"] : juce::var (512));
+    put (rq, "tail", req.hasProperty ("tail") ? req["tail"] : juce::var (2.0));
+    put (rq, "compensate", flag (req, "compensate", true));
+    put (rq, "out", str (req, "out", "mix.wav"));
+    if (req.hasProperty ("timeout")) put (rq, "timeout", req["timeout"]);
+
+    auto r = startRigRender (rq);
+    if (auto* o = r.getDynamicObject())
+        if (! left.isEmpty())
+            o->setProperty ("left_out", left.joinIntoString ("; "));
+    return r;
 }
 
 //==============================================================================
