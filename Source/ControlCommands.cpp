@@ -73,6 +73,8 @@ int MainComponent::trackIndexOf (const juce::String& s)
     if (s == "inst2") return trkInst2;
     if (s == "inst3") return trkInst3;
     if (s == "master") return -1;
+    if (s == "send1") return tiBus1;
+    if (s == "send2") return tiBus2;
     return -2;
 }
 
@@ -80,17 +82,24 @@ int MainComponent::trackIndexOf (const juce::String& s)
 juce::var MainComponent::trackInfo (int t) const
 {
     auto o = makeObj();
-    const TrackStrip* strip = t < 0 ? masterStrip : strips[t];
-    put (o, "track", t < 0 ? "master" : t == trkAudio ? "audio" : "inst" + juce::String (t));
+    const bool bus = t >= tiBus1;
+    const TrackStrip* strip = t == -1 ? masterStrip : bus ? busReturn[t - tiBus1] : strips[t];
+    put (o, "track", t == -1 ? "master" : bus ? "send" + juce::String (t - tiBus1 + 1) : t == trkAudio ? "audio" : "inst" + juce::String (t));
     put (o, "gain_db", (double) strip->getGainDb());
     put (o, "balance", (double) strip->getBalance());
     put (o, "mute", strip->isMuted());
-    if (t >= 0) put (o, "solo", strip->isSolo());
-    if (t >= 0) put (o, "silenced_by_mode", strip->isModeSilenced());
-    put (o, "sounding", t < 0 ? ! strip->isMuted() : strip->isSounding());
+    if (t >= 0 && ! bus)
+    {
+        put (o, "solo", strip->isSolo());
+        put (o, "silenced_by_mode", strip->isModeSilenced());
+        put (o, "send1_db", (double) sendLevel[t][0]->getGainDb());
+        put (o, "send2_db", (double) sendLevel[t][1]->getGainDb());
+        put (o, "insert", insertSlot[t].name);
+    }
+    put (o, "sounding", (t < 0 || bus) ? ! strip->isMuted() : strip->isSounding());
     if (t == trkAudio)
         put (o, "source", currentSourceMode() == srcFile ? "file" : "live");
-    if (t >= trkInst1)
+    if (t >= trkInst1 && ! bus)
     {
         const auto name = t == trkInst1 ? currentInstrumentName : extra (t).name;
         put (o, "plugin", name);
@@ -101,7 +110,12 @@ juce::var MainComponent::trackInfo (int t) const
                 ch.add (c);
         put (o, "midi_channels", ch);
     }
-    if (t < 0)
+    if (bus)
+    {
+        put (o, "plugin", busSlot[t - tiBus1].name);      // the FX of the bus; the strip is its return level
+        put (o, "loaded", busSlot[t - tiBus1].node != nullptr);
+    }
+    if (t == -1)
     {
         put (o, "plugin", currentEffectName);   // the legacy FX is the master insert
         put (o, "loaded", effectNode != nullptr);
@@ -118,6 +132,8 @@ juce::AudioProcessor* MainComponent::processorForRole (const juce::String& role)
         return instrumentNode != nullptr ? instrumentNode->getProcessor() : nullptr;
     if (role == "inst2" || role == "inst3")
         return extra (trackFromRole (role)).node != nullptr ? extra (trackFromRole (role)).node->getProcessor() : nullptr;
+    if (const int slot = slotFromRole (role); slot >= 0)
+        return fxSlot (slot).node != nullptr ? fxSlot (slot).node->getProcessor() : nullptr;
     return nullptr;
 }
 
@@ -263,20 +279,27 @@ juce::var MainComponent::handleControl (const juce::var& req)
     if (cmd == "track_set")
     {
         const int t = trackIndexOf (str (req, "track").toLowerCase());
-        if (t == -2) return fail ("track must be audio, inst1, inst2, inst3 or master");
-        TrackStrip* strip = t == -1 ? masterStrip : strips[t];
+        if (t == -2) return fail ("track must be audio, inst1, inst2, inst3, send1, send2 or master");
+        TrackStrip* strip = t == -1 ? masterStrip : t >= tiBus1 ? busReturn[t - tiBus1] : strips[t];
+        if (t >= 0 && t < numTracks)                                   // post-fader sends: -100 = off
+        {
+            if (req.hasProperty ("send1_db")) sendLevel[t][0]->setGainDb ((float) (double) req["send1_db"]);
+            if (req.hasProperty ("send2_db")) sendLevel[t][1]->setGainDb ((float) (double) req["send2_db"]);
+        }
+        else if (req.hasProperty ("send1_db") || req.hasProperty ("send2_db"))
+            return fail ("send1_db / send2_db apply to audio, inst1, inst2 and inst3");
         if (req.hasProperty ("gain_db")) strip->setGainDb ((float) (double) req["gain_db"]);
         if (req.hasProperty ("balance")) strip->setBalance ((float) (double) req["balance"]);
         if (req.hasProperty ("mute"))    strip->setMuted (flag (req, "mute", false));
         if (req.hasProperty ("solo"))
         {
-            if (t < 0) return fail ("the master has no solo");
+            if (t < 0 || t >= tiBus1) return fail ("only the tracks have a solo");
             strip->setSolo (flag (req, "solo", false));
             updateSolo();
         }
         if (req.hasProperty ("midi_channels"))
         {
-            if (t < trkInst1) return fail ("midi_channels applies to inst1, inst2 and inst3");
+            if (t < trkInst1 || t >= numTracks) return fail ("midi_channels applies to inst1, inst2 and inst3");
             midiFilters[t]->setMask (maskFromChannels (req["midi_channels"]));
         }
         if (mixerPanel != nullptr) mixerPanel->refresh();
@@ -289,6 +312,8 @@ juce::var MainComponent::handleControl (const juce::var& req)
         auto o = makeObj();
         juce::Array<juce::var> list;
         for (int t = trkAudio; t < numTracks; ++t) list.add (trackInfo (t));
+        list.add (trackInfo (tiBus1));
+        list.add (trackInfo (tiBus2));
         list.add (trackInfo (-1));
         put (o, "tracks", list);
         return o;
@@ -315,11 +340,12 @@ juce::var MainComponent::handleControl (const juce::var& req)
     if (cmd == "load_plugin")
     {
         const auto role = roleOf (req);
-        if (role != "fx" && trackFromRole (role) < 0)
-            return fail ("role must be \"fx\", \"inst\" (INST 1), \"inst2\" or \"inst3\"");
-        const bool asInst = role != "fx";
-        const int loadTrack = asInst ? trackFromRole (role) : trkInst1;
-        if (loadTrack >= trkInst2 && req.hasProperty ("midi_channels"))
+        const int slotId = slotFromRole (role);
+        if (role != "fx" && trackFromRole (role) < 0 && slotId < 0)
+            return fail ("role must be \"fx\" (the master insert), \"inst\" (INST 1), \"inst2\", \"inst3\", \"insert_audio\", \"insert_inst1\" .. \"insert_inst3\", \"send1\" or \"send2\"");
+        const bool asInst = role != "fx" && slotId < 0;
+        const int loadTrack = slotId >= 0 ? slotId : asInst ? trackFromRole (role) : trkInst1;
+        if (loadTrack >= trkInst2 && loadTrack < numTracks && req.hasProperty ("midi_channels"))
             midiFilters[loadTrack]->setMask (maskFromChannels (req["midi_channels"]));
 
         const auto path = str (req, "path");
@@ -364,6 +390,7 @@ juce::var MainComponent::handleControl (const juce::var& req)
         if (role == "fx") removeEffect();
         else if (role == "inst" || role == "instrument" || role == "inst1") removeInstrument();
         else if (role == "inst2" || role == "inst3") removeExtraInstrument (trackFromRole (role));
+        else if (slotFromRole (role) >= 0) removeSlotEffect (slotFromRole (role));
         else return fail ("role must be \"fx\", \"inst\", \"inst2\" or \"inst3\"");
         return makeObj();
     }
@@ -507,6 +534,12 @@ juce::var MainComponent::handleControl (const juce::var& req)
             auto& e = extra (trackFromRole (role));
             if (e.node == nullptr) return fail ("no plugin loaded for role \"" + role + "\"");
             if ((e.editor != nullptr) != want) toggleEditorFor (e.node, e.name, e.editor);
+        }
+        else if (slotFromRole (role) >= 0)
+        {
+            auto& sl = fxSlot (slotFromRole (role));
+            if (sl.node == nullptr) return fail ("no plugin loaded for role \"" + role + "\"");
+            if ((sl.editor != nullptr) != want) toggleEditorFor (sl.node, sl.name, sl.editor);
         }
         else
         {
@@ -1147,6 +1180,20 @@ juce::var MainComponent::buildMixRequest (const MixOptions& opt, const juce::var
         return f.getFullPathName();
     };
 
+    // a track's insert and its post-fader sends (the sends only when the buses are part of the render)
+    auto addInsertAndSends = [&] (juce::var& t, int tr)
+    {
+        if (insertSlot[tr].node != nullptr)
+        {
+            put (t, "insert", insertSlot[tr].name);
+            put (t, "insert_state", saveState (*insertSlot[tr].node->getProcessor(), "insert" + juce::String (tr)));
+        }
+        if (opt.master)
+            for (int n = 0; n < 2; ++n)
+                if (busSlot[n].node != nullptr)
+                    put (t, ("send" + juce::String (n + 1) + "_db").toRawUTF8(), (double) sendLevel[tr][n]->getGainDb());
+    };
+
     // --- AUDIO: the file in the player (not when it is itself the bounce of the MIDI file: the instruments are rendered directly) ---
     if (opt.audio && strips[trkAudio]->isAudible())
     {
@@ -1160,6 +1207,7 @@ juce::var MainComponent::buildMixRequest (const MixOptions& opt, const juce::var
             put (t, "source_path", currentPlayableFile.getFullPathName());
             put (t, "gain_db", (double) strips[trkAudio]->getGainDb());
             put (t, "balance", (double) strips[trkAudio]->getBalance());
+            addInsertAndSends (t, trkAudio);
             tracks.add (t);
         }
     }
@@ -1183,6 +1231,7 @@ juce::var MainComponent::buildMixRequest (const MixOptions& opt, const juce::var
         put (t, "inst_state", saveState (*inst->getProcessor(), "inst" + juce::String (tr)));
         put (t, "gain_db", (double) strips[tr]->getGainDb());
         put (t, "balance", (double) strips[tr]->getBalance());
+        addInsertAndSends (t, tr);
         tracks.add (t);
     }
     put (rq, "tracks", tracks);
@@ -1197,6 +1246,18 @@ juce::var MainComponent::buildMixRequest (const MixOptions& opt, const juce::var
         }
         put (rq, "master_gain_db", (double) masterStrip->getGainDb());
         put (rq, "master_balance", (double) masterStrip->getBalance());
+
+        // the send buses: the FX, and the return strip
+        for (int n = 0; n < 2; ++n)
+            if (busSlot[n].node != nullptr)
+            {
+                const auto role = "bus" + juce::String (n + 1);
+                put (rq, role.toRawUTF8(), busSlot[n].name);
+                put (rq, (role + "_state").toRawUTF8(), saveState (*busSlot[n].node->getProcessor(), role));
+                put (rq, (role + "_gain_db").toRawUTF8(), (double) busReturn[n]->getGainDb());
+                put (rq, (role + "_balance").toRawUTF8(), (double) busReturn[n]->getBalance());
+                put (rq, (role + "_mute").toRawUTF8(), busReturn[n]->isMuted());
+            }
     }
 
     const auto setup = deviceManager.getAudioDeviceSetup();

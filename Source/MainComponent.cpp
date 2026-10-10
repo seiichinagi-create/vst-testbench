@@ -66,6 +66,20 @@ MainComponent::MainComponent()
         masterStrip = ms.get();
         masterStripNode = graph.addNode (std::move (ms));
     }
+    for (int t = 0; t < numTracks; ++t)
+        for (int n = 0; n < 2; ++n)
+        {
+            auto sl = std::make_unique<TrackStrip>();
+            sl->setGainDb (-100.0f);                 // a send starts off
+            sendLevel[t][n] = sl.get();
+            sendNode[t][n] = graph.addNode (std::move (sl));
+        }
+    for (int n = 0; n < 2; ++n)
+    {
+        auto rs = std::make_unique<TrackStrip>();
+        busReturn[n] = rs.get();
+        busReturnNode[n] = graph.addNode (std::move (rs));
+    }
     midiFilters[trkInst2]->setMask (0);   // INST 2 / 3 get no MIDI until channels are assigned (INST 1: every channel)
     midiFilters[trkInst3]->setMask (0);
     loadTracks();
@@ -441,6 +455,8 @@ MainComponent::~MainComponent()
     editorWindow = nullptr;
     instEditorWindow = nullptr;
     for (auto& e : extraInst) { e.editor = nullptr; if (e.node != nullptr) e.node->getProcessor()->removeListener (this); }
+    for (auto& sl : insertSlot) sl.editor = nullptr;
+    for (auto& sl : busSlot) sl.editor = nullptr;
     deviceManager.removeMidiInputDeviceCallback ({}, this);
     deviceManager.removeMidiInputDeviceCallback ({}, &player);
     midiRecorder.closeAndSave();   // an open take survives app close
@@ -705,6 +721,8 @@ void MainComponent::loadPluginFromDescription (const juce::PluginDescription& de
                 setExtraInstrument (track, std::move (instance), desc);
             else if (asInstrument)
                 setInstrumentNode (std::move (instance), desc);
+            else if (track >= slotInsertBase)
+                setSlotEffect (track, std::move (instance), desc);
             else
                 setEffectNode (std::move (instance), desc);
         });
@@ -844,6 +862,19 @@ void MainComponent::saveTracks() const
         o->setProperty ("balance", (double) st->getBalance());
         if (t >= trkInst1 && t < numTracks)
             o->setProperty ("midi_mask", (int) midiFilters[t]->getMask());
+        if (t < numTracks)
+        {
+            o->setProperty ("send1_db", (double) sendLevel[t][0]->getGainDb());
+            o->setProperty ("send2_db", (double) sendLevel[t][1]->getGainDb());
+        }
+        list.add (juce::var (o));
+    }
+    for (int n = 0; n < 2; ++n)                      // the bus return strips
+    {
+        auto o = new juce::DynamicObject();
+        o->setProperty ("track", "send" + juce::String (n + 1));
+        o->setProperty ("gain_db", (double) busReturn[n]->getGainDb());
+        o->setProperty ("balance", (double) busReturn[n]->getBalance());
         list.add (juce::var (o));
     }
     root->setProperty ("tracks", list);
@@ -862,10 +893,22 @@ void MainComponent::loadTracks()
     for (const auto& e : *list)
     {
         const auto name = e["track"].toString();
+        if (name == "send1" || name == "send2")
+        {
+            auto* r = busReturn[name == "send1" ? 0 : 1];
+            r->setGainDb ((float) (double) e.getProperty ("gain_db", 0.0));
+            r->setBalance ((float) (double) e.getProperty ("balance", 0.0));
+            continue;
+        }
         const int t = name == "master" ? numTracks : name == "audio" ? trkAudio : name == "inst1" ? trkInst1
                     : name == "inst2" ? trkInst2 : name == "inst3" ? trkInst3 : -1;
         if (t < 0)
             continue;
+        if (t < numTracks)
+        {
+            sendLevel[t][0]->setGainDb ((float) (double) e.getProperty ("send1_db", -100.0));
+            sendLevel[t][1]->setGainDb ((float) (double) e.getProperty ("send2_db", -100.0));
+        }
         TrackStrip* st = t == numTracks ? masterStrip : strips[t];
         st->setGainDb ((float) (double) e.getProperty ("gain_db", 0.0));
         st->setBalance ((float) (double) e.getProperty ("balance", 0.0));
@@ -917,6 +960,54 @@ juce::String MainComponent::describeTrack (int index) const
                                  : effectNode != nullptr ? "FX: " + currentEffectName : juce::String ("no FX");
     const auto name = index == trkInst1 ? currentInstrumentName : extra (index).name;
     return name.isNotEmpty() ? name : juce::String ("-");
+}
+
+int MainComponent::slotFromRole (const juce::String& role)
+{
+    if (role == "insert_audio") return slotInsertBase + trkAudio;
+    if (role == "insert_inst1" || role == "insert_inst") return slotInsertBase + trkInst1;
+    if (role == "insert_inst2") return slotInsertBase + trkInst2;
+    if (role == "insert_inst3") return slotInsertBase + trkInst3;
+    if (role == "send1") return slotBusBase;
+    if (role == "send2") return slotBusBase + 1;
+    return -1;
+}
+
+bool MainComponent::slotsInUse() const
+{
+    for (auto& s : insertSlot) if (s.node != nullptr) return true;
+    for (auto& s : busSlot)    if (s.node != nullptr) return true;
+    return false;
+}
+
+void MainComponent::setSlotEffect (int slot, std::unique_ptr<juce::AudioPluginInstance> instance, const juce::PluginDescription& desc)
+{
+    auto& s = fxSlot (slot);
+    s.editor = nullptr;
+    if (s.node != nullptr)
+        graph.removeNode (s.node->nodeID);
+    configureInstance (*instance, deviceManager);
+    s.node = graph.addNode (std::move (instance));
+    s.name = desc.name;
+    if (preRenderActive())
+        setPreRenderEnabled (false);          // the cache holds the file and the master FX only: the mix has changed under it
+    rebuildConnections();
+    setStatus ("Loaded " + desc.name + (slot >= slotBusBase ? " into SEND " + juce::String (slot - slotBusBase + 1)
+                                                            : " as the insert of " + juce::String (slot - slotInsertBase == trkAudio ? "AUDIO" : "INST " + juce::String (slot - slotInsertBase))));
+}
+
+void MainComponent::removeSlotEffect (int slot)
+{
+    auto& s = fxSlot (slot);
+    s.editor = nullptr;
+    if (s.node != nullptr)
+    {
+        graph.removeNode (s.node->nodeID);
+        s.node = nullptr;
+    }
+    s.name = {};
+    rebuildConnections();
+    setStatus ("Effect slot cleared.");
 }
 
 int MainComponent::trackFromRole (const juce::String& role)
@@ -975,12 +1066,13 @@ void MainComponent::rebuildConnections()
     const int mode = currentSourceMode();
 
     // The same graph the offline rig builds (MixGraph, docs/TRACKS.md): tracks -> master -> out.
-    //   track:   source -> strip              (AUDIO: the file player or the live input; INST 1: the VSTi, after its MIDI filter)
+    //   track:   source -> [insert] -> strip      (AUDIO: the file player or the live input; INST: the VSTi after its MIDI filter)
+    //   sends:   strip -> send level -> send bus n -> [FX] -> return strip -> master      (post-fader, two buses)
     //   master:  [FX insert] -> master strip -> tap -> device out
     MixGraph mix (graph, audioOutNode, Graph::UpdateKind::sync);
 
     // While the PRE-RENDER cache plays, it already holds the AUDIO strip, the master FX and the master strip: none of them is in the
-    // live path (docs/TRACKS.md).
+    // live path (docs/TRACKS.md). It does not hold inserts and sends, so the cache is not used while any is loaded.
     const bool baked = preRenderActive();
 
     // --- master ---
@@ -997,16 +1089,39 @@ void MainComponent::rebuildConnections()
     masterChain.push_back (mix.adopt (tapNode, "master", -1));
     mix.setMaster (masterChain);
 
+    // --- send buses: the FX slot, then the return strip (a bus with no FX is not built: its sends are not connected) ---
+    Graph::Node::Ptr busIn[2];
+    for (int n = 0; n < 2; ++n)
+        if (busSlot[n].node != nullptr)
+            busIn[n] = mix.addBus ({ mix.adopt (busSlot[n].node, "bus", MixGraph::busBase + n),
+                                     mix.adopt (busReturnNode[n], "return", MixGraph::busBase + n) });
+    auto addSends = [&] (int t)
+    {
+        for (int n = 0; n < 2; ++n)
+            if (busIn[n] != nullptr)
+                mix.addSend (stripNode[t], mix.adopt (sendNode[t][n], "send", t), busIn[n], t, n);
+    };
+    // a track's chain: source, then its insert if one is loaded, then its strip
+    auto chainOf = [&] (int t, Graph::Node::Ptr source, const char* role)
+    {
+        std::vector<Graph::Node::Ptr> chain { mix.adopt (source, role, t) };
+        if (insertSlot[t].node != nullptr)
+            chain.push_back (mix.adopt (insertSlot[t].node, "insert", t));
+        chain.push_back (mix.adopt (stripNode[t], "strip", t));
+        return chain;
+    };
+
     // --- AUDIO track: the file player, or the live input (also the fallback when no instrument is loaded) ---
     const bool fileSource = mode == srcFile;
     if (baked)
         mix.addTrack ({ mix.adopt (filePlayerNode, "source", trkAudio) });
     else
-        mix.addTrack ({ mix.adopt (fileSource ? filePlayerNode : audioInNode, "source", trkAudio),
-                        mix.adopt (stripNode[trkAudio], "strip", trkAudio) },
-                      fileSource ? 0 : inputPairStart);
+    {
+        mix.addTrack (chainOf (trkAudio, fileSource ? filePlayerNode : audioInNode, "source"), fileSource ? 0 : inputPairStart);
+        addSends (trkAudio);
+    }
 
-    // --- INST 1..3: MIDI in -> the track's channel filter -> the VSTi -> strip ---
+    // --- INST 1..3: MIDI in -> the track's channel filter -> the VSTi -> [insert] -> strip ---
     for (int t = trkInst1; t < numTracks; ++t)
     {
         const auto inst = t == trkInst1 ? instrumentNode : extra (t).node;
@@ -1014,7 +1129,8 @@ void MainComponent::rebuildConnections()
             continue;
         mix.connectMidi (midiInNode, midiFilterNode[t]);
         mix.connectMidi (midiFilterNode[t], inst);
-        mix.addTrack ({ mix.adopt (inst, "inst", t), mix.adopt (stripNode[t], "strip", t) });
+        mix.addTrack (chainOf (t, inst, "inst"));
+        addSends (t);
     }
 
     if (mixerPanel != nullptr)
@@ -1369,6 +1485,12 @@ void MainComponent::setPreRenderEnabled (bool shouldEnable)
 {
     if (shouldEnable)
     {
+        if (slotsInUse())
+        {
+            setStatus ("PRE-RENDER holds the file, the AUDIO strip, the master FX and the master strip; clear the inserts and the send buses first (or render_mix).");
+            preRenderButton.setToggleState (false, juce::dontSendNotification);
+            return;
+        }
         if (currentSourceMode() != srcFile || ! filePlayer->hasFile())
         {
             setStatus ("PRE-RENDER needs the file player as source with a file loaded.");

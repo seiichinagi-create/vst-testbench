@@ -232,6 +232,23 @@ private:
     MidiChannelFilter* midiFilters[numTracks] = {};
     struct ExtraInstrument { Graph::Node::Ptr node; juce::String name; std::unique_ptr<juce::DocumentWindow> editor; };
     ExtraInstrument extraInst[2];                 // INST 2, INST 3
+    // Effect slots (docs/TRACKS.md): one insert per track (source -> insert -> strip), and the FX of the two send buses.
+    // A slot id: the insert of track t is slotInsertBase + t, the FX of send bus n (0 / 1) is slotBusBase + n.
+public:
+    enum { slotInsertBase = 100, slotBusBase = 200, tiBus1 = 10, tiBus2 = 11 };   // tiBus*: the return strips in track_set / track_status
+private:
+    struct FxSlot { Graph::Node::Ptr node; juce::String name; std::unique_ptr<juce::DocumentWindow> editor; };
+    FxSlot insertSlot[numTracks];
+    FxSlot busSlot[2];
+    FxSlot& fxSlot (int slot)             { return slot >= slotBusBase ? busSlot[slot - slotBusBase] : insertSlot[slot - slotInsertBase]; }
+    const FxSlot& fxSlot (int slot) const { return slot >= slotBusBase ? busSlot[slot - slotBusBase] : insertSlot[slot - slotInsertBase]; }
+    Graph::Node::Ptr sendNode[numTracks][2], busReturnNode[2];   // post-fader send levels (-100 dB = off), the bus return strips
+    TrackStrip* sendLevel[numTracks][2] = {};
+    TrackStrip* busReturn[2] = {};
+    void setSlotEffect (int slot, std::unique_ptr<juce::AudioPluginInstance>, const juce::PluginDescription&);
+    void removeSlotEffect (int slot);
+    static int slotFromRole (const juce::String& role);   // "insert_audio" .. "insert_inst3", "send1", "send2" -> a slot id, else -1
+    bool slotsInUse() const;                               // any insert, any bus FX
     std::atomic<juce::AudioProcessor*> extraProc[2] { nullptr, nullptr };   // listener-thread-safe identity, like instrumentProc
     ExtraInstrument& extra (int track) { return extraInst[track - trkInst2]; }
     const ExtraInstrument& extra (int track) const { return extraInst[track - trkInst2]; }
