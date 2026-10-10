@@ -9,6 +9,7 @@
 #include "MidiTakeRecorder.h"
 #include "MpeSupport.h"
 #include "OutputTap.h"
+#include "MixStrips.h"
 #include "RigWorkerClient.h"
 #include "ControlServer.h"
 
@@ -189,6 +190,17 @@ private:
     int pendingLoads = 0;                       // async plugin loads in flight (message thread)
     Graph::Node::Ptr tapNode;
     OutputTap* outputTap = nullptr;             // owned by the graph node
+
+    //== mixer (docs/TRACKS.md): four tracks (AUDIO, INST 1-3), each a source -> strip, summed into the master ==
+    // master: [FX insert] -> master strip -> tap -> device out. The legacy single FX is the master insert: with one
+    // track sounding (the source modes still pick which) it does what it always did.
+public:
+    enum Track { trkAudio = 0, trkInst1 = 1, trkInst2 = 2, trkInst3 = 3, numTracks = 4 };
+private:
+    Graph::Node::Ptr stripNode[numTracks], masterStripNode, midiFilterNode[numTracks];
+    TrackStrip* strips[numTracks] = {};          // owned by the graph nodes
+    TrackStrip* masterStrip = nullptr;
+    MidiChannelFilter* midiFilters[numTracks] = {};
     MidiScheduler midiScheduler { [this] (const juce::MidiMessage& m) { injectMidi (m); } };
     ControlServer controlServer { [this] (const juce::var& r) { return handleControl (r); } };
     int controlPort = 0;

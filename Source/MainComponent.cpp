@@ -1,5 +1,6 @@
 #include "MainComponent.h"
 #include "MixGraph.h"
+#include "MixStrips.h"
 
 namespace
 {
@@ -50,6 +51,20 @@ MainComponent::MainComponent()
         auto fp = std::make_unique<FilePlayerProcessor>();
         filePlayer = fp.get();
         filePlayerNode = graph.addNode (std::move (fp));
+    }
+    for (int t = 0; t < numTracks; ++t)
+    {
+        auto st = std::make_unique<TrackStrip>();
+        strips[t] = st.get();
+        stripNode[t] = graph.addNode (std::move (st));
+        auto mf = std::make_unique<MidiChannelFilter>();
+        midiFilters[t] = mf.get();
+        midiFilterNode[t] = graph.addNode (std::move (mf));
+    }
+    {
+        auto ms = std::make_unique<TrackStrip>();
+        masterStrip = ms.get();
+        masterStripNode = graph.addNode (std::move (ms));
     }
 
     player.setProcessor (&graph);
@@ -796,46 +811,44 @@ void MainComponent::rebuildConnections()
 
     const int mode = currentSourceMode();
 
-    // The same graph the offline rig builds (MixGraph, docs/TRACKS.md): tracks -> master -> out. Today one track sounds at a
-    // time (the source mode picks it) and the master is the meter / recorder tap; the other sources are not connected.
+    // The same graph the offline rig builds (MixGraph, docs/TRACKS.md): tracks -> master -> out.
+    //   track:   source -> strip              (AUDIO: the file player or the live input; INST 1: the VSTi, after its MIDI filter)
+    //   master:  [FX insert] -> master strip -> tap -> device out
     MixGraph mix (graph, audioOutNode, Graph::UpdateKind::sync);
-    mix.adopt (tapNode, "master", -1);
-    mix.setMaster ({ tapNode });                       // tap -> device out
 
-    // --- the track that sounds: its source, and the FX stage after it ---
-    Graph::Node::Ptr src;
-    int srcChanBase = 0;
-    juce::String role = "source";
+    // The legacy source mode still decides which tracks sound (the others sit muted at their strip, connected):
+    // live / file -> AUDIO; VSTi -> INST 1 (AUDIO again when no instrument is loaded: the old fallback to the live input).
+    const bool instSounds = mode == srcInstrument && instrumentNode != nullptr;
+    strips[trkAudio]->setMuted (instSounds);
+    strips[trkInst1]->setMuted (! instSounds);
+    for (int t = trkInst2; t < numTracks; ++t)
+        strips[t]->setMuted (true);
 
-    if (mode == srcInstrument && instrumentNode != nullptr)
+    // --- master ---
+    std::vector<Graph::Node::Ptr> masterChain;
+    if (effectNode != nullptr && ! preRenderActive())     // pre-render: the FX is already baked into the cache
     {
-        src = instrumentNode;
-        role = "inst";
+        masterChain.push_back (mix.adopt (effectNode, "insert", -1));
+        mix.connectMidi (midiInNode, effectNode);          // MIDI-controlled effects
     }
-    else if (mode == srcFile)
-    {
-        src = filePlayerNode;
-    }
-    else   // live input (also the fallback when no instrument is loaded)
-    {
-        src = audioInNode;
-        srcChanBase = inputPairStart;
-    }
+    masterChain.push_back (mix.adopt (masterStripNode, "master", -1));
+    masterChain.push_back (mix.adopt (tapNode, "master", -1));
+    mix.setMaster (masterChain);
 
-    // MIDI in -> instrument (whenever one is loaded, regardless of mode)
+    // --- AUDIO track: the file player, or the live input (also the fallback when no instrument is loaded) ---
+    const bool fileSource = mode == srcFile;
+    mix.addTrack ({ mix.adopt (fileSource ? filePlayerNode : audioInNode, "source", trkAudio),
+                    mix.adopt (stripNode[trkAudio], "strip", trkAudio) },
+                  fileSource ? 0 : inputPairStart);
+
+    // --- INST 1 ---
     if (instrumentNode != nullptr)
-        mix.connectMidi (midiInNode, instrumentNode);
-
-    std::vector<Graph::Node::Ptr> chain { mix.adopt (src, role, 0) };
-    if (effectNode != nullptr && ! preRenderActive())
     {
-        chain.push_back (mix.adopt (effectNode, "insert", 0));
-
-        // MIDI in -> FX (for MIDI-controlled effects)
-        mix.connectMidi (midiInNode, effectNode);
+        mix.connectMidi (midiInNode, midiFilterNode[trkInst1]);
+        mix.connectMidi (midiFilterNode[trkInst1], instrumentNode);
+        mix.addTrack ({ mix.adopt (instrumentNode, "inst", trkInst1),
+                        mix.adopt (stripNode[trkInst1], "strip", trkInst1) });
     }
-    // else: no FX (or pre-render mode: FX already baked into the cache) -> the source goes straight to the master
-    mix.addTrack (chain, srcChanBase);
 }
 
 //==============================================================================
