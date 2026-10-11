@@ -2,7 +2,15 @@ cmake_minimum_required(VERSION 3.22)
 project(VstTestBench VERSION 0.10.1)
 set(CMAKE_CXX_STANDARD 17)
 
-add_subdirectory("C:/JUCE" "${CMAKE_CURRENT_BINARY_DIR}/JUCE" EXCLUDE_FROM_ALL)
+# JUCE location (per-platform; override with -DJUCE_DIR=...)
+if(NOT DEFINED JUCE_DIR)
+    if(APPLE)
+        set(JUCE_DIR "$ENV{HOME}/JUCE")
+    else()
+        set(JUCE_DIR "C:/JUCE")
+    endif()
+endif()
+add_subdirectory("${JUCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/JUCE" EXCLUDE_FROM_ALL)
 
 # --- ARA hosting (Celemony's Audio Random Access): enabled only if the SDK is there ---------------------
 # Recursive clone of https://github.com/Celemony/ARA_SDK (JUCE 8 documents releases/2.1.0).
@@ -34,14 +42,18 @@ if(MSVC)
     target_compile_options(VstTestBench PRIVATE /utf-8)
 endif()
 
-# --- ASIO: enable only if the Steinberg ASIO SDK is present ---------------
-set(ASIO_SDK_DIR "C:/SDKs/ASIOSDK" CACHE PATH "Steinberg ASIO SDK folder")
-if(EXISTS "${ASIO_SDK_DIR}/common/iasiodrv.h")
-    message(STATUS "ASIO SDK found -> enabling JUCE_ASIO (${ASIO_SDK_DIR})")
-    target_include_directories(VstTestBench PRIVATE "${ASIO_SDK_DIR}/common")
-    target_compile_definitions(VstTestBench PRIVATE JUCE_ASIO=1)
-else()
-    message(WARNING "ASIO SDK not found at ${ASIO_SDK_DIR} -> falling back to WASAPI/DirectSound")
+# --- Windows audio backends (ASIO/WASAPI/DirectSound) are Windows-only ---
+if(WIN32)
+    # ASIO: enable only if the Steinberg ASIO SDK is present
+    set(ASIO_SDK_DIR "C:/SDKs/ASIOSDK" CACHE PATH "Steinberg ASIO SDK folder")
+    if(EXISTS "${ASIO_SDK_DIR}/common/iasiodrv.h")
+        message(STATUS "ASIO SDK found -> enabling JUCE_ASIO (${ASIO_SDK_DIR})")
+        target_include_directories(VstTestBench PRIVATE "${ASIO_SDK_DIR}/common")
+        target_compile_definitions(VstTestBench PRIVATE JUCE_ASIO=1)
+    else()
+        message(WARNING "ASIO SDK not found at ${ASIO_SDK_DIR} -> falling back to WASAPI/DirectSound")
+    endif()
+    target_compile_definitions(VstTestBench PRIVATE JUCE_WASAPI=1 JUCE_DIRECTSOUND=1)
 endif()
 
 if(VSTTB_HAS_ARA)
@@ -52,16 +64,22 @@ target_compile_definitions(VstTestBench PRIVATE
     JUCE_WEB_BROWSER=0
     JUCE_USE_CURL=0
     JUCE_PLUGINHOST_VST3=1
+    JUCE_PLUGINHOST_AU=1       # host AU on macOS (ignored on Windows)
     JUCE_USE_MP3AUDIOFORMAT=1
     JUCE_USE_FLAC=1
     JUCE_USE_OGGVORBIS=1
-    JUCE_WASAPI=1
-    JUCE_DIRECTSOUND=1
     JUCE_APPLICATION_NAME_STRING="$<TARGET_PROPERTY:VstTestBench,JUCE_PRODUCT_NAME>"
     JUCE_APPLICATION_VERSION_STRING="$<TARGET_PROPERTY:VstTestBench,JUCE_VERSION>"
 )
 
+# Embed the user manual pages (shown by the "?" button)
+juce_add_binary_data(TbManualData SOURCES
+    "${CMAKE_CURRENT_SOURCE_DIR}/Resources/manual/manual_p1.png"
+    "${CMAKE_CURRENT_SOURCE_DIR}/Resources/manual/manual_p2.png"
+)
+
 target_link_libraries(VstTestBench PRIVATE
+    TbManualData
     juce::juce_audio_utils
     juce::juce_audio_processors
     PUBLIC

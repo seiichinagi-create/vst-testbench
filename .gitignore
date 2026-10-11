@@ -21,3 +21,8 @@ Desktop.ini
 
 # JUCE generated
 JuceLibraryCode/
+
+# Mac build dir, build logs, local MIDI recording backup
+build-mac12/
+build_mac*.log
+_midi_rec_backup/

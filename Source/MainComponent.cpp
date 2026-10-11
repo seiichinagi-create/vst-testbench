@@ -1,6 +1,7 @@
 #include "MainComponent.h"
 #include "MixGraph.h"
 #include "MixStrips.h"
+#include "ManualWindow.h"
 
 namespace
 {
@@ -138,11 +139,17 @@ MainComponent::MainComponent()
     deviceManager.addAudioCallback (&player);
     deviceManager.addMidiInputDeviceCallback ({}, &player);   // feed MIDI into graph (for VSTi)
     deviceManager.addMidiInputDeviceCallback ({}, this);      // our own MIDI thru path
+   #if JUCE_MAC
+    // macOS has no saved "MIDI input enabled" state like Windows; the empty-id callbacks
+    // only receive from ENABLED inputs, so enable every input found at startup.
+    for (const auto& mi : juce::MidiInput::getAvailableDevices())
+        deviceManager.setMidiInputDeviceEnabled (mi.identifier, true);
+   #endif
     rebuildConnections();
 
     // === UI ===
     auto addBtn = [this] (juce::Button& b) { addAndMakeVisible (b); };
-    addBtn (audioSettingsButton); addBtn (resetAudioButton);
+    addBtn (audioSettingsButton); addBtn (resetAudioButton); addBtn (helpButton);
     addBtn (loadButton); addBtn (editorButton);
     addBtn (clearButton);         addBtn (bypassButton); addBtn (midiThruButton);
     addBtn (loadInstButton);      addBtn (instEditorButton); addBtn (clearInstButton);
@@ -150,6 +157,12 @@ MainComponent::MainComponent()
     addBtn (openFileButton);      addBtn (playButton); addBtn (stopButton); addBtn (loopButton);
 
     audioSettingsButton.onClick = [this] { showAudioSettings(); };
+    helpButton.setTooltip ("Open the user manual (generated from this running instance).");
+    helpButton.onClick = [this]
+    {
+        if (manualWindow) { manualWindow->toFront (true); return; }
+        manualWindow.reset (new ManualWindow ([this] { manualWindow.reset(); }));
+    };
     resetAudioButton.onClick    = [this]
     {
         // One-click recovery when the ASIO driver goes irregular (post-xrun).
@@ -273,6 +286,12 @@ MainComponent::MainComponent()
     addAndMakeVisible (gpuStatusLabel);
 
     addAndMakeVisible (gpuViewport);
+   #if JUCE_MAC
+    // the Mac build excludes GPU FX: hide all of its UI (button, status, knob area)
+    gpuFxButton.setVisible (false);
+    gpuStatusLabel.setVisible (false);
+    gpuViewport.setVisible (false);
+   #endif
     gpuViewport.setViewedComponent (&gpuPanelHolder, false);
     gpuViewport.setScrollBarsShown (true, false);
     gpuViewport.setScrollBarThickness (12);
@@ -2128,6 +2147,12 @@ void MainComponent::handleIncomingMidiMessage (juce::MidiInput*, const juce::Mid
 void MainComponent::changeListenerCallback (juce::ChangeBroadcaster*)
 {
     // Device layout may have changed; keep monitor/plugin wiring valid.
+   #if JUCE_MAC
+    // A MIDI keyboard plugged in after launch also needs enabling.
+    for (const auto& mi : juce::MidiInput::getAvailableDevices())
+        if (! deviceManager.isMidiInputDeviceEnabled (mi.identifier))
+            deviceManager.setMidiInputDeviceEnabled (mi.identifier, true);
+   #endif
     rebuildConnections();
 }
 
@@ -2354,6 +2379,8 @@ void MainComponent::resized()
     // --- top utility bar: title (painted) + settings on the right ---
     {
         auto top = full.removeFromTop (30);
+        helpButton.setBounds (top.removeFromRight (30));
+        top.removeFromRight (6);
         resetAudioButton.setBounds (top.removeFromRight (100));
         top.removeFromRight (6);
         audioSettingsButton.setBounds (top.removeFromRight (150));

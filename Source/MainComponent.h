@@ -320,6 +320,7 @@ private:
     //== UI ==
     juce::TextButton   audioSettingsButton { "Audio / MIDI Settings" };
     juce::TextButton   resetAudioButton    { "Reset ASIO" };
+    juce::TextButton   helpButton          { "?" };
     juce::ComboBox     sourceCombo;
     juce::Label        sourceLabel { {}, "Source:" };
     juce::ToggleButton autoBackendButton { "Auto backend (file=WASAPI / live=ASIO)" };
@@ -363,7 +364,7 @@ private:
     juce::Label        pluginLabel;
     juce::Label        statusLabel;
 
-    std::unique_ptr<juce::DocumentWindow> editorWindow, instEditorWindow;
+    std::unique_ptr<juce::DocumentWindow> editorWindow, instEditorWindow, manualWindow;
 
     //== signal-flow diagram layout ==
     // paint() draws titled stage boxes + connecting arrows; resized() fills them.
