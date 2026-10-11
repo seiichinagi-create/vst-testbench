@@ -608,6 +608,21 @@ juce::var MainComponent::handleControl (const juce::var& req)
         if (flag (req, "rewind", true)) filePlayer->transport.setPosition (0.0);
         return makeObj();
     }
+    if (cmd == "transport")
+    {
+        // The host transport that plug-ins read (tempo, position, playing): action = start | stop | seek | status.
+        const auto action = str (req, "action", "status");
+        if (req.hasProperty ("bpm")) liveTransport.setTempo (num (req, "bpm", 120.0));
+        if (action == "start") liveTransport.start (num (req, "from", 0.0));
+        else if (action == "stop") liveTransport.stop (flag (req, "rewind", true));
+        else if (action == "seek") liveTransport.seek (num (req, "seconds", 0.0));
+        else if (action != "status") return fail ("action must be start | stop | seek | status");
+        auto o = makeObj();
+        put (o, "playing", liveTransport.isPlaying());
+        put (o, "seconds", liveTransport.seconds());
+        put (o, "bpm", liveTransport.tempo());
+        return o;
+    }
     if (cmd == "seek")
     {
         filePlayer->transport.setPosition (num (req, "seconds", 0.0));
@@ -734,6 +749,8 @@ juce::var MainComponent::handleControl (const juce::var& req)
             return fail ("no instrument loaded (the events would only reach FX / MIDI thru)");
         if (currentSourceMode() != srcInstrument)
             sourceCombo.setSelectedId (srcInstrument, juce::sendNotificationSync);
+        if (req.hasProperty ("bpm")) liveTransport.setTempo (num (req, "bpm", 120.0));
+        if (flag (req, "transport", true)) liveTransport.start (0.0);     // a plug-in that plays its own project needs the transport
         midiScheduler.play (std::move (seq));
         auto o = makeObj();
         put (o, "duration", midiScheduler.getDuration());
@@ -743,6 +760,7 @@ juce::var MainComponent::handleControl (const juce::var& req)
     if (cmd == "midi_stop")
     {
         midiScheduler.stop();
+        liveTransport.stop();
         for (int ch = 1; ch <= 16; ++ch)
         {
             injectMidi (juce::MidiMessage::allNotesOff (ch));
@@ -872,7 +890,7 @@ juce::var MainComponent::handleControl (const juce::var& req)
         put (o, "commands", juce::StringArray ({
             "ping", "status", "graph_dump", "track_set", "track_status", "render_mix", "list_plugins", "load_plugin", "remove_plugin", "set_bypass",
             "list_params", "set_param", "set_params", "save_state", "load_state",
-            "show_editor", "screenshot", "set_source", "load_audio", "play", "stop", "seek", "loop",
+            "show_editor", "screenshot", "set_source", "load_audio", "play", "stop", "seek", "transport", "loop",
             "prerender", "rig_render", "ara_probe", "load_midi", "export_midi", "mpe", "midi_send", "midi_play", "midi_play_file", "midi_stop",
             "record_start", "record_stop", "analyze", "audio_devices", "set_audio" }).joinIntoString (" "));
         put (o, "doc", "docs/CONTROL.md");

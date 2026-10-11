@@ -134,6 +134,7 @@ MainComponent::MainComponent()
     }
 
     player.setProcessor (&graph);
+    graph.setPlayHead (&liveTransport);
     deviceManager.addAudioCallback (&player);
     deviceManager.addMidiInputDeviceCallback ({}, &player);   // feed MIDI into graph (for VSTi)
     deviceManager.addMidiInputDeviceCallback ({}, this);      // our own MIDI thru path

@@ -132,3 +132,8 @@ master: sum -> [master FX] -> master strip -> tap -> out
 - **プラグインのキャッシュ(`known_plugins.xml`)に、存在しないファイルのエントリが残る**: 入れ子になった配備(`Flesh808.vst3\Flesh808.vst3`)の跡で、名前で探すと先頭の存在しないものを選んで「No compatible plug-in format exists」で失敗した(ライブでもリグでも・検査が静かに落ちた)。**起動時に、存在しないファイルのエントリを取り除く**ようにした。
 - 全検査(最終ビルド): `rig_test`(基準と差 0 行)・`rig_sends`・`tracks_smoke`・`live_vs_rig`(通常・`--strips`・`--slots`)・`prerender_strips`(通常・`--slots`)・`midi_multi_inst`・`render_mix_midi` がすべて PASS。
 
+### SynthV の再生(ライブ・2026-10-11)
+
+ライブのホストにも再生位置(`AudioPlayHead`)を持たせた(`Source/LiveTransport.h`・命令 `transport`)。これで SynthV はライブでも歌う。
+**プロジェクトを読み込んだ直後は、歌が数秒遅れて出る**(プラグインが先に描画する)ので、読み込みから3秒ほど置いてから `transport start` する
+(置かずに始めると最初の約2.2秒が無音)。使う側=別 repo `synthv-sing`(`python -m synthv_sing play "..." --check`)。

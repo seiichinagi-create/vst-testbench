@@ -20,6 +20,10 @@ The legacy FX (`role=fx`) is the master insert.
 * **MIDI channels**: INST 1 listens to every channel by default, INST 2 and 3 to none until you give channels (`midi_channels`,
   or the field in the strip). A note on a channel nobody listens to is silent. With MPE, give an MPE instrument its master channel
   too (e.g. `1-8`): the zone setup travels on channel 1.
+* **Host transport**: `transport action=start|stop|seek|status [bpm=120] [from=0] [seconds=..] [rewind=true]`. What the live host tells a plug-in about
+  tempo / position / playing (`AudioPlayHead`; the offline rig has always had its own). Advances one block at a time with the audio callback. A plug-in that
+  plays its own project on the transport (Synthesizer V) is silent without it. `midi_play` starts it at 0 (`transport=false` to leave it; `bpm` sets the tempo),
+  `midi_stop` stops it. Check: `tools/transport_smoke.py`. Not tied to the AUDIO file player's `play`/`seek`.
 * **Inserts and send buses**: `load_plugin role=insert_audio | insert_inst1 | insert_inst2 | insert_inst3 | send1 | send2` (also `remove_plugin`, `show_editor`,
   `list_params`, `set_param`). `track_set track=audio|inst1..3 send1_db=-6 send2_db=-12` (post-fader; -100 = off), `track_set track=send1|send2 gain_db=..`
   (the return strip). A bus with no FX is not built. `render_mix` takes all of it. `status.prerender_mode` is `engine` (file + master FX, in

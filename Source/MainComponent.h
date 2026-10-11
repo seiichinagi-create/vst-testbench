@@ -1,5 +1,6 @@
 #pragma once
 
+#include "LiveTransport.h"
 #include <juce_audio_utils/juce_audio_utils.h>
 #include "vendor/SnLookAndFeel.h"
 #include "FilePlayerProcessor.h"
@@ -187,7 +188,8 @@ private:
     //== audio graph ==
     juce::AudioDeviceManager deviceManager;
     Graph graph;
-    juce::AudioProcessorPlayer player;
+    LiveTransport liveTransport;              // tempo / position the plug-ins read from the host
+    TransportPlayer player { liveTransport };
     juce::AudioPluginFormatManager formatManager;
     juce::KnownPluginList knownPlugins;
     juce::AudioFormatManager audioFormats;
