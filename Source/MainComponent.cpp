@@ -631,11 +631,56 @@ void MainComponent::applyBackendForMode (int mode)
                + (dev != nullptr ? " (" + dev->getName() + ")" : juce::String (" - no device opened!")));
 }
 
-juce::AudioPluginFormat* MainComponent::vst3Format() const
+static bool isAudioUnitRef (const juce::String& s)
 {
+    return s.startsWithIgnoreCase ("AudioUnit:")
+        || s.endsWithIgnoreCase (".component") || s.endsWithIgnoreCase (".appex");
+}
+
+juce::AudioPluginFormat* MainComponent::formatFor (const juce::String& pathOrId) const
+{
+    const juce::String want = isAudioUnitRef (pathOrId.trimCharactersAtEnd ("/")) ? "AudioUnit" : "VST3";
     for (auto* f : formatManager.getFormats())
-        if (f->getName().containsIgnoreCase ("VST3"))
+        if (f->getName().equalsIgnoreCase (want))
             return f;
+    return nullptr;
+}
+
+bool MainComponent::isPluginPath (const juce::String& what)
+{
+    return what.endsWithIgnoreCase (".vst3") || isAudioUnitRef (what) || juce::File::isAbsolutePath (what);
+}
+
+juce::String MainComponent::scanPluginFile (const juce::String& pathOrId, juce::OwnedArray<juce::PluginDescription>& found)
+{
+    const auto ref = pathOrId.startsWithIgnoreCase ("AudioUnit:") ? pathOrId
+                                                                   : juce::File (pathOrId).getFullPathName();
+    auto* fmt = formatFor (ref);
+    if (fmt == nullptr)
+        return isAudioUnitRef (ref) ? "AudioUnit format not available (macOS only)" : "VST3 format not available";
+    knownPlugins.scanAndAddFile (ref, true, found, *fmt);
+    return {};
+}
+
+const juce::PluginDescription* MainComponent::findCachedPlugin (const juce::Array<juce::PluginDescription>& types,
+                                                                juce::String name, int wantInst) const
+{
+    juce::String format;
+    for (auto tag : { "AU", "VST3" })
+        if (name.endsWithIgnoreCase (juce::String (" (") + tag + ")"))
+        {
+            format = juce::String (tag) == "AU" ? "AudioUnit" : "VST3";
+            name = name.dropLastCharacters (juce::String (tag).length() + 3).trimEnd();
+        }
+    auto ok = [&] (const juce::PluginDescription& t)
+    {
+        return (wantInst < 0 || t.isInstrument == (wantInst != 0))
+            && (format.isEmpty() || t.pluginFormatName.equalsIgnoreCase (format));
+    };
+    for (const auto& t : types)
+        if (ok (t) && t.name.equalsIgnoreCase (name)) return &t;
+    for (const auto& t : types)
+        if (ok (t) && t.name.containsIgnoreCase (name)) return &t;
     return nullptr;
 }
 
@@ -681,7 +726,8 @@ void MainComponent::refreshRecentList()
     recentCombo.clear (juce::dontSendNotification);
     auto types = knownPlugins.getTypes();
     for (int i = 0; i < types.size(); ++i)
-        recentCombo.addItem ((types[i].isInstrument ? "[inst] " : "[fx] ") + types[i].name, i + 1);
+        recentCombo.addItem ((types[i].isInstrument ? "[inst] " : "[fx] ") + types[i].name
+                             + (types[i].pluginFormatName == "AudioUnit" ? " (AU)" : ""), i + 1);
     recentCombo.setTextWhenNothingSelected (types.isEmpty() ? "(none cached yet)"
                                                             : "select cached plugin...");
 }
@@ -737,10 +783,16 @@ void MainComponent::showAudioSettings()
 //==============================================================================
 void MainComponent::loadPluginDialog (bool asInstrument, int track)
 {
+   #if JUCE_MAC
+    const juce::File startDir = juce::File::getSpecialLocation (juce::File::userHomeDirectory).getChildFile ("Library/Audio/Plug-Ins");
+    const juce::String patterns = "*.vst3;*.component";
+   #else
+    const juce::File startDir ("C:/Program Files/Common Files/VST3");
+    const juce::String patterns = "*.vst3";
+   #endif
     auto chooser = std::make_shared<juce::FileChooser> (
-        asInstrument ? "Select a VST3 instrument" : "Select a VST3 effect",
-        juce::File ("C:/Program Files/Common Files/VST3"),
-        "*.vst3");
+        asInstrument ? "Select a plug-in instrument (VST3 / AU)" : "Select a plug-in effect (VST3 / AU)",
+        startDir, patterns);
 
     chooser->launchAsync (juce::FileBrowserComponent::openMode
                           | juce::FileBrowserComponent::canSelectFiles
@@ -750,12 +802,10 @@ void MainComponent::loadPluginDialog (bool asInstrument, int track)
             auto file = fc.getResult();
             if (file == juce::File{}) return;
 
-            auto* fmt = vst3Format();
-            if (fmt == nullptr) { setStatus ("VST3 format not available."); return; }
-
             juce::OwnedArray<juce::PluginDescription> found;
             setStatus ("Scanning " + file.getFileName() + " ...");
-            knownPlugins.scanAndAddFile (file.getFullPathName(), true, found, *fmt);
+            const auto err = scanPluginFile (file.getFullPathName(), found);
+            if (err.isNotEmpty()) { setStatus (err + "."); return; }
             saveKnownPlugins();
             refreshRecentList();
 

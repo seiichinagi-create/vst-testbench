@@ -355,31 +355,25 @@ juce::var MainComponent::handleControl (const juce::var& req)
         const auto name = str (req, "name");
         if (path.isNotEmpty())
         {
-            auto* fmt = vst3Format();
-            if (fmt == nullptr) return fail ("VST3 format not available");
-            const juce::File f (path);
-            if (! f.exists()) return fail ("no such file: " + path);
+            const bool auId = path.startsWithIgnoreCase ("AudioUnit:");
+            if (! auId && ! juce::File (path).exists()) return fail ("no such file: " + path);
             juce::OwnedArray<juce::PluginDescription> found;
-            knownPlugins.scanAndAddFile (f.getFullPathName(), true, found, *fmt);
+            const auto err = scanPluginFile (path, found);
+            if (err.isNotEmpty()) return fail (err);
             saveKnownPlugins();
             refreshRecentList();
-            if (found.isEmpty()) return fail ("no plugin found in " + f.getFileName());
+            if (found.isEmpty()) return fail ("no plugin found in " + (auId ? path : juce::File (path).getFileName()));
             loadPluginFromDescription (*found.getFirst(), asInst, loadTrack);
         }
         else if (name.isNotEmpty())
         {
-            const juce::PluginDescription* hit = nullptr;
             auto types = knownPlugins.getTypes();
-            for (const auto& t : types)
-                if (t.isInstrument == asInst && t.name.equalsIgnoreCase (name)) { hit = &t; break; }
-            if (hit == nullptr)
-                for (const auto& t : types)
-                    if (t.isInstrument == asInst && t.name.containsIgnoreCase (name)) { hit = &t; break; }
-            if (hit == nullptr) return fail ("no cached " + role + " plugin matching \"" + name + "\" (use path=...vst3)");
+            const auto* hit = findCachedPlugin (types, name, asInst ? 1 : 0);
+            if (hit == nullptr) return fail ("no cached " + role + " plugin matching \"" + name + "\" (use path=...vst3 / .component)");
             loadPluginFromDescription (*hit, asInst, loadTrack);
         }
         else
-            return fail ("give \"path\" (a .vst3) or \"name\" (a cached plugin)");
+            return fail ("give \"path\" (a .vst3, a .component or an AudioUnit: identifier) or \"name\" (a cached plugin)");
 
         auto o = makeObj();
         put (o, "started", true);
@@ -919,25 +913,18 @@ juce::var MainComponent::startRigRender (const juce::var& req)
     if (rigWorker.isRunning())
         return fail ("a rig render is already running");
 
-    auto* fmt = vst3Format();
-    if (fmt == nullptr) return fail ("VST3 format not available");
-
-    // resolves a plugin name or .vst3 path to its description
+    // resolves a plugin name, a .vst3 / .component path or an AudioUnit: identifier to its description
     auto findPlugin = [&] (const juce::String& what, bool wantInst, juce::PluginDescription& desc) -> bool
     {
-        if (what.endsWithIgnoreCase (".vst3") || juce::File::isAbsolutePath (what))
+        if (isPluginPath (what))
         {
             juce::OwnedArray<juce::PluginDescription> types;
-            knownPlugins.scanAndAddFile (juce::File (what).getFullPathName(), true, types, *fmt);
-            if (types.isEmpty()) return false;
+            if (scanPluginFile (what, types).isNotEmpty() || types.isEmpty()) return false;
             desc = *types.getFirst();
             return true;
         }
         auto types = knownPlugins.getTypes();
-        for (const auto& t : types)
-            if (t.isInstrument == wantInst && t.name.equalsIgnoreCase (what)) { desc = t; return true; }
-        for (const auto& t : types)
-            if (t.isInstrument == wantInst && t.name.containsIgnoreCase (what)) { desc = t; return true; }
+        if (const auto* t = findCachedPlugin (types, what, wantInst ? 1 : 0)) { desc = *t; return true; }
         return false;
     };
 
@@ -1046,7 +1033,7 @@ juce::var MainComponent::startRigRender (const juce::var& req)
                 // the ARA plug-in is the track's first stage and its source: it reads the file through an ARA document
                 auto ara = stageFor (t, "ara", false, error);
                 if (! error.isEmpty()) return {};
-                if (ara.isVoid()) { error = "give \"ara\" (a plug-in name or a .vst3 path)"; return {}; }
+                if (ara.isVoid()) { error = "give \"ara\" (a plug-in name, a .vst3 / .component path)"; return {}; }
                 stages.add (ara);
             }
         }
@@ -1057,7 +1044,7 @@ juce::var MainComponent::startRigRender (const juce::var& req)
             put (track, "events", t["events"]);
             auto inst = stageFor (t, "inst", true, error);
             if (error.isNotEmpty()) return {};
-            if (inst.isVoid()) { error = "give \"inst\" (a cached name or a .vst3 path)"; return {}; }
+            if (inst.isVoid()) { error = "give \"inst\" (a cached name, a .vst3 / .component path or an AudioUnit: identifier)"; return {}; }
             stages.add (inst);
         }
 
@@ -1501,22 +1488,15 @@ juce::var MainComponent::startAraProbe (const juce::var& req)
 
     juce::PluginDescription desc;
     bool found = false;
-    if (what.endsWithIgnoreCase (".vst3") || juce::File::isAbsolutePath (what))
+    if (isPluginPath (what))
     {
-        if (auto* fmt = vst3Format())
-        {
-            juce::OwnedArray<juce::PluginDescription> types;
-            knownPlugins.scanAndAddFile (juce::File (what).getFullPathName(), true, types, *fmt);
-            if (! types.isEmpty()) { desc = *types.getFirst(); found = true; }
-        }
+        juce::OwnedArray<juce::PluginDescription> types;
+        if (scanPluginFile (what, types).isEmpty() && ! types.isEmpty()) { desc = *types.getFirst(); found = true; }
     }
     else
     {
-        for (const auto& t : knownPlugins.getTypes())
-            if (t.name.equalsIgnoreCase (what)) { desc = t; found = true; break; }
-        if (! found)
-            for (const auto& t : knownPlugins.getTypes())
-                if (t.name.containsIgnoreCase (what)) { desc = t; found = true; break; }
+        auto types = knownPlugins.getTypes();
+        if (const auto* t = findCachedPlugin (types, what, -1)) { desc = *t; found = true; }
     }
     if (! found) return fail ("no plug-in matching \"" + what + "\"");
 

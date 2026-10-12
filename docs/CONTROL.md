@@ -45,7 +45,7 @@ Client: `python tools/tb.py <cmd> key=value ...` (or a JSON body), `--wait` bloc
 | cmd | arguments | notes |
 |---|---|---|
 | status | | source, plugins, transport, MIDI/bounce, MPE, audio device, output level (peak/rms since last call), `busy` |
-| list_plugins / load_plugin / remove_plugin | `role=fx\|inst`, `path=...vst3` or `name=` (cached) | loading is async: wait for `busy=false` |
+| list_plugins / load_plugin / remove_plugin | `role=fx\|inst`, `path=...vst3` (macOS also `...component` or an `AudioUnit:Type/aumu,Code,Mfr` identifier) or `name=` (cached; `"Name (AU)"` / `"Name (VST3)"` picks the format when both are cached) | loading is async: wait for `busy=false`. The rig log line `loading inst <name> [<format>]` records which format was rendered |
 | list_params | `role`, `filter`, `limit` | normalized value + text |
 | set_param / set_params | `role`, `name` or `index`, `value` (0..1) or `text`; batch: `values=[...]` | goes through the host, so knob-driven re-render / re-bounce still triggers |
 | save_state / load_state | `role`, `path` | raw plugin state |

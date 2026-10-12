@@ -182,7 +182,15 @@ private:
     juce::File midiOutFile() const;
     juce::File midiThruFile() const;
     bool ensureOutputDevice();
-    juce::AudioPluginFormat* vst3Format() const;
+    // The format that reads a plug-in path or identifier: a .component / .appex bundle or an
+    // "AudioUnit:..." identifier is an AU (macOS), anything else a VST3. Null if not built in.
+    juce::AudioPluginFormat* formatFor (const juce::String& pathOrId) const;
+    static bool isPluginPath (const juce::String& what);
+    // Scans one plug-in file (or AU identifier) into the cache; the descriptions it holds land in `found`.
+    juce::String scanPluginFile (const juce::String& pathOrId, juce::OwnedArray<juce::PluginDescription>& found);
+    // A cached plug-in by name: exact first, then substring. "Name (AU)" / "Name (VST3)" picks the format.
+    const juce::PluginDescription* findCachedPlugin (const juce::Array<juce::PluginDescription>& types,
+                                                     juce::String name, int wantInst) const;
     int currentSourceMode() const;
 
     //== audio graph ==

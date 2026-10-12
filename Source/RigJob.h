@@ -79,7 +79,7 @@ namespace rigjob
         }
 
         if (note != nullptr)
-            note ("loading " + role + " " + desc.name);
+            note ("loading " + role + " " + desc.name + " [" + desc.pluginFormatName + "]");
         juce::String err;
         auto plugin = formats.createPluginInstance (desc, spec.sampleRate, spec.block, err);
         if (plugin == nullptr)
