@@ -142,9 +142,9 @@ MainComponent::MainComponent()
    #if JUCE_MAC
     // macOS has no saved "MIDI input enabled" state like Windows; the empty-id callbacks
     // only receive from ENABLED inputs, so enable every input found at startup.
-    for (const auto& mi : juce::MidiInput::getAvailableDevices())
-        deviceManager.setMidiInputDeviceEnabled (mi.identifier, true);
+    midiInputsChanged();
    #endif
+    midiListConnection = juce::MidiDeviceListConnection::make ([this] { midiInputsChanged(); });
     rebuildConnections();
 
     // === UI ===
@@ -521,6 +521,7 @@ MainComponent::~MainComponent()
     saveBackendSnapshot();
     if (auto xml = deviceManager.createStateXml())
         xml->writeTo (audioStateFile());
+    closeMidiInputs();   // after the state is saved, so the saved state keeps them enabled
 
     const juce::ScopedLock sl (midiOutLock);
     midiOut.reset();
@@ -2197,13 +2198,38 @@ void MainComponent::handleIncomingMidiMessage (juce::MidiInput*, const juce::Mid
 void MainComponent::changeListenerCallback (juce::ChangeBroadcaster*)
 {
     // Device layout may have changed; keep monitor/plugin wiring valid.
-   #if JUCE_MAC
-    // A MIDI keyboard plugged in after launch also needs enabling.
-    for (const auto& mi : juce::MidiInput::getAvailableDevices())
-        if (! deviceManager.isMidiInputDeviceEnabled (mi.identifier))
-            deviceManager.setMidiInputDeviceEnabled (mi.identifier, true);
-   #endif
+    // (MIDI inputs are NOT re-enabled here: this fires when the user unticks one in the
+    // settings dialog too, and turning it straight back on made the tick look stuck.)
     rebuildConnections();
+}
+
+void MainComponent::midiInputsChanged()
+{
+   #if JUCE_MAC
+    // A MIDI keyboard plugged in after launch needs enabling; one the user switched off stays off.
+    for (const auto& mi : juce::MidiInput::getAvailableDevices())
+        if (! seenMidiInputs.contains (mi.identifier))
+        {
+            seenMidiInputs.add (mi.identifier);
+            deviceManager.setMidiInputDeviceEnabled (mi.identifier, true);
+        }
+   #endif
+    deviceManager.sendChangeMessage();   // the settings dialog's MIDI list refreshes on this
+}
+
+void MainComponent::closeMidiInputs()
+{
+    // JUCE 8.0.13: AudioDeviceManager declares its MIDI callback handler AFTER enabledMidiInputs,
+    // so its destructor frees the handler first and then closes the inputs. A message arriving in
+    // between (a keyboard sending clock / active sensing) is delivered to the freed handler:
+    // EXC_BAD_ACCESS on the CoreMIDI thread at quit. Closing the inputs here, while the handler
+    // is alive, leaves nothing open for that window.
+    midiListConnection = {};
+    juce::StringArray ids (seenMidiInputs);
+    for (const auto& mi : juce::MidiInput::getAvailableDevices())
+        ids.addIfNotAlreadyThere (mi.identifier);
+    for (const auto& id : ids)
+        deviceManager.setMidiInputDeviceEnabled (id, false);
 }
 
 void MainComponent::timerCallback()

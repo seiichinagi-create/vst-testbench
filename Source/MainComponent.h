@@ -318,6 +318,15 @@ private:
     juce::Component gpuPanelHolder;      // controls live here, inside the viewport
     int gpuPanelContentHeight() const;
 
+    //== MIDI inputs ==
+    // AudioDeviceManager does not watch MIDI hot-plug, so the settings list went stale and a
+    // keyboard plugged in later stayed off. This connection enables inputs that APPEAR (never
+    // re-enables one the user switched off) and tells the settings dialog to refresh.
+    void midiInputsChanged();
+    void closeMidiInputs();
+    juce::StringArray seenMidiInputs;     // identifiers already offered once
+    juce::MidiDeviceListConnection midiListConnection;
+
     //== MIDI thru to hardware (off by default; the chosen output is remembered) ==
     std::unique_ptr<juce::MidiOutput> midiOut;
     juce::CriticalSection            midiOutLock;
