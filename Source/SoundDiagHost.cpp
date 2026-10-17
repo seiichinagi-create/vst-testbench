@@ -44,6 +44,7 @@ void MainComponent::tickSoundDiag()
     f.stops        = p.stops.load();
     f.errors       = p.errors.load();
     if (f.errors > 0) f.lastError = p.getLastError();
+    f.noteChannels = p.noteChannels.exchange (0);
 
     TrackStrip* st[SoundDiag::numStages] = { strips[trkAudio], strips[trkInst1], strips[trkInst2], strips[trkInst3],
                                              busReturn[0], busReturn[1], masterStrip };
@@ -139,8 +140,12 @@ juce::String MainComponent::describeForDiag() const
                  + (s->isModeSilenced() ? " mode-silenced" : "")
                  + (mf != nullptr ? " midi-mask=0x" + juce::String::toHexString ((int) mf->getMask()) : juce::String()));
     };
+    auto input = [this, &out] (int t)
+    {
+        out.add ("  INST" + juce::String (t) + " MIDI input: " + trackMidiInputLabel (t));
+    };
     strip ("AUDIO", strips[trkAudio], nullptr);
-    for (int t = trkInst1; t < numTracks; ++t) strip ("INST" + juce::String (t), strips[t], midiFilters[t]);
+    for (int t = trkInst1; t < numTracks; ++t) { strip ("INST" + juce::String (t), strips[t], midiFilters[t]); input (t); }
     strip ("RET1", busReturn[0], nullptr);
     strip ("RET2", busReturn[1], nullptr);
     strip ("MASTER", masterStrip, nullptr);

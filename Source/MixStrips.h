@@ -133,6 +133,8 @@ private:
 //==============================================================================
 // Passes only the MIDI channels of a mask (bit 0 = channel 1). Channel-less messages (sysex, clock) pass. The default
 // mask is every channel: the node then changes nothing. One per VSTi track (docs/TRACKS.md, section on MIDI routing).
+// Live feed (the live graph): the node ignores its MIDI input and plays its own queue instead. MainComponent::routeMidi
+// fills it with what came from this track's MIDI input device (or every device), so each INST track has its own input.
 class MidiChannelFilter : public juce::AudioProcessor
 {
 public:
@@ -143,15 +145,24 @@ public:
     void setMask (juce::uint32 m) { mask.store (m & 0xFFFFu); }
     juce::uint32 getMask() const { return mask.load(); }
 
-    void prepareToPlay (double, int) override {}
+    void setLiveFeed (bool b) { liveFeed.store (b); }
+    // Any thread: a message for this track (timestamp = Time::getMillisecondCounterHiRes() * 0.001, like MidiInput's).
+    void feed (const juce::MidiMessage& m) { if (fed.load()) queue.addMessageToQueue (m); }
+
+    void prepareToPlay (double sampleRate, int block) override { queue.reset (sampleRate); blockSize = block; fed.store (true); }
     void releaseResources() override {}
 
     // Note-ons that reached this filter / that it let through (cumulative; the sound diagnostics read them).
     juce::uint32 getNotesSeen() const   { return notesSeen.load(); }
     juce::uint32 getNotesPassed() const { return notesPassed.load(); }
 
-    void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer& midi) override
+    void processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi) override
     {
+        if (liveFeed.load())
+        {
+            midi.clear();
+            queue.removeNextBlockOfMessages (midi, buffer.getNumSamples() > 0 ? buffer.getNumSamples() : juce::jmax (1, blockSize));
+        }
         const auto m = mask.load();
         if (m == 0xFFFFu)
         {
@@ -188,6 +199,9 @@ public:
 private:
     std::atomic<juce::uint32> mask { 0xFFFFu };
     std::atomic<juce::uint32> notesSeen { 0 }, notesPassed { 0 };
+    std::atomic<bool> liveFeed { false }, fed { false };
+    juce::MidiMessageCollector queue;
+    int blockSize = 512;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MidiChannelFilter)
 };

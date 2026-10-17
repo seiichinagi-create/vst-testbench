@@ -109,6 +109,7 @@ juce::var MainComponent::trackInfo (int t) const
             if ((midiFilters[t]->getMask() & (1u << (c - 1))) != 0)
                 ch.add (c);
         put (o, "midi_channels", ch);
+        put (o, "midi_input", trackMidiInputLabel (t));
     }
     if (bus)
     {
@@ -251,6 +252,58 @@ juce::var MainComponent::handleControl (const juce::var& req)
     if (cmd == "ping")   { auto o = makeObj(); put (o, "pong", true); put (o, "app", "VST TestBench"); return o; }
     if (cmd == "status") return controlStatus();
     if (cmd == "diag" || cmd == "diag_mark") return diagControl (req);
+    // midi_inputs: every MIDI input and whether it is enabled; {"enable": "<name or identifier>", "on": true|false} switches one
+    if (cmd == "midi_inputs")
+    {
+        if (req.hasProperty ("enable"))
+        {
+            const auto want = str (req, "enable");
+            bool done = false;
+            for (const auto& d : juce::MidiInput::getAvailableDevices())
+                if (d.identifier == want || d.name == want)
+                {
+                    deviceManager.setMidiInputDeviceEnabled (d.identifier, flag (req, "on", true));
+                    done = true;
+                    break;
+                }
+            if (! done) return fail ("no MIDI input named \"" + want + "\"");
+        }
+        auto o = makeObj();
+        juce::Array<juce::var> list;
+        for (const auto& d : juce::MidiInput::getAvailableDevices())
+        {
+            auto r = makeObj();
+            put (r, "name", d.name);
+            put (r, "identifier", d.identifier);
+            put (r, "enabled", deviceManager.isMidiInputDeviceEnabled (d.identifier));
+            list.add (r);
+        }
+        put (o, "inputs", list);
+        return o;
+    }
+    if (cmd == "midi_monitor")   // the last n (default 50) MIDI messages in: time, input, channel, message, tracks that took it
+    {
+        auto o = makeObj();
+        const auto entries = midiLog.snapshot (flag (req, "realtime", false));
+        const size_t n = (size_t) juce::jmax (1, (int) num (req, "n", 50));
+        juce::Array<juce::var> list;
+        for (size_t i = entries.size() > n ? entries.size() - n : 0; i < entries.size(); ++i)
+        {
+            const auto& e = entries[i];
+            auto r = makeObj();
+            put (r, "time", e.time);
+            put (r, "input", e.source);
+            put (r, "channel", e.msg.getChannel());
+            put (r, "message", e.msg.getDescription());
+            put (r, "to", MidiLog::describeTracks (e));
+            list.add (r);
+        }
+        put (o, "messages", list);
+        juce::Array<juce::var> routes;
+        for (auto& l : midiRouteInfo()) routes.add (l);
+        put (o, "routes", routes);
+        return o;
+    }
 
     // The live graph's connections as sorted "node:channel -> node:channel" lines (MIDI = "midi"): what is wired to what.
     // For checking that a change to how the graph is built (docs/TRACKS.md, P1) leaves the routing exactly as it was.
@@ -305,6 +358,11 @@ juce::var MainComponent::handleControl (const juce::var& req)
         {
             if (t < trkInst1 || t >= numTracks) return fail ("midi_channels applies to inst1, inst2 and inst3");
             midiFilters[t]->setMask (maskFromChannels (req["midi_channels"]));
+        }
+        if (req.hasProperty ("midi_input"))   // "all", or a MIDI input device's name or identifier
+        {
+            if (t < trkInst1 || t >= numTracks) return fail ("midi_input applies to inst1, inst2 and inst3");
+            setTrackMidiInput (t, str (req, "midi_input"));
         }
         if (mixerPanel != nullptr) mixerPanel->refresh();
         saveTracks();
@@ -559,11 +617,13 @@ juce::var MainComponent::handleControl (const juce::var& req)
         juce::Component* c = this;
         if (target == "fx")   c = editorWindow.get();
         if (target == "inst") c = instEditorWindow.get();
+        if (target == "midi") { showMidiMonitor(); c = midiMonitorWindow.get(); }   // opens the MIDI monitor
         if (c == nullptr) return fail ("that editor window is not open (show_editor first)");
 
         const auto img = c->createComponentSnapshot (c->getLocalBounds(), true, (float) num (req, "scale", 1.0));
         const auto file = resolvePath (str (req, "path", "shot_" + target + ".png"), appDir());
         juce::PNGImageFormat png;
+        file.deleteFile();   // createOutputStream appends: a second shot to the same name kept the first image
         std::unique_ptr<juce::OutputStream> os (file.createOutputStream());
         if (os == nullptr || ! png.writeImageToStream (img, *os)) return fail ("cannot write " + file.getFullPathName());
         os.reset();
@@ -893,7 +953,7 @@ juce::var MainComponent::handleControl (const juce::var& req)
             "list_params", "set_param", "set_params", "save_state", "load_state",
             "show_editor", "screenshot", "set_source", "load_audio", "play", "stop", "seek", "transport", "loop",
             "prerender", "rig_render", "ara_probe", "load_midi", "export_midi", "mpe", "midi_send", "midi_play", "midi_play_file", "midi_stop",
-            "record_start", "record_stop", "analyze", "audio_devices", "set_audio", "diag", "diag_mark" }).joinIntoString (" "));
+            "record_start", "record_stop", "analyze", "audio_devices", "set_audio", "diag", "diag_mark", "midi_monitor", "midi_inputs" }).joinIntoString (" "));
         put (o, "doc", "docs/CONTROL.md");
         return o;
     }

@@ -36,6 +36,7 @@ struct AudioProbe
     std::atomic<juce::uint32> nonFinite { 0 };     // blocks with NaN / Inf in the device output
     std::atomic<juce::uint32> midiHw { 0 }, midiHwNotes { 0 };   // from enabled MIDI inputs, at the player
     std::atomic<juce::uint32> midiInj { 0 }, midiInjNotes { 0 }; // injected (control server, MIDI file play)
+    std::atomic<juce::uint32> noteChannels { 0 };  // bit c-1: a note-on came on channel c, since the previous take
     std::atomic<juce::uint32> starts { 0 }, stops { 0 }, errors { 0 };
     std::atomic<juce::uint32> lastCallbackMs { 0 };
     juce::SpinLock errorLock;
@@ -109,6 +110,7 @@ public:
         float devPeak = 0.0f, maxBlockMs = 0.0f;
         juce::uint32 overBudget = 0, nonFinite = 0, midiHw = 0, midiHwNotes = 0, midiInj = 0, midiInjNotes = 0;
         juce::uint32 starts = 0, stops = 0, errors = 0;
+        juce::uint32 noteChannels = 0;             // bit c-1: note-ons on channel c since the previous tick
         juce::String lastError;
         // graph
         float stIn[numStages] {}, stOut[numStages] {};
@@ -196,6 +198,13 @@ public:
         // --- SILENT: notes came in and nothing reached the device ---
         const float floor = kAudible;
         if (f.devPeak > floor) { notesPendingMs = 0; fileSilentMs = 0; silentReported = false; }
+        // A silent spell ends after 5 s without notes: the next notes (perhaps after a settings change) are a new one.
+        if (newNotes > 0) lastNoteMs = f.ms;
+        if (notesPendingMs != 0 && newNotes == 0 && f.ms - lastNoteMs > 5000 && ! f.filePlaying)
+        {
+            notesPendingMs = 0;
+            silentReported = false;
+        }
         if (newNotes > 0 && notesPendingMs == 0 && f.devPeak <= floor)
             notesPendingMs = f.ms;
         if (notesPendingMs != 0 && ! silentReported && f.ms - notesPendingMs > 1500)
@@ -265,6 +274,7 @@ private:
         float in[numStages] {}, out[numStages] {};
         juce::uint32 callbacks = 0, overBudget = 0, notes = 0, hwNotes = 0, injNotes = 0, hwMsgs = 0, xruns = 0;
         juce::uint32 seen[3] {}, passed[3] {};
+        juce::uint32 noteChannels = 0;
         bool anyFilePlaying = false;
     };
     struct WindowFrame { juce::uint32 ms; Frame f, prev; };
@@ -283,6 +293,14 @@ private:
         if (f.xruns > p.xruns && p.xruns >= 0) a.xruns += (juce::uint32) (f.xruns - p.xruns);
         for (int t = 0; t < 3; ++t) { a.seen[t] += f.instSeen[t] - p.instSeen[t]; a.passed[t] += f.instPassed[t] - p.instPassed[t]; }
         a.anyFilePlaying = a.anyFilePlaying || f.filePlaying;
+        a.noteChannels |= f.noteChannels;
+    }
+
+    static juce::String channels (juce::uint32 m)
+    {
+        juce::StringArray c;
+        for (int i = 0; i < 16; ++i) if (m & (1u << i)) c.add (juce::String (i + 1));
+        return c.isEmpty() ? juce::String ("-") : c.joinIntoString (",");
     }
 
     static juce::String db (float v)
@@ -303,6 +321,7 @@ private:
           << (f.fileLoaded ? (f.filePlaying ? " file=play" : " file=stop") : "")
           << (f.preRender ? (f.cacheInPath ? " cache" : " prerender(nocache)") : "")
           << " | notes hw=" << (int) a.hwNotes << " inj=" << (int) a.injNotes;
+        if (a.noteChannels != 0) s << " ch=" << channels (a.noteChannels);
         for (int t = 0; t < 3; ++t)
             if (f.stPresent[stInst1 + t])
                 s << " i" << (t + 1) << "=" << (int) a.passed[t] << "/" << (int) a.seen[t];
@@ -332,7 +351,7 @@ private:
         if (a.callbacks == 0)           return "the audio callback is not running (device stalled or stopped)";
         if (a.devPeak > floor)          return "the device output had signal (" + db (a.devPeak) + " dBFS): the problem is after the bench (device routing / monitor / volume)";
         if (a.out[stMaster] > floor)    return "the master strip outputs signal but the device output is silent: the player or the device channel mapping drops it";
-        if (a.in[stMaster] > floor)     return juce::String ("signal reaches the master strip and the strip outputs nothing")
+        if (a.in[stMaster] > floor && a.out[stMaster] < a.in[stMaster] * 0.1f) return juce::String ("signal reaches the master strip and the strip outputs nothing")
                                                + (f.stSounding[stMaster] ? " (gain at -100 dB?)" : " (master muted)");
         juce::StringArray why, byMode;
         for (int st = stAudio; st < stMaster; ++st)
@@ -346,7 +365,7 @@ private:
             }
             if (a.out[st] > floor) why.add (juce::String (stageName (st)) + " outputs " + db (a.out[st]) + " dB but nothing reaches the master (routing / connections="
                                             + juce::String (f.connections) + ")");
-            else if (a.in[st] > floor) why.add (juce::String (stageName (st)) + " gets " + db (a.in[st]) + " dB and its strip silences it"
+            else if (a.in[st] > floor && a.out[st] < a.in[st] * 0.1f) why.add (juce::String (stageName (st)) + " gets " + db (a.in[st]) + " dB and its strip silences it"
                                                 + (f.stSounding[st] ? " (gain?)" : " (mute / solo / source-mode preset)"));
         }
         if (! why.isEmpty()) return why.joinIntoString ("; ");
@@ -361,8 +380,9 @@ private:
             {
                 if (! f.stPresent[stInst1 + t]) continue;
                 anyInst = true;
-                if (a.seen[t] == 0)        src.add ("INST" + juce::String (t + 1) + ": no note reached its MIDI filter (MIDI not routed into the graph)");
-                else if (a.passed[t] == 0) src.add ("INST" + juce::String (t + 1) + ": its MIDI channel mask dropped all " + juce::String ((int) a.seen[t]) + " notes");
+                if (a.seen[t] == 0)        src.add ("INST" + juce::String (t + 1) + ": no note reached its MIDI filter (its MIDI input device is another one?)");
+                else if (a.passed[t] == 0) src.add ("INST" + juce::String (t + 1) + ": its MIDI channel mask dropped all " + juce::String ((int) a.seen[t])
+                                                    + " notes (they came on ch " + channels (a.noteChannels) + ")");
                 else                       src.add ("INST" + juce::String (t + 1) + ": got " + juce::String ((int) a.passed[t]) + " notes and produced no audio (the plug-in is silent)");
             }
             if (! anyInst) src.add ("notes arrived but no instrument is loaded");
@@ -482,7 +502,7 @@ private:
     Acc sec;
     std::deque<WindowFrame> window;
     juce::uint32 secondStartMs = 0, lastCbAdvanceMs = 0, lastWrittenStatusMs = 0;
-    juce::uint32 notesPendingMs = 0, fileSilentMs = 0;
+    juce::uint32 notesPendingMs = 0, fileSilentMs = 0, lastNoteMs = 0;
     bool stallReported = false, silentReported = false;
     int incidents = 0;
     juce::String lastIncident, summary, lastStatusBody;

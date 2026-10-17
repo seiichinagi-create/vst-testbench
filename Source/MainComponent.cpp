@@ -60,6 +60,7 @@ MainComponent::MainComponent()
         stripNode[t] = graph.addNode (std::move (st));
         auto mf = std::make_unique<MidiChannelFilter>();
         midiFilters[t] = mf.get();
+        mf->setLiveFeed (true);      // live: the track's own input (routeMidi), not the merged MIDI input node
         midiFilterNode[t] = graph.addNode (std::move (mf));
     }
     {
@@ -113,6 +114,12 @@ MainComponent::MainComponent()
         hooks.describe = [this] (int i, bool insert) { return describeTrack (i, insert); };
         hooks.soloChanged = [this] { updateSolo(); };
         hooks.sendChanged = [this] { markBakeDirty(); };
+        hooks.getMidiInput = [this] (int i)
+        {
+            const juce::SpinLock::ScopedLockType sl (midiRouteLock);
+            return i >= trkInst1 && i < numTracks ? trackMidiInId[i] : juce::String();
+        };
+        hooks.setMidiInput = [this] (int i, const juce::String& id) { setTrackMidiInput (i, id); };
         hooks.stripChanged = [this] (int i)
         {
             if (i < numTracks)                            markMixChanged (i);
@@ -137,14 +144,14 @@ MainComponent::MainComponent()
     player.setProcessor (&graph);
     graph.setPlayHead (&liveTransport);
     deviceManager.addAudioCallback (&player);
-    deviceManager.addMidiInputDeviceCallback ({}, &player);   // feed MIDI into graph (for VSTi)
-    deviceManager.addMidiInputDeviceCallback ({}, this);      // our own MIDI thru path
+    deviceManager.addMidiInputDeviceCallback ({}, this);      // every hardware message: tracks (routeMidi), thru, take recorder
     rebuildConnections();
 
     // === UI ===
     auto addBtn = [this] (juce::Button& b) { addAndMakeVisible (b); };
     addBtn (audioSettingsButton); addBtn (resetAudioButton);
-    addBtn (noSoundButton);       addBtn (diagLogButton);
+    addBtn (noSoundButton);       addBtn (diagLogButton);       addBtn (midiMonitorButton);
+    midiMonitorButton.onClick = [this] { showMidiMonitor(); };
     addAndMakeVisible (diagLabel);
     diagLabel.setFont (juce::FontOptions (11.0f));
     diagLabel.setColour (juce::Label::textColourId, juce::Colours::grey);
@@ -508,7 +515,6 @@ MainComponent::~MainComponent()
     for (auto& sl : insertSlot) { sl.editor = nullptr; if (sl.node != nullptr) sl.node->getProcessor()->removeListener (this); }
     for (auto& sl : busSlot)    { sl.editor = nullptr; if (sl.node != nullptr) sl.node->getProcessor()->removeListener (this); }
     deviceManager.removeMidiInputDeviceCallback ({}, this);
-    deviceManager.removeMidiInputDeviceCallback ({}, &player);
     midiRecorder.closeAndSave();   // an open take survives app close
     deviceManager.removeAudioCallback (&player);
     deviceManager.removeChangeListener (this);
@@ -925,7 +931,12 @@ void MainComponent::saveTracks() const
         o->setProperty ("gain_db", (double) st->getGainDb());
         o->setProperty ("balance", (double) st->getBalance());
         if (t >= trkInst1 && t < numTracks)
+        {
             o->setProperty ("midi_mask", (int) midiFilters[t]->getMask());
+            const juce::SpinLock::ScopedLockType sl (midiRouteLock);
+            o->setProperty ("midi_input_id", trackMidiInId[t]);
+            o->setProperty ("midi_input_name", trackMidiInName[t]);
+        }
         if (t < numTracks)
         {
             o->setProperty ("send1_db", (double) sendLevel[t][0]->getGainDb());
@@ -978,6 +989,16 @@ void MainComponent::loadTracks()
         st->setBalance ((float) (double) e.getProperty ("balance", 0.0));
         if (t >= trkInst1 && t < numTracks && e.hasProperty ("midi_mask"))
             midiFilters[t]->setMask ((juce::uint32) (int) e["midi_mask"]);
+        if (t >= trkInst1 && t < numTracks && e["midi_input_id"].toString().isNotEmpty())
+        {
+            // the identifier first; a device that came back under another identifier is found by its name
+            juce::String id = e["midi_input_id"].toString(), inName = e["midi_input_name"].toString();
+            for (const auto& d : juce::MidiInput::getAvailableDevices())
+                if (d.identifier == id || (d.name == inName && inName.isNotEmpty())) { id = d.identifier; inName = d.name; break; }
+            const juce::SpinLock::ScopedLockType sl (midiRouteLock);
+            trackMidiInId[t] = id;
+            trackMidiInName[t] = inName;
+        }
     }
 }
 
@@ -2078,9 +2099,7 @@ void MainComponent::injectMidi (const juce::MidiMessage& m)
 {
     auto msg = m;
     msg.setTimeStamp (juce::Time::getMillisecondCounterHiRes() * 0.001);
-    player.getMidiMessageCollector().addMessageToQueue (msg);   // same entry as a hardware keyboard
-    player.probe.midiInj.fetch_add (1);
-    if (msg.isNoteOn()) player.probe.midiInjNotes.fetch_add (1);
+    routeMidi (msg, nullptr);   // every INST track (by channel) and the master FX
     midiRecorder.handleMessage (msg);
     if (midiThru.load())
     {
@@ -2135,8 +2154,9 @@ void MainComponent::setMpeEnabled (bool on, bool rebounce)
 }
 
 //==============================================================================
-void MainComponent::handleIncomingMidiMessage (juce::MidiInput*, const juce::MidiMessage& m)
+void MainComponent::handleIncomingMidiMessage (juce::MidiInput* source, const juce::MidiMessage& m)
 {
+    routeMidi (m, source);
     midiRecorder.handleMessage (m);   // dashcam capture, independent of the thru switch
 
     if (! midiThru.load()) return;
@@ -2383,6 +2403,8 @@ void MainComponent::resized()
         diagLogButton.setBounds (top.removeFromRight (66));
         top.removeFromRight (4);
         noSoundButton.setBounds (top.removeFromRight (80));
+        top.removeFromRight (4);
+        midiMonitorButton.setBounds (top.removeFromRight (96));
         top.removeFromRight (6);
         top.removeFromLeft (300);                       // title + AI control port (painted)
         diagLabel.setBounds (top);

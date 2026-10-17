@@ -22,6 +22,9 @@ public:
         std::function<void()> soloChanged;                               // a solo button was pressed: the host recomputes who is silenced
         std::function<void (int index)> stripChanged;                    // gain / balance / mute / MIDI channels (index as above; 6 = master)
         std::function<void()> sendChanged;                               // a send level moved
+        // INST tracks: the MIDI input device ("" = all inputs)
+        std::function<juce::String (int index)> getMidiInput;
+        std::function<void (int index, const juce::String& identifier)> setMidiInput;
     };
 
     // what the strips drive
@@ -40,6 +43,16 @@ public:
             addAndMakeVisible (*views[i]);
         }
         startTimerHz (30);
+    }
+
+    // The MIDI inputs, enumerated at most once a second (three strips refresh twice a second each).
+    static juce::Array<juce::MidiDeviceInfo> availableInputs()
+    {
+        static juce::Array<juce::MidiDeviceInfo> cached;
+        static juce::uint32 when = 0;
+        const auto now = juce::Time::getMillisecondCounter();
+        if (when == 0 || now - when > 1000) { cached = juce::MidiInput::getAvailableDevices(); when = now; }
+        return cached;
     }
 
     // "all", "none", or "1,3,5-8" -> a channel mask (bit 0 = channel 1)
@@ -130,6 +143,14 @@ private:
             }
             if (filter != nullptr)
             {
+                midiIn.setTooltip ("MIDI input device this track listens to (All = every enabled input). Channels below.");
+                midiIn.onChange = [this]
+                {
+                    const int i = midiIn.getSelectedItemIndex();
+                    if (i < 0 || i >= deviceIds.size() || updatingInputs) return;
+                    if (owner.hooks.setMidiInput) owner.hooks.setMidiInput (index, deviceIds[i]);
+                };
+                addAndMakeVisible (midiIn);
                 midi.setTextToShowWhenEmpty ("channels", juce::Colours::grey);
                 midi.setFont (juce::FontOptions (12.0f));
                 midi.setTooltip ("MIDI channels this track listens to: all, none, or e.g. 1,3,5-8");
@@ -240,6 +261,28 @@ private:
                 mute.setToggleState (strip->isMuted(), juce::dontSendNotification);
             if (filter != nullptr && ! midi.hasKeyboardFocus (true))
                 midi.setText (formatChannels (filter->getMask()), juce::dontSendNotification);
+            if (filter != nullptr && ! midiIn.isPopupActive())
+                refreshInputs();
+        }
+
+        // The input list follows what is plugged in; the selection follows the host (control API, tracks.json).
+        void refreshInputs()
+        {
+            const auto current = owner.hooks.getMidiInput ? owner.hooks.getMidiInput (index) : juce::String();
+            juce::StringArray ids { "" }, names { "All MIDI inputs" };
+            for (const auto& d : availableInputs()) { ids.add (d.identifier); names.add (d.name); }
+            if (current.isNotEmpty() && ! ids.contains (current)) { ids.add (current); names.add ("(not connected)"); }
+            const juce::ScopedValueSetter<bool> svs (updatingInputs, true);
+            if (ids != deviceIds || names != deviceNames)
+            {
+                deviceIds = ids;
+                deviceNames = names;
+                midiIn.clear (juce::dontSendNotification);
+                for (int i = 0; i < names.size(); ++i) midiIn.addItem (names[i], i + 1);
+            }
+            const int want = deviceIds.indexOf (current);
+            if (midiIn.getSelectedItemIndex() != want)
+                midiIn.setSelectedItemIndex (juce::jmax (0, want), juce::dontSendNotification);
         }
 
         void tick()
@@ -270,6 +313,8 @@ private:
             }
             if (filter != nullptr)
             {
+                midiIn.setBounds (r.removeFromTop (20));
+                r.removeFromTop (2);
                 midi.setBounds (r.removeFromTop (20));
                 r.removeFromTop (3);
             }
@@ -354,6 +399,9 @@ private:
         juce::TextButton insLoadBtn { "Ins" }, insUiBtn { "UI" }, insDelBtn { "x" };
         juce::TextButton mute, solo;
         juce::TextEditor midi;
+        juce::ComboBox midiIn;
+        juce::StringArray deviceIds, deviceNames;
+        bool updatingInputs = false;
         juce::Slider gain, balance, sendSlider[2];
         juce::Rectangle<int> meterArea;
         float meterL = 0.0f, meterR = 0.0f;

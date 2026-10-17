@@ -14,6 +14,7 @@
 #include "MixerPanel.h"
 #include "RigWorkerClient.h"
 #include "ControlServer.h"
+#include "MidiMonitor.h"
 
 //==============================================================================
 // Lightweight VST3 test-bench host.
@@ -279,6 +280,20 @@ private:
 
     //== sound diagnostics (SoundDiag.h, SoundDiagHost.cpp): %APPDATA%\VstTestBench\diag\diag_<start>.txt ==
     SoundDiag soundDiag;
+
+    //== MIDI input per INST track (MidiInputs.cpp): each track listens to one input device (or all) and its channels ==
+    // Hardware MIDI no longer goes through the player: handleIncomingMidiMessage knows which device sent it and routeMidi
+    // feeds the tracks whose input matches (their MidiChannelFilter then applies the channel mask). Injected MIDI (control
+    // server, midi_play, MPE setup) reaches every track. The master FX still gets everything through the player.
+    juce::SpinLock midiRouteLock;
+    juce::String trackMidiInId[numTracks], trackMidiInName[numTracks];   // "" = every enabled input
+    void routeMidi (const juce::MidiMessage&, juce::MidiInput* source);   // source nullptr = injected
+    void setTrackMidiInput (int track, const juce::String& identifierOrName);   // "" / "all" = every input
+    juce::String trackMidiInputLabel (int track) const;
+    juce::StringArray midiRouteInfo() const;
+    MidiLog midiLog;
+    std::unique_ptr<MidiMonitorWindow> midiMonitorWindow;
+    void showMidiMonitor();
     void startSoundDiag();
     void tickSoundDiag();                    // timer: one frame of what the audio path is doing
     juce::String describeForDiag() const;    // detail block of an incident / mark: device, MIDI inputs, nodes, strips, wiring
@@ -329,6 +344,7 @@ private:
     juce::TextButton   resetAudioButton    { "Reset ASIO" };
     juce::TextButton   noSoundButton       { "No sound!" };   // writes a MARK with the diagnosis into the diag log
     juce::TextButton   diagLogButton       { "Diag log" };
+    juce::TextButton   midiMonitorButton   { "MIDI Monitor" };
     juce::Label        diagLabel;
     juce::ComboBox     sourceCombo;
     juce::Label        sourceLabel { {}, "Source:" };

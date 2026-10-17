@@ -82,13 +82,6 @@ public:
         juce::AudioProcessorPlayer::audioDeviceError (message);
     }
 
-    void handleIncomingMidiMessage (juce::MidiInput* source, const juce::MidiMessage& m) override
-    {
-        probe.midiHw.fetch_add (1);
-        if (m.isNoteOn()) probe.midiHwNotes.fetch_add (1);
-        juce::AudioProcessorPlayer::handleIncomingMidiMessage (source, m);
-    }
-
     void audioDeviceIOCallbackWithContext (const float* const* in, int nIn, float* const* out, int nOut,
                                            int numSamples, const juce::AudioIODeviceCallbackContext& ctx) override
     {

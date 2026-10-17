@@ -82,3 +82,14 @@ disappeared) and a detail block (device, MIDI inputs, nodes, strips, wiring with
 
 - `{"cmd":"diag","n":60}` -> `log`, `incidents`, `last_incident`, `summary`, `lines` (the last n log lines)
 - `{"cmd":"diag_mark","note":"..."}` -> writes a MARK with the diagnosis over the last 3 s (the same as the No sound! button), then as `diag`
+
+## MIDI input per track and the MIDI monitor
+
+Each INST track listens to one MIDI input device (or all enabled inputs) and to its channels. Hardware MIDI is routed
+by the bench itself (the device is known), injected MIDI (midi_send, midi_play, MPE setup) reaches every track; the
+channel mask applies to both. The master FX still gets every message.
+
+- `{"cmd":"track_set","track":"inst2","midi_input":"Launchkey Mini MK4 37 MIDI"}` (a name, a part of one, an identifier, or `"all"`); choosing a device enables it
+- `{"cmd":"midi_inputs"}` -> every input with `enabled`; `{"cmd":"midi_inputs","enable":"<name>","on":false}` switches one
+- `{"cmd":"midi_monitor","n":50,"realtime":false}` -> `messages` (time, input, channel, message, to = the tracks that took it, or "none (dropped)") and `routes`
+- `{"cmd":"screenshot","target":"midi"}` opens the MIDI Monitor window and captures it
