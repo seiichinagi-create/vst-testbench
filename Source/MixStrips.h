@@ -40,6 +40,9 @@ public:
     // Peak since the previous read, per side (the meter's source).
     float takePeakL() { return peakL.exchange (0.0f); }
     float takePeakR() { return peakR.exchange (0.0f); }
+    // The same for the sound diagnostics (SoundDiag.h), on both sides of the gain: "signal arrives but the strip silences it".
+    float takeDiagIn()  { return diagIn.exchange (0.0f); }
+    float takeDiagOut() { return diagOut.exchange (0.0f); }
 
     // What the strip does to the signal, as two linear gains (testable without a graph).
     static void gains (float gainDbValue, float balanceValue, bool mutedValue, float& left, float& right)
@@ -60,6 +63,13 @@ public:
         float tl, tr;
         gains (gainDb.load(), balance.load(), muted.load() || soloSilenced.load() || modeSilenced.load(), tl, tr);
         if (first) { lastL = tl; lastR = tr; first = false; }
+
+        {
+            float pkIn = 0.0f;
+            for (int ch = 0; ch < juce::jmin (2, chans); ++ch)
+                pkIn = juce::jmax (pkIn, buffer.getMagnitude (ch, 0, n));
+            raise (diagIn, pkIn);
+        }
 
         const float targets[2] = { tl, tr };
         float* last[2] = { &lastL, &lastR };
@@ -88,7 +98,14 @@ public:
             for (int i = 0; i < n; ++i) pk = juce::jmax (pk, std::abs (d[i]));
             float cur = peaks[ch]->load();
             while (pk > cur && ! peaks[ch]->compare_exchange_weak (cur, pk)) {}
+            raise (diagOut, pk);
         }
+    }
+
+    static void raise (std::atomic<float>& a, float v)
+    {
+        float cur = a.load();
+        while (v > cur && ! a.compare_exchange_weak (cur, v)) {}
     }
 
     double getTailLengthSeconds() const override { return 0.0; }
@@ -105,7 +122,7 @@ public:
     void setStateInformation (const void*, int) override {}
 
 private:
-    std::atomic<float> gainDb { 0.0f }, balance { 0.0f }, peakL { 0.0f }, peakR { 0.0f };
+    std::atomic<float> gainDb { 0.0f }, balance { 0.0f }, peakL { 0.0f }, peakR { 0.0f }, diagIn { 0.0f }, diagOut { 0.0f };
     std::atomic<bool> muted { false }, solo { false }, soloSilenced { false }, modeSilenced { false };
     float lastL = 1.0f, lastR = 1.0f;   // audio thread only
     bool first = true;
@@ -129,17 +146,27 @@ public:
     void prepareToPlay (double, int) override {}
     void releaseResources() override {}
 
+    // Note-ons that reached this filter / that it let through (cumulative; the sound diagnostics read them).
+    juce::uint32 getNotesSeen() const   { return notesSeen.load(); }
+    juce::uint32 getNotesPassed() const { return notesPassed.load(); }
+
     void processBlock (juce::AudioBuffer<float>&, juce::MidiBuffer& midi) override
     {
         const auto m = mask.load();
         if (m == 0xFFFFu)
+        {
+            for (const auto meta : midi)
+                if (meta.getMessage().isNoteOn()) { notesSeen.fetch_add (1); notesPassed.fetch_add (1); }
             return;
+        }
         juce::MidiBuffer kept;
         for (const auto meta : midi)
         {
             const auto msg = meta.getMessage();
             const int ch = msg.getChannel();                 // 1..16, 0 for channel-less messages
-            if (ch == 0 || (m & (1u << (ch - 1))) != 0)
+            const bool pass = ch == 0 || (m & (1u << (ch - 1))) != 0;
+            if (msg.isNoteOn()) { notesSeen.fetch_add (1); if (pass) notesPassed.fetch_add (1); }
+            if (pass)
                 kept.addEvent (msg, meta.samplePosition);
         }
         midi.swapWith (kept);
@@ -160,6 +187,7 @@ public:
 
 private:
     std::atomic<juce::uint32> mask { 0xFFFFu };
+    std::atomic<juce::uint32> notesSeen { 0 }, notesPassed { 0 };
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (MidiChannelFilter)
 };

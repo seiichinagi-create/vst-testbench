@@ -28,6 +28,7 @@ target_sources(VstTestBench PRIVATE
     Source/Main.cpp
     Source/MainComponent.cpp
     Source/ControlCommands.cpp
+    Source/SoundDiagHost.cpp
 )
 
 if(MSVC)

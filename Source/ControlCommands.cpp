@@ -250,6 +250,7 @@ juce::var MainComponent::handleControl (const juce::var& req)
 
     if (cmd == "ping")   { auto o = makeObj(); put (o, "pong", true); put (o, "app", "VST TestBench"); return o; }
     if (cmd == "status") return controlStatus();
+    if (cmd == "diag" || cmd == "diag_mark") return diagControl (req);
 
     // The live graph's connections as sorted "node:channel -> node:channel" lines (MIDI = "midi"): what is wired to what.
     // For checking that a change to how the graph is built (docs/TRACKS.md, P1) leaves the routing exactly as it was.
@@ -892,7 +893,7 @@ juce::var MainComponent::handleControl (const juce::var& req)
             "list_params", "set_param", "set_params", "save_state", "load_state",
             "show_editor", "screenshot", "set_source", "load_audio", "play", "stop", "seek", "transport", "loop",
             "prerender", "rig_render", "ara_probe", "load_midi", "export_midi", "mpe", "midi_send", "midi_play", "midi_play_file", "midi_stop",
-            "record_start", "record_stop", "analyze", "audio_devices", "set_audio" }).joinIntoString (" "));
+            "record_start", "record_stop", "analyze", "audio_devices", "set_audio", "diag", "diag_mark" }).joinIntoString (" "));
         put (o, "doc", "docs/CONTROL.md");
         return o;
     }

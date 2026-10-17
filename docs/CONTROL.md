@@ -71,3 +71,14 @@ Events: `{"t":0.5,"type":"note_on","ch":2,"note":60,"vel":100,"dur":1.0}`; types
 
 Typical loop: `load_plugin` -> `set_param` -> `load_midi` (or `midi_play` + `record_start`) -> `analyze` -> adjust.
 Auto backend is on by default: `set_source file` switches to WASAPI, `inst`/`live` to ASIO.
+
+## Sound diagnostics
+
+The bench logs what the audio path does to `%APPDATA%\VstTestBench\diag\diag_<start>.txt` (the 30 newest are kept).
+`S` lines (one per second while anything happens, a heartbeat every 30 s otherwise) carry the callbacks, the longest block,
+the notes (hardware / injected, and passed/seen at each INST filter) and the peaks on both sides of every strip and at the device.
+`!!!` lines are incidents (SILENT, STALL, NONFINITE, DEVICE ERROR, HANG) with a diagnosis (the first stage where the signal
+disappeared) and a detail block (device, MIDI inputs, nodes, strips, wiring with node ids). "Audible" means above -60 dBFS.
+
+- `{"cmd":"diag","n":60}` -> `log`, `incidents`, `last_incident`, `summary`, `lines` (the last n log lines)
+- `{"cmd":"diag_mark","note":"..."}` -> writes a MARK with the diagnosis over the last 3 s (the same as the No sound! button), then as `diag`

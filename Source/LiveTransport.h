@@ -1,6 +1,7 @@
 #pragma once
 #include <JuceHeader.h>
 #include <atomic>
+#include "SoundDiag.h"
 
 // What the live host tells a plug-in about the transport (tempo, position, playing). The rig has its own
 // (RigRender::RigPlayHead); this one is advanced by the live audio callback, one block at a time.
@@ -58,19 +59,47 @@ class TransportPlayer : public juce::AudioProcessorPlayer
 public:
     explicit TransportPlayer (LiveTransport& t) : transport (t) {}
 
+    // Sound diagnostics (SoundDiag.h): the player reports what the device actually got.
+    AudioProbe probe;
+
     void audioDeviceAboutToStart (juce::AudioIODevice* d) override
     {
         transport.setRate (d->getCurrentSampleRate());
+        rate.store (d->getCurrentSampleRate());
+        probe.starts.fetch_add (1);
         juce::AudioProcessorPlayer::audioDeviceAboutToStart (d);
+    }
+
+    void audioDeviceStopped() override
+    {
+        probe.stops.fetch_add (1);
+        juce::AudioProcessorPlayer::audioDeviceStopped();
+    }
+
+    void audioDeviceError (const juce::String& message) override
+    {
+        probe.onError (message);
+        juce::AudioProcessorPlayer::audioDeviceError (message);
+    }
+
+    void handleIncomingMidiMessage (juce::MidiInput* source, const juce::MidiMessage& m) override
+    {
+        probe.midiHw.fetch_add (1);
+        if (m.isNoteOn()) probe.midiHwNotes.fetch_add (1);
+        juce::AudioProcessorPlayer::handleIncomingMidiMessage (source, m);
     }
 
     void audioDeviceIOCallbackWithContext (const float* const* in, int nIn, float* const* out, int nOut,
                                            int numSamples, const juce::AudioIODeviceCallbackContext& ctx) override
     {
+        const auto t0 = juce::Time::getHighResolutionTicks();
         juce::AudioProcessorPlayer::audioDeviceIOCallbackWithContext (in, nIn, out, nOut, numSamples, ctx);
         transport.advance (numSamples);
+        probe.onBlock (out, nOut, numSamples,
+                       juce::Time::highResolutionTicksToSeconds (juce::Time::getHighResolutionTicks() - t0), rate.load());
     }
 
 private:
     LiveTransport& transport;
+    std::atomic<double> rate { 48000.0 };
 };

@@ -276,6 +276,13 @@ private:
     MidiScheduler midiScheduler { [this] (const juce::MidiMessage& m) { injectMidi (m); } };
     ControlServer controlServer { [this] (const juce::var& r) { return handleControl (r); } };
     int controlPort = 0;
+
+    //== sound diagnostics (SoundDiag.h, SoundDiagHost.cpp): %APPDATA%\VstTestBench\diag\diag_<start>.txt ==
+    SoundDiag soundDiag;
+    void startSoundDiag();
+    void tickSoundDiag();                    // timer: one frame of what the audio path is doing
+    juce::String describeForDiag() const;    // detail block of an incident / mark: device, MIDI inputs, nodes, strips, wiring
+    juce::var diagControl (const juce::var& request);
     juce::File mpeFile() const;
     juce::File tracksFile() const;         // tracks.json: strip gain / balance and the INST MIDI channels (not mute / solo)
     void saveTracks() const;
@@ -320,6 +327,9 @@ private:
     //== UI ==
     juce::TextButton   audioSettingsButton { "Audio / MIDI Settings" };
     juce::TextButton   resetAudioButton    { "Reset ASIO" };
+    juce::TextButton   noSoundButton       { "No sound!" };   // writes a MARK with the diagnosis into the diag log
+    juce::TextButton   diagLogButton       { "Diag log" };
+    juce::Label        diagLabel;
     juce::ComboBox     sourceCombo;
     juce::Label        sourceLabel { {}, "Source:" };
     juce::ToggleButton autoBackendButton { "Auto backend (file=WASAPI / live=ASIO)" };

@@ -30,6 +30,7 @@ MainComponent::MainComponent()
     juce::addDefaultFormatsToManager (formatManager);
     audioFormats.registerBasicFormats();
     loadKnownPlugins();
+    startSoundDiag();       // before the device opens: its first moves are logged too
 
     // --- audio + MIDI device ---
     std::unique_ptr<juce::XmlElement> savedAudio (juce::XmlDocument::parse (audioStateFile()));
@@ -143,6 +144,17 @@ MainComponent::MainComponent()
     // === UI ===
     auto addBtn = [this] (juce::Button& b) { addAndMakeVisible (b); };
     addBtn (audioSettingsButton); addBtn (resetAudioButton);
+    addBtn (noSoundButton);       addBtn (diagLogButton);
+    addAndMakeVisible (diagLabel);
+    diagLabel.setFont (juce::FontOptions (11.0f));
+    diagLabel.setColour (juce::Label::textColourId, juce::Colours::grey);
+    noSoundButton.setTooltip ("Heard nothing? Click: the diag log gets a MARK with what the audio path did in the last 3 seconds");
+    noSoundButton.onClick = [this]
+    {
+        soundDiag.mark ("user: no sound");
+        setStatus ("Marked in the diag log: " + soundDiag.getLogFile().getFileName());
+    };
+    diagLogButton.onClick = [this] { soundDiag.getLogFile().revealToUser(); };
     addBtn (loadButton); addBtn (editorButton);
     addBtn (clearButton);         addBtn (bypassButton); addBtn (midiThruButton);
     addBtn (loadInstButton);      addBtn (instEditorButton); addBtn (clearInstButton);
@@ -155,6 +167,7 @@ MainComponent::MainComponent()
         // One-click recovery when the ASIO driver goes irregular (post-xrun).
         const bool wasPlaying = filePlayer->transport.isPlaying();
         filePlayer->transport.stop();
+        soundDiag.event ("user: Reset ASIO");
         deviceManager.closeAudioDevice();
         deviceManager.restartLastAudioDevice();
         rebuildConnections();
@@ -473,6 +486,8 @@ MainComponent::MainComponent()
 
 MainComponent::~MainComponent()
 { setLookAndFeel (nullptr);
+    soundDiag.event ("app closing");
+    soundDiag.stop();
     saveTracks();
     mixerPanel = nullptr;
     stopTimer();
@@ -628,6 +643,7 @@ int MainComponent::currentSourceMode() const
 
 void MainComponent::setStatus (const juce::String& s)
 {
+    soundDiag.event ("status: " + s);
     statusLabel.setText (s, juce::dontSendNotification);
 }
 
@@ -1221,6 +1237,8 @@ void MainComponent::rebuildConnections()
 
     if (mixerPanel != nullptr)
         mixerPanel->refresh();     // what the strips say follows what is loaded
+    soundDiag.event ("graph rebuilt: " + juce::String ((int) graph.getConnections().size()) + " connections, source mode "
+                     + juce::String (mode) + (baked ? ", cache in path" : ""));
 }
 
 //==============================================================================
@@ -2061,6 +2079,8 @@ void MainComponent::injectMidi (const juce::MidiMessage& m)
     auto msg = m;
     msg.setTimeStamp (juce::Time::getMillisecondCounterHiRes() * 0.001);
     player.getMidiMessageCollector().addMessageToQueue (msg);   // same entry as a hardware keyboard
+    player.probe.midiInj.fetch_add (1);
+    if (msg.isNoteOn()) player.probe.midiInjNotes.fetch_add (1);
     midiRecorder.handleMessage (msg);
     if (midiThru.load())
     {
@@ -2133,6 +2153,8 @@ void MainComponent::changeListenerCallback (juce::ChangeBroadcaster*)
 
 void MainComponent::timerCallback()
 {
+    tickSoundDiag();
+
     // --- PRE-RENDER housekeeping ---
     if (mixBakeMode && preRenderActive())
     {
@@ -2357,6 +2379,13 @@ void MainComponent::resized()
         resetAudioButton.setBounds (top.removeFromRight (100));
         top.removeFromRight (6);
         audioSettingsButton.setBounds (top.removeFromRight (150));
+        top.removeFromRight (6);
+        diagLogButton.setBounds (top.removeFromRight (66));
+        top.removeFromRight (4);
+        noSoundButton.setBounds (top.removeFromRight (80));
+        top.removeFromRight (6);
+        top.removeFromLeft (300);                       // title + AI control port (painted)
+        diagLabel.setBounds (top);
     }
     full.removeFromTop (10);
 
