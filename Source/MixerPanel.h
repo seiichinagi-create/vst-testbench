@@ -151,13 +151,20 @@ private:
                     if (owner.hooks.setMidiInput) owner.hooks.setMidiInput (index, deviceIds[i]);
                 };
                 addAndMakeVisible (midiIn);
-                midi.setTextToShowWhenEmpty ("channels", juce::Colours::grey);
-                midi.setFont (juce::FontOptions (12.0f));
-                midi.setTooltip ("MIDI channels this track listens to: all, none, or e.g. 1,3,5-8");
-                midi.onReturnKey = midi.onFocusLost = [this]
+                // MIDI channels: All, one channel, None, or several through "Multiple..." (each click toggles one)
+                midi.addItem ("All channels", chAll);
+                for (int c = 1; c <= 16; ++c) midi.addItem ("Ch " + juce::String (c), chFirst + c - 1);
+                midi.addItem ("None", chNone);
+                midi.addSeparator();
+                midi.addItem ("Multiple...", chMulti);
+                midi.setTooltip ("MIDI channels this track listens to (Multiple...: tick several)");
+                midi.onChange = [this]
                 {
-                    filter->setMask (parseChannels (midi.getText()));
-                    midi.setText (formatChannels (filter->getMask()), juce::dontSendNotification);
+                    const int id = midi.getSelectedId();
+                    if (id == 0 || updatingChannels) return;
+                    if (id == chMulti) { showChannelTicks(); return; }
+                    filter->setMask (id == chAll ? 0xFFFFu : id == chNone ? 0u : 1u << (id - chFirst));
+                    showChannels();
                     changed();
                 };
                 addAndMakeVisible (midi);
@@ -259,10 +266,44 @@ private:
                 solo.setToggleState (strip->isSolo(), juce::dontSendNotification);
             if (mute.getToggleState() != strip->isMuted())
                 mute.setToggleState (strip->isMuted(), juce::dontSendNotification);
-            if (filter != nullptr && ! midi.hasKeyboardFocus (true))
-                midi.setText (formatChannels (filter->getMask()), juce::dontSendNotification);
+            if (filter != nullptr && ! midi.isPopupActive())
+                showChannels();
             if (filter != nullptr && ! midiIn.isPopupActive())
                 refreshInputs();
+        }
+
+        enum { chAll = 1, chFirst = 2, chNone = 18, chMulti = 19 };
+
+        // The box shows the filter's mask: an item when it is one, else its text ("1,3,5-8").
+        void showChannels()
+        {
+            const auto m = filter->getMask() & 0xFFFFu;
+            int id = 0;
+            if (m == 0xFFFFu)                id = chAll;
+            else if (m == 0)                 id = chNone;
+            else if ((m & (m - 1)) == 0)     for (int c = 0; c < 16; ++c) if (m == (1u << c)) id = chFirst + c;
+            const juce::ScopedValueSetter<bool> svs (updatingChannels, true);
+            if (id != 0) { if (midi.getSelectedId() != id) midi.setSelectedId (id, juce::dontSendNotification); }
+            else if (midi.getText() != "Ch " + formatChannels (m)) midi.setText ("Ch " + formatChannels (m), juce::dontSendNotification);
+        }
+
+        // "Multiple...": a ticked list; a click toggles that channel and the list opens again until dismissed.
+        void showChannelTicks()
+        {
+            showChannels();
+            juce::PopupMenu menu;
+            const auto m = filter->getMask();
+            for (int c = 0; c < 16; ++c)
+                menu.addItem (c + 1, "Ch " + juce::String (c + 1), true, (m & (1u << c)) != 0);
+            juce::Component::SafePointer<StripView> self (this);
+            menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (&midi), [self] (int r)
+            {
+                if (self == nullptr || r <= 0) return;
+                self->filter->setMask (self->filter->getMask() ^ (1u << (r - 1)));
+                self->showChannels();
+                self->changed();
+                self->showChannelTicks();
+            });
         }
 
         // The input list follows what is plugged in; the selection follows the host (control API, tracks.json).
@@ -398,7 +439,8 @@ private:
         juce::TextButton loadBtn { "Load" }, uiBtn { "UI" }, delBtn { "x" };
         juce::TextButton insLoadBtn { "Ins" }, insUiBtn { "UI" }, insDelBtn { "x" };
         juce::TextButton mute, solo;
-        juce::TextEditor midi;
+        juce::ComboBox midi;
+        bool updatingChannels = false;
         juce::ComboBox midiIn;
         juce::StringArray deviceIds, deviceNames;
         bool updatingInputs = false;
