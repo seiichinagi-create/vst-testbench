@@ -134,6 +134,38 @@ def bat_paren_offenders(text: str):
             yield no
 
 
+ESCAPE_SUFFIXES = {".c", ".cc", ".cpp", ".cxx", ".h", ".hpp", ".hxx", ".m", ".mm",
+                   ".py", ".js", ".ts", ".jsx", ".tsx"}
+
+_LITERAL = re.compile(r"""(?P<pre>\b[rRbBfFuU8]{1,2})?(?P<q>["'])(?P<body>(?:\\.|(?!(?P=q)).)*)(?P=q)""")
+# The drive letter starts the literal or follows a space = ; , ( - so "%p:" then
+# backslash-n in a printf format is not taken for a drive.
+_DRIVE_ONE_SLASH = re.compile(r"(?:^|(?<=[\s=;,(]))[A-Za-z]:\\(?!\\)")
+
+
+def path_escape_suspects(line: str, path: str) -> bool:
+    r"""A string literal that holds a Windows path written with single backslashes,
+    in a language where the backslash starts an escape: the path C:/temp/new
+    typed with single backslashes holds a tab and a newline when the program
+    runs, and nothing at commit time can see it (the file is plain ASCII). Raw
+    literals (r"..", R"(..)") are left alone. WARNING ONLY: it never fails a
+    commit, because a path in a message or a regex is not always a mistake.
+    Only the drive form (X: then one backslash) is looked for; a relative path
+    is too often something else.
+    """
+    if Path(path).suffix.lower() not in ESCAPE_SUFFIXES:
+        return False
+    head = line.lstrip()
+    if head.startswith(("#", "//", "/*", "*")):
+        return False
+    for m in _LITERAL.finditer(line):
+        if m.group("pre") and "r" in m.group("pre").lower():
+            continue
+        if _DRIVE_ONE_SLASH.search(m.group("body")):
+            return True
+    return False
+
+
 def staged_text(path: str) -> str:
     return subprocess.run(["git", "show", f":{path}"], capture_output=True,
                           text=True, encoding="utf-8", errors="replace").stdout
@@ -144,7 +176,7 @@ def check_staged() -> int:
                            "--no-color", "--diff-filter=ACM"],
                           capture_output=True, text=True, encoding="utf-8",
                           errors="replace").stdout
-    path, lineno, bad = None, 0, []
+    path, lineno, bad, warn = None, 0, [], []
     added = {}  # .bat path -> {line number: text} of the lines this commit adds
     hunk = re.compile(r"^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@")
     for raw in diff.splitlines():
@@ -164,7 +196,16 @@ def check_staged() -> int:
                                 "".join(sorted({c for _, c in found}))[:20]))
                 if is_bat(path):
                     added.setdefault(path, {})[lineno] = line
+                if path_escape_suspects(line, path):
+                    warn.append((path, lineno, line.strip()[:70]))
             lineno += 1
+
+    if warn:  # information only: does not change the exit code
+        print("warning: a Windows path with single backslashes inside a string literal.")
+        print("  When the program runs, \\t \\n \\a \\x.. in it are escapes, not path text.")
+        print("  Write C:\\\\dir, C:/dir, or a raw literal (r\"..\" / R\"(..)\"). Not blocking.")
+        for p, n, text in warn:
+            print(f"  {p}:{n}: {text}")
 
     # The paren check needs the whole file (block depth) but reports only
     # added lines, so existing scripts stay legal until someone edits them.
@@ -226,6 +267,17 @@ def check_all() -> int:
     print(f"\n.bat lines with an unquoted %NAME(..)% inside a ( ) block: {len(paren)}")
     for f, no in paren[:15]:
         print(f"  {f}:{no}")
+    esc = []
+    for f in files:
+        if is_code(f) and Path(f).suffix.lower() in ESCAPE_SUFFIXES:
+            try:
+                text = Path(f).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            esc += [(f, no) for no, ln in enumerate(text.splitlines(), 1) if path_escape_suspects(ln, f)]
+    print(f"\nstring literals with a single-backslash Windows path (warning only): {len(esc)}")
+    for f, no in esc[:15]:
+        print(f"  {f}:{no}")
     print("\n(informational: existing lines are grandfathered. The hook only")
     print(" rejects lines a commit adds.)")
     return 0
@@ -256,7 +308,32 @@ def selftest() -> int:
             fails += 1
             print(f"  FAIL want {want} got {got}: {lines}")
     print(f"bat paren cases: {len(BAT_CASES) - fails} pass / {fails} fail")
-    return 1 if fails else 0
+    efails = 0
+    for line, path, want in ESCAPE_CASES:
+        if path_escape_suspects(line, path) != want:
+            efails += 1
+            print(f"  FAIL want {want}: {path}: {line}")
+    print(f"path escape cases: {len(ESCAPE_CASES) - efails} pass / {efails} fail")
+    return 1 if fails or efails else 0
+
+
+# Control cases for path_escape_suspects: (line, file, expected).
+ESCAPE_CASES = [
+    ('p = "C:\\temp\\new"', "a.py", True),
+    ('auto p = "C:\\dev\\x.wav";', "a.cpp", True),
+    ("const p = 'D:\\data';", "a.ts", True),
+    ('p = "C:\\\\temp\\\\new"', "a.py", False),       # escaped: fine
+    ('p = r"C:\\temp\\new"', "a.py", False),          # raw
+    ('auto p = R"(C:\\temp)";', "a.cpp", False),      # C++ raw
+    ('p = "C:/temp/new"', "a.py", False),
+    ('# see "C:\\temp\\new"', "a.py", False),         # comment
+    ('$p = "C:\\temp\\new"', "a.ps1", False),         # no escapes in PowerShell
+    ('set "P=C:\\temp"', "a.bat", False),
+    ('x = "a:\\b"', "a.c", True),
+    ('url = "http://x"', "a.py", False),
+    ('printf("for %p:\\n", f);', "a.c", False),       # printf format, not a path
+    ('msg = "see C:\\temp"', "a.py", True),
+]
 
 
 def main() -> int:
